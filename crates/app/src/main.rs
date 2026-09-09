@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context as _};
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, anchored, canvas, deferred, div, fill, font, point, prelude::*, px, relative, size,
+    actions, anchored, canvas, deferred, div, fill, font, point, prelude::*, px, size,
     uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -17,7 +17,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{CompletionProvider, Escape as InputEscape, Input, InputEvent, InputState},
     kbd::Kbd,
-    scroll::Scrollbar,
+    scroll::{Scrollbar, ScrollbarShow},
     tag::Tag,
     tooltip::Tooltip,
     Disableable as _, Icon, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
@@ -3105,6 +3105,8 @@ enum PaletteStep {
     Sources { selected: usize },
     /// Step 2 (GitHub path): type `owner/repo`.
     RepoInput { error: Option<SharedString> },
+    /// Step 2 (subscription path): type `owner/repo`.
+    SubscribeRepoInput { error: Option<SharedString> },
     /// Step 3 (GitHub path): pick a PR from the repo's open list.
     PrList { repo: String, prs: PrListState },
     /// Local path: pick the base ref for an already-open local item.
@@ -3140,10 +3142,16 @@ enum BaseListState {
     Failed(String),
 }
 
-const PALETTE_SOURCES: [&str; 2] = ["Open GitHub pull request", "Open local folder"];
+const PALETTE_SOURCES: [&str; 3] = [
+    "Open GitHub pull request",
+    "Subscribe to GitHub repository",
+    "Open local folder",
+];
 const SOURCE_PR: usize = 0;
-const SOURCE_FOLDER: usize = 1;
+const SOURCE_SUBSCRIBE: usize = 1;
+const SOURCE_FOLDER: usize = 2;
 const PALETTE_ROW_HEIGHT: f32 = 30.0;
+const SIDEBAR_MAX_LIST_HEIGHT: f32 = 240.0;
 
 /// Step-1 options matching the query (case-insensitive substring), as indices
 /// into PALETTE_SOURCES. Empty query keeps both.
@@ -3272,6 +3280,83 @@ fn parse_repo_slug(value: &str) -> Result<(String, String), &'static str> {
         return Err("expected owner/repo");
     }
     Ok((owner.to_string(), repo.to_string()))
+}
+
+#[derive(Clone)]
+struct SubscribedRepo {
+    owner: String,
+    repo: String,
+    prs: Vec<gh::PrSummary>,
+    refresh_error: Option<String>,
+}
+
+impl SubscribedRepo {
+    fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+fn subscriptions_path() -> Option<PathBuf> {
+    Some(
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join(".cache")
+            .join("lgtm")
+            .join("subscriptions.json"),
+    )
+}
+
+fn parse_subscription_slugs(json: &str) -> Vec<(String, String)> {
+    let Ok(slugs) = serde_json::from_str::<Vec<String>>(json) else {
+        return Vec::new();
+    };
+    let mut parsed = Vec::new();
+    for slug in slugs {
+        let Ok((owner, repo)) = parse_repo_slug(&slug) else {
+            continue;
+        };
+        if !parsed.iter().any(|(o, r)| o == &owner && r == &repo) {
+            parsed.push((owner, repo));
+        }
+    }
+    parsed
+}
+
+fn pr_key(owner: &str, repo: &str, number: u64) -> (String, String, u64) {
+    (owner.to_lowercase(), repo.to_lowercase(), number)
+}
+
+fn load_subscribed_repos() -> Vec<SubscribedRepo> {
+    let Some(path) = subscriptions_path() else {
+        return Vec::new();
+    };
+    let Ok(json) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_subscription_slugs(&json)
+        .into_iter()
+        .map(|(owner, repo)| SubscribedRepo {
+            owner,
+            repo,
+            prs: Vec::new(),
+            refresh_error: None,
+        })
+        .collect()
+}
+
+fn save_subscribed_repos(repos: &[SubscribedRepo]) {
+    let Some(path) = subscriptions_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let slugs: Vec<String> = repos.iter().map(SubscribedRepo::slug).collect();
+    if let Ok(json) = serde_json::to_string_pretty(&slugs) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 // --- @-mention autocomplete ------------------------------------------------
@@ -4176,6 +4261,12 @@ struct ReviewApp {
     /// PRs with cached LSP worktrees on disk, listed in the sidebar to reopen or
     /// clean up. Filled by a background scan when the app starts.
     cached_prs: Vec<CachedPr>,
+    /// GitHub repositories whose open PRs are kept in the sidebar feed.
+    subscribed_repos: Vec<SubscribedRepo>,
+    /// The feed refresh is guarded so a slow `gh pr list` cannot overlap the
+    /// next scheduled refresh.
+    subscribed_refreshing: bool,
+    subscribed_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -4259,10 +4350,13 @@ impl ReviewApp {
                 },
             ),
         ];
+        let subscribed_repos = load_subscribed_repos();
         let mut this = Self {
             items: Vec::new(),
             active: 0,
-            sidebar_visible: !errors.is_empty() || sources.len() != 1,
+            sidebar_visible: !errors.is_empty()
+                || sources.len() != 1
+                || !subscribed_repos.is_empty(),
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
             tree_filter_input,
@@ -4283,9 +4377,13 @@ impl ReviewApp {
             review: None,
             review_gen: 0,
             cached_prs: Vec::new(),
+            subscribed_repos,
+            subscribed_refreshing: false,
+            subscribed_scroll: ScrollHandle::new(),
             _subscriptions,
         };
         this.refresh_cached_prs(cx);
+        this.start_subscribed_pr_poll(cx);
         for source in sources {
             this.open_item(source, cx);
         }
@@ -4307,6 +4405,100 @@ impl ReviewApp {
         .detach();
     }
 
+    fn start_subscribed_pr_poll(&mut self, cx: &mut Context<Self>) {
+        self.refresh_subscribed_prs(cx);
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(30))
+                .await;
+            if this
+                .update(cx, |app, cx| app.refresh_subscribed_prs(cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Refresh every subscribed repository as one guarded batch. The list for
+    /// each repository is replaced only after a successful fetch; failures
+    /// keep the last successful list visible and attach an error to it.
+    fn refresh_subscribed_prs(&mut self, cx: &mut Context<Self>) {
+        if self.subscribed_refreshing || self.subscribed_repos.is_empty() {
+            return;
+        }
+        self.subscribed_refreshing = true;
+        let repos: Vec<(String, String)> = self
+            .subscribed_repos
+            .iter()
+            .map(|repo| (repo.owner.clone(), repo.repo.clone()))
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move {
+                    repos
+                        .into_iter()
+                        .map(|(owner, repo)| {
+                            let result = gh::list_prs(&owner, &repo)
+                                .map_err(|err| format!("{err:#}"));
+                            (owner, repo, result)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                app.subscribed_refreshing = false;
+                for (owner, repo, result) in fetched {
+                    let Some(subscription) = app.subscribed_repos.iter_mut().find(|subscription| {
+                        subscription.owner == owner && subscription.repo == repo
+                    }) else {
+                        continue;
+                    };
+                    match result {
+                        Ok(prs) => {
+                            subscription.prs = prs;
+                            subscription.refresh_error = None;
+                        }
+                        Err(error) => subscription.refresh_error = Some(error),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn subscribe_repo(
+        &mut self,
+        owner: String,
+        repo: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .subscribed_repos
+            .iter()
+            .any(|subscription| {
+                subscription.owner.eq_ignore_ascii_case(&owner)
+                    && subscription.repo.eq_ignore_ascii_case(&repo)
+            })
+        {
+            self.subscribed_repos.push(SubscribedRepo {
+                owner,
+                repo,
+                prs: Vec::new(),
+                refresh_error: None,
+            });
+            save_subscribed_repos(&self.subscribed_repos);
+        }
+        self.sidebar_visible = true;
+        self.close_palette(window, cx);
+        self.refresh_subscribed_prs(cx);
+        cx.notify();
+    }
+
     /// Open a cached PR (activating it if already open), from a sidebar click.
     fn open_cached_pr(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(loc) = self.cached_prs.get(ix).map(|cached| cached.loc.clone()) else {
@@ -4314,7 +4506,29 @@ impl ReviewApp {
         };
         if let Some(existing) = self.items.iter().position(|item| {
             matches!(&item.source, Source::Pr(l)
-                if l.owner == loc.owner && l.repo == loc.repo && l.number == loc.number)
+                if l.owner.eq_ignore_ascii_case(&loc.owner)
+                    && l.repo.eq_ignore_ascii_case(&loc.repo)
+                    && l.number == loc.number)
+        }) {
+            self.activate(existing, window, cx);
+            return;
+        }
+        self.open_item(Source::Pr(loc), cx);
+    }
+
+    /// Open a subscribed feed PR, activating the existing review item when it
+    /// is already open so the sidebar never creates duplicate reviews.
+    fn open_subscribed_pr(
+        &mut self,
+        loc: gh::PrLocator,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self.items.iter().position(|item| {
+            matches!(&item.source, Source::Pr(l)
+                if l.owner.eq_ignore_ascii_case(&loc.owner)
+                    && l.repo.eq_ignore_ascii_case(&loc.repo)
+                    && l.number == loc.number)
         }) {
             self.activate(existing, window, cx);
             return;
@@ -4872,6 +5086,12 @@ impl ReviewApp {
                 self.set_palette_input("", "type to filter…", window, cx);
                 cx.notify();
             }
+            Some(PaletteStep::SubscribeRepoInput { .. }) => {
+                self.palette = Some(PaletteStep::Sources { selected: 0 });
+                self.palette_gen += 1;
+                self.set_palette_input("", "type to filter…", window, cx);
+                cx.notify();
+            }
             Some(PaletteStep::PrList { repo, .. }) => {
                 let repo = repo.clone();
                 self.palette = Some(PaletteStep::RepoInput { error: None });
@@ -4930,6 +5150,7 @@ impl ReviewApp {
                 *selected = (*selected).min(len.saturating_sub(1));
             }
             Some(PaletteStep::RepoInput { error }) => *error = None,
+            Some(PaletteStep::SubscribeRepoInput { error }) => *error = None,
             Some(PaletteStep::PrList {
                 prs:
                     PrListState::Loaded {
@@ -4974,6 +5195,15 @@ impl ReviewApp {
                     }
                 }
             },
+            Some(PaletteStep::SubscribeRepoInput { .. }) => match parse_repo_slug(&query) {
+                Ok((owner, repo)) => self.subscribe_repo(owner, repo, window, cx),
+                Err(msg) => {
+                    if let Some(PaletteStep::SubscribeRepoInput { error }) = &mut self.palette {
+                        *error = Some(msg.into());
+                        cx.notify();
+                    }
+                }
+            },
             Some(PaletteStep::PrList {
                 prs: PrListState::Loaded { selected, .. },
                 ..
@@ -4996,6 +5226,12 @@ impl ReviewApp {
         match opt {
             SOURCE_PR => {
                 self.palette = Some(PaletteStep::RepoInput { error: None });
+                self.palette_gen += 1;
+                self.set_palette_input("", "owner/repo", window, cx);
+                cx.notify();
+            }
+            SOURCE_SUBSCRIBE => {
+                self.palette = Some(PaletteStep::SubscribeRepoInput { error: None });
                 self.palette_gen += 1;
                 self.set_palette_input("", "owner/repo", window, cx);
                 cx.notify();
@@ -7245,13 +7481,14 @@ impl ReviewApp {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Item counts are small: a plain scrollable div capped at ~40% of the
-        // sidebar leaves the rest for the active item's file tree.
+        // Five normal two-line entries fit before this area scrolls, leaving
+        // the rest of the sidebar for the active item's file tree.
         let mut list = div()
             .id("sidebar-items")
-            .max_h(relative(0.4))
+            .max_h(px(SIDEBAR_MAX_LIST_HEIGHT))
             .flex_shrink_0()
             .overflow_y_scroll()
+            .track_scroll(&self.subscribed_scroll)
             .py_1();
         for (ix, item) in self.items.iter().enumerate() {
             let active = ix == self.active;
@@ -7352,27 +7589,142 @@ impl ReviewApp {
             list = list.child(entry);
         }
 
-        // --- cached PRs (past reviews with an on-disk worktree) ---
-        // Skip any that are already open above, so each PR shows once.
-        let open_pr_keys: Vec<(String, String, u64)> = self
+        // --- subscribed GitHub PRs ---
+        // Feed rows remain lightweight: only the list summary is retained,
+        // and opening one goes through the normal review-item path.
+        let open_pr_keys: HashSet<(String, String, u64)> = self
             .items
             .iter()
             .filter_map(|item| match &item.source {
-                Source::Pr(l) => Some((l.owner.clone(), l.repo.clone(), l.number)),
+                Source::Pr(loc) => Some(pr_key(&loc.owner, &loc.repo, loc.number)),
                 Source::Local(_) => None,
             })
             .collect();
+        let subscribed_feed: Vec<(gh::PrLocator, gh::PrSummary)> = self
+            .subscribed_repos
+            .iter()
+            .flat_map(|subscription| {
+                subscription.prs.iter().filter_map(|pr| {
+                    let key = pr_key(&subscription.owner, &subscription.repo, pr.number);
+                    (!open_pr_keys.contains(&key)).then(|| {
+                        (
+                            gh::PrLocator {
+                                owner: subscription.owner.clone(),
+                                repo: subscription.repo.clone(),
+                                number: pr.number,
+                            },
+                            pr.clone(),
+                        )
+                    })
+                })
+            })
+            .collect();
+        let subscribed_pr_keys: HashSet<(String, String, u64)> = self
+            .subscribed_repos
+            .iter()
+            .flat_map(|subscription| {
+                subscription
+                    .prs
+                    .iter()
+                    .map(|pr| pr_key(&subscription.owner, &subscription.repo, pr.number))
+            })
+            .collect();
+        let subscribed_feed_count = subscribed_feed.len();
+        if !self.subscribed_repos.is_empty() {
+            let refresh_failed = self
+                .subscribed_repos
+                .iter()
+                .any(|subscription| subscription.refresh_error.is_some());
+            list = list.child(
+                div()
+                    .mx_1()
+                    .mt_2()
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(if refresh_failed {
+                        theme::red()
+                    } else {
+                        theme::overlay0()
+                    })
+                    .child(SharedString::from(if refresh_failed {
+                        "SUBSCRIBED PRS · REFRESH FAILED"
+                    } else {
+                        "SUBSCRIBED PRS"
+                    })),
+            );
+            for (loc, pr) in subscribed_feed {
+                let label: SharedString = format!("{}#{}", loc.repo_slug(), pr.number).into();
+                let title: SharedString = pr.title.clone().into();
+                let click_loc = loc.clone();
+                let entry = div()
+                    .id(SharedString::from(format!(
+                        "subscribed-pr-{}#{}",
+                        loc.repo_slug(),
+                        pr.number
+                    )))
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_subscribed_pr(click_loc.clone(), window, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(8.))
+                                    .h(px(8.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(theme::green()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme::text())
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(theme::subtext())
+                                    .child(SharedString::from(pr.author.login.clone())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pl(px(16.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(theme::subtext())
+                            .child(title),
+                    );
+                list = list.child(entry);
+            }
+        }
+
+        // --- cached PRs (past reviews with an on-disk worktree) ---
+        // Skip any that are already open above, so each PR shows once.
         let cached: Vec<(usize, SharedString)> = self
             .cached_prs
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                !open_pr_keys.iter().any(|(o, r, n)| {
-                    *o == c.loc.owner && *r == c.loc.repo && *n == c.loc.number
-                })
+                let key = pr_key(&c.loc.owner, &c.loc.repo, c.loc.number);
+                !open_pr_keys.contains(&key) && !subscribed_pr_keys.contains(&key)
             })
             .map(|(ix, c)| (ix, SharedString::from(format!("{}#{}", c.loc.repo_slug(), c.loc.number))))
             .collect();
+        let cached_count = cached.len();
         if !cached.is_empty() {
             list = list.child(
                 div()
@@ -7431,6 +7783,21 @@ impl ReviewApp {
                 list = list.child(entry);
             }
         }
+
+        let section_count = usize::from(!self.subscribed_repos.is_empty())
+            + usize::from(cached_count > 0);
+        let sidebar_row_count =
+            self.items.len() + subscribed_feed_count + cached_count + section_count;
+        let list = div()
+            .relative()
+            .flex_shrink_0()
+            .child(list)
+            .when(sidebar_row_count > 5, |area| {
+                area.child(
+                    Scrollbar::vertical(&self.subscribed_scroll)
+                        .scrollbar_show(ScrollbarShow::Always),
+                )
+            });
 
         // --- file tree for the active item ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
@@ -7569,6 +7936,9 @@ impl ReviewApp {
         let header: Option<SharedString> = match step {
             PaletteStep::Sources { .. } => None,
             PaletteStep::RepoInput { .. } => Some("Open GitHub pull request".into()),
+            PaletteStep::SubscribeRepoInput { .. } => {
+                Some("Subscribe to GitHub repository".into())
+            }
             PaletteStep::PrList { repo, .. } => Some(repo.clone().into()),
             PaletteStep::LocalBaseList { .. } => Some("Choose local diff base".into()),
         };
@@ -7616,13 +7986,14 @@ impl ReviewApp {
                 }
                 list.into_any_element()
             }
-            PaletteStep::RepoInput { error } => {
+            PaletteStep::RepoInput { error } | PaletteStep::SubscribeRepoInput { error } => {
                 let (text, color): (SharedString, gpui::Rgba) = match error {
                     Some(err) => (err.clone(), theme::red()),
-                    None => (
+                    None if matches!(step, PaletteStep::RepoInput { .. }) => (
                         "enter to list open pull requests · esc to go back".into(),
                         theme::overlay0(),
                     ),
+                    None => ("enter to subscribe · esc to go back".into(), theme::overlay0()),
                 };
                 div()
                     .px_3()
@@ -8487,6 +8858,28 @@ mod tests {
     use diff_core::{FileDiff, Hunk};
 
     #[test]
+    fn repository_subscription_slugs_parse_and_deduplicate() {
+        assert_eq!(
+            parse_repo_slug("owner/repo"),
+            Ok(("owner".to_string(), "repo".to_string()))
+        );
+        assert!(parse_repo_slug("owner").is_err());
+        assert!(parse_repo_slug("owner/repo/extra").is_err());
+
+        assert_eq!(
+            parse_subscription_slugs(
+                r#"["owner/repo", "owner/repo", "other/project", "bad", "owner/repo/extra"]"#
+            ),
+            vec![
+                ("owner".to_string(), "repo".to_string()),
+                ("other".to_string(), "project".to_string()),
+            ]
+        );
+        assert!(parse_subscription_slugs("not json").is_empty());
+        assert_eq!(pr_key("Owner", "Repo", 42), pr_key("owner", "repo", 42));
+    }
+
+    #[test]
     fn cached_pr_dir_names_parse() {
         assert_eq!(
             cached_pr_number("atuinsh__atuin__pr3592__5467566b7eb4"),
@@ -9191,10 +9584,11 @@ mod tests {
 
     #[test]
     fn source_options_filter_by_substring() {
-        assert_eq!(filtered_sources(""), vec![0, 1]);
+        assert_eq!(filtered_sources(""), vec![0, 1, 2]);
         assert_eq!(filtered_sources("pull"), vec![0]);
-        assert_eq!(filtered_sources("FOLDER"), vec![1]);
-        assert_eq!(filtered_sources("open"), vec![0, 1]);
+        assert_eq!(filtered_sources("subscribe"), vec![1]);
+        assert_eq!(filtered_sources("FOLDER"), vec![2]);
+        assert_eq!(filtered_sources("open"), vec![0, 2]);
         assert!(filtered_sources("nope").is_empty());
     }
 
