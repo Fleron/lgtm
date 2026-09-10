@@ -316,28 +316,38 @@ pub fn post_review_comment(
     path: &str,
     side: &str,
     line: u64,
+    start_line: Option<u64>,
     body: &str,
 ) -> Result<()> {
-    gh(&[
-        "api",
-        "-X",
-        "POST",
-        &format!(
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        format!(
             "repos/{}/{}/pulls/{}/comments",
             loc.owner, loc.repo, loc.number
         ),
-        "-f",
-        &format!("body={body}"),
-        "-f",
-        &format!("commit_id={commit_id}"),
-        "-f",
-        &format!("path={path}"),
-        "-f",
-        &format!("side={side}"),
+        "-f".to_string(),
+        format!("body={body}"),
+        "-f".to_string(),
+        format!("commit_id={commit_id}"),
+        "-f".to_string(),
+        format!("path={path}"),
+        "-f".to_string(),
+        format!("side={side}"),
         // -F, not -f: line must be a JSON integer, not a string.
-        "-F",
-        &format!("line={line}"),
-    ])?;
+        "-F".to_string(),
+        format!("line={line}"),
+    ];
+    // A multi-line comment additionally anchors its start on the same side
+    // (GitHub doesn't support a range spanning left and right).
+    if let Some(start_line) = start_line {
+        args.push("-F".to_string());
+        args.push(format!("start_line={start_line}"));
+        args.push("-f".to_string());
+        args.push(format!("start_side={side}"));
+    }
+    gh(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
 }
 

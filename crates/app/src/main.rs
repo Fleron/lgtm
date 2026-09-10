@@ -498,6 +498,7 @@ impl LocalReview {
         path: String,
         side: CommentSide,
         line: u64,
+        start_line: Option<u64>,
         body: String,
     ) {
         self.next_id += 1;
@@ -506,7 +507,7 @@ impl LocalReview {
             path,
             line: Some(line),
             side: Some(side.api_str().to_string()),
-            start_line: None,
+            start_line,
             body,
             user: gh::Author {
                 login: "you".to_string(),
@@ -1570,6 +1571,7 @@ fn render_row(
                                 path.to_string(),
                                 side,
                                 line,
+                                None,
                                 ix,
                                 window,
                                 cx,
@@ -3542,6 +3544,9 @@ struct Composer {
     path: String,
     side: CommentSide,
     line: u64,
+    /// Set when the comment spans multiple lines (a drag-selection covered
+    /// more than one row when "+" was clicked); anchors at `line`, the end.
+    start_line: Option<u64>,
     /// Display row the composer is anchored beneath (best effort; goes stale
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
@@ -6092,6 +6097,7 @@ impl ReviewApp {
         path: String,
         side: CommentSide,
         line: u64,
+        start_line: Option<u64>,
         row_ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6150,6 +6156,7 @@ impl ReviewApp {
             path,
             side,
             line,
+            start_line,
             row_ix,
             input,
             error: None,
@@ -6231,7 +6238,7 @@ impl ReviewApp {
         let item_id = item.id;
         let source = item.source.clone();
         let gen = self.composer_gen;
-        let (reply_to, commit_id, path, side, line) = {
+        let (reply_to, commit_id, path, side, line, start_line) = {
             let composer = self.composer.as_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
@@ -6241,10 +6248,11 @@ impl ReviewApp {
                 composer.path.clone(),
                 composer.side,
                 composer.line,
+                composer.start_line,
             )
         };
         if let Source::Local(_) = source {
-            self.add_local_comment(item_id, reply_to, path, side, line, body, cx);
+            self.add_local_comment(item_id, reply_to, path, side, line, start_line, body, cx);
             if self.composer_gen == gen {
                 self.close_composer(window, cx);
             }
@@ -6266,6 +6274,7 @@ impl ReviewApp {
                             &path,
                             side.api_str(),
                             line,
+                            start_line,
                             &body,
                         ),
                     }
@@ -6301,6 +6310,7 @@ impl ReviewApp {
         path: String,
         side: CommentSide,
         line: u64,
+        start_line: Option<u64>,
         body: String,
         cx: &mut Context<Self>,
     ) {
@@ -6313,7 +6323,7 @@ impl ReviewApp {
         let Some(local) = &mut data.local_review else {
             return;
         };
-        local.add_comment(reply_to, path, side, line, body);
+        local.add_comment(reply_to, path, side, line, start_line, body);
         data.comments = Some(local.index());
         data.rebuild_rows_anchored();
         cx.notify();
@@ -7064,6 +7074,30 @@ impl ReviewApp {
             }
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
+        // A drag-selection (the same one cmd-c copies) whose near or far end
+        // is this row becomes a multi-line comment spanning the selection.
+        let other_end = data.selection.and_then(|sel| {
+            if sel.side != side {
+                return None;
+            }
+            let (lo, hi) = sel.ordered();
+            if lo.row == hi.row {
+                return None;
+            }
+            let other_row = if row_ix == lo.row {
+                Some(hi.row)
+            } else if row_ix == hi.row {
+                Some(lo.row)
+            } else {
+                None
+            }?;
+            let (other_side, other_line) = comment_anchor(&data.rows, other_row, side)?;
+            (other_side == anchor_side).then_some(other_line)
+        });
+        let (line, start_line) = match other_end {
+            Some(other) => (line.max(other), Some(line.min(other))),
+            None => (line, None),
+        };
         let file_ix = data
             .file_rows
             .iter()
@@ -7105,7 +7139,9 @@ impl ReviewApp {
                     cx.stop_propagation();
                     let path = path.clone();
                     entity.update(cx, |this, cx| {
-                        this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                        this.open_composer(
+                            None, path, anchor_side, line, start_line, row_ix, window, cx,
+                        );
                     });
                 })
                 .into_any_element(),
@@ -7140,6 +7176,10 @@ impl ReviewApp {
         } else {
             "Comment"
         };
+        let line_label = match composer.start_line {
+            Some(start) => format!("{start}-{}", composer.line),
+            None => composer.line.to_string(),
+        };
         let target = format!(
             "{}{}:{} ({})",
             if composer.reply_to.is_some() {
@@ -7148,7 +7188,7 @@ impl ReviewApp {
                 ""
             },
             composer.path,
-            composer.line,
+            line_label,
             composer.side.api_str()
         );
         div()
@@ -10836,6 +10876,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             12,
+            None,
             "please simplify this".to_string(),
         );
         review.add_comment(
@@ -10843,6 +10884,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             12,
+            None,
             "also add a test".to_string(),
         );
 
@@ -10869,6 +10911,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             7,
+            None,
             "why remove this?\nplease explain".to_string(),
         );
         review.add_comment(
@@ -10876,6 +10919,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             7,
+            None,
             "because this path handles nil".to_string(),
         );
         review.add_comment(
@@ -10883,6 +10927,7 @@ mod tests {
             "src/main.rs".to_string(),
             CommentSide::Left,
             12,
+            None,
             "second thread".to_string(),
         );
 
