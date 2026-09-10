@@ -112,11 +112,32 @@ pub struct PrMeta {
     /// required reviews and none given).
     #[serde(default)]
     pub review_decision: String,
+    #[serde(default)]
+    pub status_check_rollup: Vec<CheckRun>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Author {
     pub login: String,
+}
+
+/// One entry of `statusCheckRollup`. GitHub mixes two shapes in this array:
+/// legacy commit statuses report `state`, GitHub Actions check runs report
+/// `status`/`conclusion`. Absent fields default to empty so either shape
+/// deserializes into the same struct.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CheckRun {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub conclusion: String,
+}
+
+impl CheckRun {
+    pub fn passed(&self) -> bool {
+        matches!(self.state.as_str(), "SUCCESS" | "EXPECTED")
+            || matches!(self.conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
+    }
 }
 
 pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
@@ -128,7 +149,7 @@ pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
         &loc.repo_slug(),
         "--json",
         "number,title,author,state,isDraft,url,body,baseRefName,headRefName,baseRefOid,\
-         headRefOid,additions,deletions,changedFiles,reviewDecision",
+         headRefOid,additions,deletions,changedFiles,reviewDecision,statusCheckRollup",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr view JSON")
 }
@@ -521,6 +542,35 @@ mod tests {
     }
 
     #[test]
+    fn check_run_passed_handles_both_status_shapes() {
+        // Legacy commit status: `state`.
+        let status_ctx = CheckRun {
+            state: "SUCCESS".into(),
+            conclusion: String::new(),
+        };
+        assert!(status_ctx.passed());
+
+        // GitHub Actions check run: `conclusion`.
+        let check_run = CheckRun {
+            state: String::new(),
+            conclusion: "NEUTRAL".into(),
+        };
+        assert!(check_run.passed());
+
+        let failing = CheckRun {
+            state: "FAILURE".into(),
+            conclusion: String::new(),
+        };
+        assert!(!failing.passed());
+
+        let pending = CheckRun {
+            state: String::new(),
+            conclusion: String::new(),
+        };
+        assert!(!pending.passed());
+    }
+
+    #[test]
     fn encodes_paths_per_segment_keeping_slashes() {
         assert_eq!(encode_path("src/main.rs"), "src/main.rs");
         assert_eq!(
@@ -554,6 +604,7 @@ mod tests {
     fn deserializes_pr_meta_with_oids() {
         let json = r#"{
             "number": 1, "title": "t", "author": {"login": "a"}, "state": "OPEN",
+            "isDraft": false,
             "url": "https://github.com/o/r/pull/1",
             "baseRefName": "main", "headRefName": "feat",
             "baseRefOid": "abc123", "headRefOid": "def456",

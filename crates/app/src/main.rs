@@ -2935,8 +2935,20 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
     let decision = match meta.review_decision.as_str() {
         "APPROVED" => Some((theme::green(), "approved")),
         "CHANGES_REQUESTED" => Some((theme::red(), "changes requested")),
+        "REVIEW_REQUIRED" => Some((theme::peach(), "review required")),
         _ => None,
     };
+    // CI checks pass count, when the PR has any checks at all.
+    let checks = (!meta.status_check_rollup.is_empty()).then(|| {
+        let total = meta.status_check_rollup.len();
+        let passed = meta.status_check_rollup.iter().filter(|c| c.passed()).count();
+        let color = if passed == total {
+            theme::green()
+        } else {
+            theme::red()
+        };
+        (color, format!("{passed}/{total}"))
+    });
     let url = meta.url.clone();
     div()
         .flex()
@@ -2978,6 +2990,14 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                         Tag::custom(tint.opacity(0.15), tint, tint.opacity(0.4))
                             .small()
                             .child(SharedString::from(label.to_string())),
+                    )
+                })
+                .when_some(checks, |row, (color, label)| {
+                    let tint: Hsla = color.into();
+                    row.child(
+                        Tag::custom(tint.opacity(0.15), tint, tint.opacity(0.4))
+                            .small()
+                            .child(SharedString::from(label)),
                     )
                 }),
         )
@@ -10779,6 +10799,7 @@ mod tests {
             deletions: 2,
             changed_files: 3,
             review_decision: String::new(),
+            status_check_rollup: Vec::new(),
         };
         let header = pr_chat_header(&meta);
         assert!(header.contains("\"Fix the frobnicator\""));
