@@ -2920,11 +2920,15 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
 }
 
 fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
-    let (state_color, state_label) = match meta.state.as_str() {
-        "OPEN" => (theme::green(), "open"),
-        "MERGED" => (theme::mauve(), "merged"),
-        "CLOSED" => (theme::red(), "closed"),
-        other => (theme::overlay0(), other),
+    let (state_color, state_label) = if meta.is_draft {
+        (theme::overlay0(), "draft")
+    } else {
+        match meta.state.as_str() {
+            "OPEN" => (theme::green(), "open"),
+            "MERGED" => (theme::mauve(), "merged"),
+            "CLOSED" => (theme::red(), "closed"),
+            other => (theme::overlay0(), other),
+        }
     };
     let state: Hsla = state_color.into();
     // The PR's overall review decision, when it has one.
@@ -10764,6 +10768,7 @@ mod tests {
                 login: "alice".into(),
             },
             state: "OPEN".into(),
+            is_draft: false,
             url: "https://github.com/o/r/pull/7".into(),
             body: "It was broken.\n".into(),
             base_ref_name: "main".into(),
