@@ -12,6 +12,18 @@ rendering) unchanged.
 Codex instead of or alongside Claude; picking a backend per session (or
 per-message) would let them stay in lgtm instead of switching tools.
 
+## Decided (feature-planning, 2026-09-11)
+
+Full feature-plan: `/Users/emil.fleron/.claude/plans/humming-wobbling-trinket.md`.
+
+- Backend toggle lives inside the chat panel itself (not the titlebar), is per-item, and resets to Claude every time an item is opened or the app restarts. No disk persistence, no per-message selection.
+- Switching backend clears the item's transcript and starts a new conversation. If a reply is streaming when the switch happens, it's stopped first (same as hitting stop), then the switch proceeds.
+- Codex gets the same diff/selection context and cross-turn memory Claude gets today.
+- Codex failures render the same inline red error text Claude failures do, with no retry and no fallback to the other backend. No upfront check that the `codex` CLI is installed.
+- Stopping an in-flight Codex reply shows the same "stopped" marker Claude shows today.
+- Cost line is omitted for Codex messages that don't report a cost, rather than showing a placeholder.
+- Codex is read-only (no file edits, no writing shell commands), matching Claude's read-only intent, but the mechanism differs: Claude enforces confinement to the item's directory and blocks web access via a tool allowlist, while Codex's read-only shell can reach files outside the item's directory and make outbound network requests (e.g. `curl`). Accepted knowingly as a real safety gap between the two backends, not closed in this feature.
+
 ## How
 
 Today: `crates/claude/src/lib.rs` spawns `claude -p <prompt> --output-format
