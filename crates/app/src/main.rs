@@ -7889,6 +7889,8 @@ impl ReviewApp {
             self.items.len() + subscribed_feed_count + cached_count + section_count;
         let list = div()
             .relative()
+            .w_full()
+            .max_h(px(SIDEBAR_MAX_LIST_HEIGHT))
             .flex_shrink_0()
             .child(list)
             .when(sidebar_row_count > 5, |area| {
