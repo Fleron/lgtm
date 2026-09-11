@@ -165,6 +165,10 @@ pub struct PrSummary {
     pub is_draft: bool,
     pub head_ref_name: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub review_decision: String,
+    #[serde(default)]
+    pub status_check_rollup: Vec<CheckRun>,
 }
 
 /// Open PRs for a repo, most recently updated first (gh's default order).
@@ -179,7 +183,8 @@ pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
         "--limit",
         "200",
         "--json",
-        "number,title,author,state,isDraft,headRefName,updatedAt",
+        "number,title,author,state,isDraft,headRefName,updatedAt,reviewDecision,\
+         statusCheckRollup",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr list JSON")
 }

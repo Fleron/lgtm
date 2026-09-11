@@ -2537,6 +2537,9 @@ impl ReviewItem {
         match &self.source {
             Source::Local(_) => theme::blue(),
             Source::Pr(_) => match &self.state {
+                ItemState::Ready(data) if data.pr_meta.as_ref().is_some_and(|m| m.is_draft) => {
+                    theme::overlay0()
+                }
                 ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
                     Some("OPEN") => theme::green(),
                     Some("MERGED") => theme::mauve(),
@@ -2921,6 +2924,44 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
     title.into_any_element()
 }
 
+/// Icon-only review + CI summary for a sidebar PR row: a warning triangle
+/// while a review is still required (a green check once it isn't), plus a
+/// passed/total CI count when the PR has any checks at all. Used in both the
+/// subscribed-PRs feed (before a PR is opened) and the open-items list
+/// (after), so it takes plain fields rather than `PrSummary`/`PrMeta`.
+fn review_ci_indicator(review_decision: &str, checks: &[gh::CheckRun]) -> gpui::AnyElement {
+    let (icon, icon_color) = if review_decision == "REVIEW_REQUIRED" {
+        (IconName::TriangleAlert, theme::peach())
+    } else {
+        (IconName::CircleCheck, theme::green())
+    };
+    let checks_text = (!checks.is_empty()).then(|| {
+        let total = checks.len();
+        let passed = checks.iter().filter(|c| c.passed()).count();
+        let color = if passed == total {
+            theme::green()
+        } else {
+            theme::red()
+        };
+        (color, format!("{passed}/{total}"))
+    });
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .flex_shrink_0()
+        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .when_some(checks_text, |row, (color, label)| {
+            row.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(Hsla::from(color))
+                    .child(SharedString::from(label)),
+            )
+        })
+        .into_any_element()
+}
+
 fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let (state_color, state_label) = if meta.is_draft {
         (theme::overlay0(), "draft")
@@ -2937,20 +2978,8 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
     let decision = match meta.review_decision.as_str() {
         "APPROVED" => Some((theme::green(), "approved")),
         "CHANGES_REQUESTED" => Some((theme::red(), "changes requested")),
-        "REVIEW_REQUIRED" => Some((theme::peach(), "review required")),
         _ => None,
     };
-    // CI checks pass count, when the PR has any checks at all.
-    let checks = (!meta.status_check_rollup.is_empty()).then(|| {
-        let total = meta.status_check_rollup.len();
-        let passed = meta.status_check_rollup.iter().filter(|c| c.passed()).count();
-        let color = if passed == total {
-            theme::green()
-        } else {
-            theme::red()
-        };
-        (color, format!("{passed}/{total}"))
-    });
     let url = meta.url.clone();
     div()
         .flex()
@@ -2992,14 +3021,6 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                         Tag::custom(tint.opacity(0.15), tint, tint.opacity(0.4))
                             .small()
                             .child(SharedString::from(label.to_string())),
-                    )
-                })
-                .when_some(checks, |row, (color, label)| {
-                    let tint: Hsla = color.into();
-                    row.child(
-                        Tag::custom(tint.opacity(0.15), tint, tint.opacity(0.4))
-                            .small()
-                            .child(SharedString::from(label)),
                     )
                 }),
         )
@@ -7558,23 +7579,29 @@ impl ReviewApp {
             let active = ix == self.active;
             let dot: Hsla = item.dot_color().into();
             let status: gpui::AnyElement = match &item.state {
-                ItemState::Ready(data) => div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .child(
-                        div()
-                            .text_color(theme::green())
-                            .child(SharedString::from(format!("+{}", data.additions))),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme::red())
-                            .child(SharedString::from(format!("−{}", data.deletions))),
-                    )
-                    .into_any_element(),
+                ItemState::Ready(data) => {
+                    let review_ci = data.pr_meta.as_ref().map(|meta| {
+                        review_ci_indicator(&meta.review_decision, &meta.status_check_rollup)
+                    });
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .child(
+                            div()
+                                .text_color(theme::green())
+                                .child(SharedString::from(format!("+{}", data.additions))),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme::red())
+                                .child(SharedString::from(format!("−{}", data.deletions))),
+                        )
+                        .children(review_ci)
+                        .into_any_element()
+                }
                 ItemState::Loading => div()
                     .flex_shrink_0()
                     .text_size(px(11.))
@@ -7747,7 +7774,11 @@ impl ReviewApp {
                                     .h(px(8.))
                                     .flex_shrink_0()
                                     .rounded_full()
-                                    .bg(theme::green()),
+                                    .bg(if pr.is_draft {
+                                        theme::overlay0()
+                                    } else {
+                                        theme::green()
+                                    }),
                             )
                             .child(
                                 div()
@@ -7762,7 +7793,11 @@ impl ReviewApp {
                                     .flex_shrink_0()
                                     .text_color(theme::subtext())
                                     .child(SharedString::from(pr.author.login.clone())),
-                            ),
+                            )
+                            .child(review_ci_indicator(
+                                &pr.review_decision,
+                                &pr.status_check_rollup,
+                            )),
                     )
                     .child(
                         div()
@@ -9474,6 +9509,8 @@ mod tests {
             is_draft: false,
             head_ref_name: branch.to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),
+            review_decision: String::new(),
+            status_check_rollup: Vec::new(),
         }
     }
 
