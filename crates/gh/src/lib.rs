@@ -138,6 +138,40 @@ impl CheckRun {
         matches!(self.state.as_str(), "SUCCESS" | "EXPECTED")
             || matches!(self.conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
     }
+
+    fn failed(&self) -> bool {
+        matches!(self.state.as_str(), "FAILURE" | "ERROR")
+            || matches!(
+                self.conclusion.as_str(),
+                "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+            )
+    }
+}
+
+/// Overall CI state for a PR's `statusCheckRollup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiState {
+    Passed,
+    InProgress,
+    Failed,
+}
+
+/// Summarizes a PR's CI checks as a passed/total count plus an overall
+/// state, or `None` when the PR has no checks at all.
+pub fn ci_summary(checks: &[CheckRun]) -> Option<(usize, usize, CiState)> {
+    if checks.is_empty() {
+        return None;
+    }
+    let total = checks.len();
+    let passed = checks.iter().filter(|c| c.passed()).count();
+    let state = if checks.iter().any(CheckRun::failed) {
+        CiState::Failed
+    } else if passed == total {
+        CiState::Passed
+    } else {
+        CiState::InProgress
+    };
+    Some((passed, total, state))
 }
 
 pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
@@ -583,6 +617,37 @@ mod tests {
             conclusion: String::new(),
         };
         assert!(!pending.passed());
+    }
+
+    #[test]
+    fn ci_summary_reflects_pass_fail_and_pending() {
+        assert_eq!(ci_summary(&[]), None);
+
+        let passed = CheckRun {
+            state: "SUCCESS".into(),
+            conclusion: String::new(),
+        };
+        let pending = CheckRun {
+            state: String::new(),
+            conclusion: String::new(),
+        };
+        let failing = CheckRun {
+            state: "FAILURE".into(),
+            conclusion: String::new(),
+        };
+
+        assert_eq!(
+            ci_summary(&[passed.clone(), passed.clone()]),
+            Some((2, 2, CiState::Passed))
+        );
+        assert_eq!(
+            ci_summary(&[passed.clone(), pending.clone()]),
+            Some((1, 2, CiState::InProgress))
+        );
+        assert_eq!(
+            ci_summary(&[passed, pending, failing]),
+            Some((1, 3, CiState::Failed))
+        );
     }
 
     #[test]

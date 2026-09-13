@@ -2978,8 +2978,17 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
     let decision = match meta.review_decision.as_str() {
         "APPROVED" => Some((theme::green(), "approved")),
         "CHANGES_REQUESTED" => Some((theme::red(), "changes requested")),
+        "REVIEW_REQUIRED" => Some((theme::peach(), "review required")),
         _ => None,
     };
+    let ci = gh::ci_summary(&meta.status_check_rollup).map(|(passed, total, state)| {
+        let color = match state {
+            gh::CiState::Passed => theme::green(),
+            gh::CiState::InProgress => theme::peach(),
+            gh::CiState::Failed => theme::red(),
+        };
+        (color, format!("{passed}/{total}"))
+    });
     let url = meta.url.clone();
     div()
         .flex()
@@ -3021,6 +3030,14 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                         Tag::custom(tint.opacity(0.15), tint, tint.opacity(0.4))
                             .small()
                             .child(SharedString::from(label.to_string())),
+                    )
+                })
+                .when_some(ci, |row, (color, label)| {
+                    let tint: Hsla = color.into();
+                    row.child(
+                        Tag::custom(tint.opacity(0.15), tint, tint.opacity(0.4))
+                            .small()
+                            .child(SharedString::from(label)),
                     )
                 }),
         )
