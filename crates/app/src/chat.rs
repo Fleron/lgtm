@@ -2,7 +2,7 @@ use crate::comments::{CommentThread, LocalReview};
 use crate::items::{dir_name, ItemState, Source};
 use crate::selection::selection_info;
 use crate::theme;
-use crate::{centered_message, row_height, ReviewApp};
+use crate::{centered_message, row_height, ReviewApp, TopView};
 use gpui::{
     div, prelude::*, px, Context, Hsla, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Window,
@@ -329,6 +329,9 @@ impl ReviewApp {
     /// `cmd-j`: toggle the chat panel; opening focuses the active item's
     /// chat input.
     pub(crate) fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.top_view != TopView::Review {
+            return;
+        }
         self.chat_visible = !self.chat_visible;
         if self.chat_visible {
             // The chat input can't take focus under the palette (same as the

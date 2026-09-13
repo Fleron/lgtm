@@ -14,6 +14,7 @@ mod subscriptions;
 mod theme;
 mod titlebar;
 mod sidebar;
+mod tracker;
 mod tree;
 
 use gpui::{
@@ -35,7 +36,7 @@ pub(crate) use diff::{
     SPLIT_DIVIDER,
 };
 
-pub(crate) use app::{app_title, centered_message, ReviewApp};
+pub(crate) use app::{app_title, centered_message, ReviewApp, TopView};
 pub(crate) use items::Source;
 pub(crate) use palette::SIDEBAR_MAX_LIST_HEIGHT;
 
@@ -56,6 +57,8 @@ actions!(
         ToggleView,
         Quit,
         ToggleSidebar,
+        ShowReview,
+        ShowTracker,
         OpenInput,
         CloseItem,
         NextItem,
@@ -173,6 +176,8 @@ fn main() {
                 KeyBinding::new("cmd-w", CloseItem, None),
                 KeyBinding::new("cmd-k", OpenPalette, None),
                 KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-1", ShowReview, None),
+                KeyBinding::new("cmd-2", ShowTracker, None),
                 // Palette navigation. The `Palette > Input` variants are bound
                 // after gpui_component::init, so at the input's dispatch depth
                 // they take precedence over the Input's own up/down (which a

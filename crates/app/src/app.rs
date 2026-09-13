@@ -14,8 +14,9 @@ use crate::subscriptions::{load_subscribed_repos, SubscribedRepo};
 use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom,
     GoToDefinition, GoToTop, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
-    OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, SubmitReview, ToggleChat,
-    ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, ZoomIn, ZoomOut, ZoomReset, MONO,
+    OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
+    ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, ZoomIn, ZoomOut,
+    ZoomReset, MONO,
 };
 use gpui::{
     div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
@@ -27,6 +28,13 @@ use gpui_component::{
     kbd::Kbd,
 };
 use std::sync::atomic::Ordering;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopView {
+    #[default]
+    Review,
+    Tracker,
+}
 
 pub(crate) fn centered_message(text: SharedString, color: gpui::Rgba) -> gpui::AnyElement {
     div()
@@ -63,6 +71,7 @@ pub(crate) fn app_title(detail: Option<String>) -> gpui::AnyElement {
 }
 
 pub(crate) struct ReviewApp {
+    pub(crate) top_view: TopView,
     pub(crate) items: Vec<ReviewItem>,
     pub(crate) active: usize,
     pub(crate) sidebar_visible: bool,
@@ -170,6 +179,7 @@ impl ReviewApp {
         ];
         let subscribed_repos = load_subscribed_repos();
         let mut this = Self {
+            top_view: TopView::default(),
             items: Vec::new(),
             active: 0,
             sidebar_visible: !errors.is_empty()
@@ -240,6 +250,14 @@ impl ReviewApp {
             // Minimap geometry is height-derived; drop the memoized layout.
             data.minimap_cache.replace(None);
         }
+        cx.notify();
+    }
+
+    pub(crate) fn show_view(&mut self, view: TopView, cx: &mut Context<Self>) {
+        if self.top_view == view {
+            return;
+        }
+        self.top_view = view;
         cx.notify();
     }
 
@@ -477,7 +495,7 @@ impl ReviewApp {
                     .child(SharedString::from(label)),
             )
         };
-        div()
+        let footer = div()
             .h(px(28.))
             .flex_shrink_0()
             .flex()
@@ -487,27 +505,47 @@ impl ReviewApp {
             .bg(theme::mantle())
             .border_t_1()
             .border_color(theme::surface0())
-            .text_size(px(12.))
-            .child(hint(&["]", "["], "files"))
-            .child(hint(&["n", "p"], "hunks"))
-            .child(hint(&["v"], "unified/split"))
-            .child(hint(&["m"], "minimap"))
-            .child(hint(&["c"], "comments"))
-            .child(hint(&["/"], "filter files"))
-            .child(hint(&["home", "end"], "top/bottom"))
-            .child(hint(&["cmd-k"], "palette"))
-            .child(hint(&["cmd-t"], "open"))
-            .child(hint(&["cmd-b"], "sidebar"))
-            .child(hint(&["cmd-j"], "chat"))
-            .child(hint(&["r"], "refresh"))
-            .child(hint(&["cmd-enter"], "review"))
+            .text_size(px(12.));
+        match self.top_view {
+            TopView::Review => footer
+                .child(hint(&["]", "["], "files"))
+                .child(hint(&["n", "p"], "hunks"))
+                .child(hint(&["v"], "unified/split"))
+                .child(hint(&["m"], "minimap"))
+                .child(hint(&["c"], "comments"))
+                .child(hint(&["/"], "filter files"))
+                .child(hint(&["home", "end"], "top/bottom"))
+                .child(hint(&["cmd-k"], "palette"))
+                .child(hint(&["cmd-t"], "open"))
+                .child(hint(&["cmd-b"], "sidebar"))
+                .child(hint(&["cmd-j"], "chat"))
+                .child(hint(&["r"], "refresh"))
+                .child(hint(&["cmd-enter"], "review")),
+            TopView::Tracker => footer
+                .child(hint(&["cmd-1"], "review"))
+                .child(hint(&["cmd-2"], "tracker"))
+                .child(hint(&["j", "k"], "move"))
+                .child(hint(&["tab"], "column"))
+                .child(hint(&["enter"], "open"))
+                .child(hint(&["s"], "start"))
+                .child(hint(&["r"], "review"))
+                .child(hint(&["d"], "done"))
+                .child(hint(&["n"], "new"))
+                .child(hint(&["/"], "filter"))
+                .child(hint(&["a"], "assignee"))
+                .child(hint(&["o"], "github"))
+                .child(hint(&["cmd-k"], "palette")),
+        }
     }
 }
 
 impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.resync_comment_wrap(window);
-        let pane: gpui::AnyElement = self.render_pane(window, cx);
+        let (pane, pane_key_context): (gpui::AnyElement, &'static str) = match self.top_view {
+            TopView::Review => (self.render_pane(window, cx), "ReviewApp"),
+            TopView::Tracker => (self.render_tracker_pane(cx), "Tracker"),
+        };
         div()
             .size_full()
             .relative()
@@ -577,6 +615,10 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowReview, _, cx| this.show_view(TopView::Review, cx)))
+            .on_action(cx.listener(|this, _: &ShowTracker, _, cx| {
+                this.show_view(TopView::Tracker, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
             .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
             .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
@@ -670,6 +712,9 @@ impl Render for ReviewApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenInput, window, cx| {
+                if this.top_view != TopView::Review {
+                    return;
+                }
                 // The sidebar input can't take focus under the palette.
                 this.palette = None;
                 this.palette_gen += 1;
@@ -679,6 +724,9 @@ impl Render for ReviewApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CloseItem, _, cx| {
+                if this.top_view != TopView::Review {
+                    return;
+                }
                 let active = this.active;
                 this.close_item(active, cx)
             }))
@@ -696,23 +744,25 @@ impl Render for ReviewApp {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .when(self.sidebar_visible, |main| {
-                        main.child(self.render_sidebar(cx))
+                    .when(self.sidebar_visible, |main| match self.top_view {
+                        TopView::Review => main.child(self.render_sidebar(cx)),
+                        TopView::Tracker => main.child(self.render_tracker_sidebar(cx)),
                     })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
-                            .key_context("ReviewApp")
+                            .key_context(pane_key_context)
                             .track_focus(&self.focus_handle)
                             .child(pane),
                     )
                     // Chat panel: a sibling of the diff pane, outside the
                     // "ReviewApp" key context so typing in its input never
                     // triggers diff keys — the same isolation the palette
-                    // and composer inputs rely on.
-                    .when(self.chat_visible, |main| {
+                    // and composer inputs rely on. Review-only: it never
+                    // renders in Tracker even if it was left open.
+                    .when(self.chat_visible && self.top_view == TopView::Review, |main| {
                         main.child(self.render_chat(window, cx))
                     }),
             )

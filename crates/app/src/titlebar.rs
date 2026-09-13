@@ -1,6 +1,6 @@
 use crate::items::{dir_name, ItemData, ItemState, Source};
 use crate::theme;
-use crate::{app_title, ReviewApp};
+use crate::{app_title, ReviewApp, TopView};
 use gpui::{div, prelude::*, px, Context, Hsla, SharedString};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -248,34 +248,67 @@ pub(crate) fn local_titlebar_content(
 }
 
 impl ReviewApp {
+    fn render_view_switch(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let review = Button::new("view-review")
+            .label("Review")
+            .xsmall()
+            .when(self.top_view == TopView::Review, |b| b.primary())
+            .when(self.top_view != TopView::Review, |b| b.ghost())
+            .on_click(cx.listener(|this, _, _, cx| this.show_view(TopView::Review, cx)));
+        let tracker = Button::new("view-tracker")
+            .label("Tracker")
+            .xsmall()
+            .when(self.top_view == TopView::Tracker, |b| b.primary())
+            .when(self.top_view != TopView::Tracker, |b| b.ghost())
+            .on_click(cx.listener(|this, _, _, cx| this.show_view(TopView::Tracker, cx)));
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_3()
+            .child(review)
+            .child(tracker)
+            .into_any_element()
+    }
+
     pub(crate) fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let content: gpui::AnyElement = match self.active_item() {
-            None => app_title(None),
-            Some(item) => match &item.state {
-                ItemState::Ready(data) => match &item.source {
-                    Source::Pr(_) => match &data.pr_meta {
-                        Some(meta) => pr_titlebar_content(meta, cx),
-                        None => app_title(None),
+        let content: Option<gpui::AnyElement> = match self.top_view {
+            TopView::Tracker => None,
+            TopView::Review => Some(match self.active_item() {
+                None => app_title(None),
+                Some(item) => match &item.state {
+                    ItemState::Ready(data) => match &item.source {
+                        Source::Pr(_) => match &data.pr_meta {
+                            Some(meta) => pr_titlebar_content(meta, cx),
+                            None => app_title(None),
+                        },
+                        Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
                     },
-                    Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
+                    ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
+                    ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
                 },
-                ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
-                ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
-            },
+            }),
         };
-        let note: Option<SharedString> = self.active_item().and_then(|item| {
-            if item.reloading {
-                Some("reloading…".into())
-            } else {
-                item.refresh_error
-                    .as_ref()
-                    .map(|err| SharedString::from(format!("refresh failed: {err}")))
-            }
-        });
+        let note: Option<SharedString> = (self.top_view == TopView::Review)
+            .then(|| self.active_item())
+            .flatten()
+            .and_then(|item| {
+                if item.reloading {
+                    Some("reloading…".into())
+                } else {
+                    item.refresh_error
+                        .as_ref()
+                        .map(|err| SharedString::from(format!("refresh failed: {err}")))
+                }
+            });
+        let lsp_status = (self.top_view == TopView::Review)
+            .then(|| self.render_lsp_status(cx))
+            .flatten();
         TitleBar::new()
             .text_size(px(13.))
-            .child(content)
-            .when_some(self.render_lsp_status(cx), |bar, status| bar.child(status))
+            .child(self.render_view_switch(cx))
+            .when_some(content, |bar, content| bar.child(content))
+            .when_some(lsp_status, |bar, status| bar.child(status))
             .when_some(note, |bar, note| {
                 bar.child(
                     div()
