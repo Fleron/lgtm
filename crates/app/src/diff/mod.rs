@@ -1,5 +1,6 @@
 mod gaps;
 mod highlight;
+mod render;
 
 pub(crate) use gaps::{push_gap_rows, run_upgrade, FileUpgrade, UpgradeJob, UpgradeSource};
 #[cfg(test)]

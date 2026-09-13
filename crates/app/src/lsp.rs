@@ -333,6 +333,7 @@ impl ReviewApp {
         cx.notify();
     }
 
+    /// The row + split half under the pointer if it can take a new comment:
     /// the pointer is inside the diff list, and the row has a line number on
     /// that side. PR items also need a known head oid for GitHub anchoring.
     pub(crate) fn hover_target(

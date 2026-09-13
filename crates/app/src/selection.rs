@@ -183,7 +183,8 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use crate::comments::COMMENT_WRAP_CHARS;
-    use crate::{build_rows, Cell, LineKind, ViewMode};
+    use crate::diff::build_rows;
+    use crate::{Cell, LineKind, ViewMode};
     use std::collections::HashMap;
 
     fn line(text: &str) -> Row {
