@@ -550,6 +550,475 @@ pub fn encode_path(path: &str) -> String {
     out
 }
 
+// --- Tracker: Projects v2 boards, fields, items, issue detail, writes ---
+
+/// One Projects v2 board, as returned by the `projectsV2` connection on a
+/// repository.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProjectBoard {
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+}
+
+/// Projects v2 boards linked to `owner/repo`, in the order GitHub returns
+/// them (the tracker uses the first one).
+pub fn list_project_boards(owner: &str, repo: &str) -> Result<Vec<ProjectBoard>> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Data,
+    }
+    #[derive(serde::Deserialize)]
+    struct Data {
+        repository: RepositoryField,
+    }
+    #[derive(serde::Deserialize)]
+    struct RepositoryField {
+        #[serde(rename = "projectsV2")]
+        projects_v2: Connection,
+    }
+    #[derive(serde::Deserialize)]
+    struct Connection {
+        nodes: Vec<ProjectBoard>,
+    }
+
+    const QUERY: &str = "query($owner:String!,$repo:String!){\
+        repository(owner:$owner,name:$repo){\
+        projectsV2(first:10){nodes{id number title}}}}";
+
+    let json = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={QUERY}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("repo={repo}"),
+    ])?;
+    let resp: Resp =
+        serde_json::from_str(&json).context("unexpected gh graphql projectsV2 JSON")?;
+    Ok(resp.data.repository.projects_v2.nodes)
+}
+
+/// A single-select field's option, in board order.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProjectFieldOption {
+    pub id: String,
+    pub name: String,
+}
+
+/// A project field. `options` is empty for non-single-select fields (Title,
+/// text, date, ...).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProjectField {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub options: Vec<ProjectFieldOption>,
+}
+
+/// Fields on project `number` (owned by `owner`), via `gh project field-list`.
+pub fn project_fields(owner: &str, number: u64) -> Result<Vec<ProjectField>> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        fields: Vec<ProjectField>,
+    }
+    let json = gh(&[
+        "project",
+        "field-list",
+        &number.to_string(),
+        "--owner",
+        owner,
+        "--format",
+        "json",
+    ])?;
+    let resp: Resp =
+        serde_json::from_str(&json).context("unexpected gh project field-list JSON")?;
+    Ok(resp.fields)
+}
+
+/// The `content` an item wraps: an issue, a PR, or a draft issue.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProjectItemContent {
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub repository: String,
+}
+
+/// One row of `gh project item-list`, with the Status/Due/Priority fields
+/// the tracker board is expected to have (empty string when unset).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProjectItem {
+    pub id: String,
+    #[serde(default)]
+    pub content: ProjectItemContent,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub due: String,
+    #[serde(default)]
+    pub priority: String,
+}
+
+/// Never page past this many items in one tracker refresh.
+const MAX_PROJECT_ITEMS: &str = "500";
+
+/// Items on project `number`, filtered to issues (drafts and PRs dropped).
+pub fn project_items(owner: &str, number: u64) -> Result<Vec<ProjectItem>> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        items: Vec<ProjectItem>,
+    }
+    let json = gh(&[
+        "project",
+        "item-list",
+        &number.to_string(),
+        "--owner",
+        owner,
+        "--format",
+        "json",
+        "--limit",
+        MAX_PROJECT_ITEMS,
+    ])?;
+    let resp: Resp = serde_json::from_str(&json).context("unexpected gh project item-list JSON")?;
+    Ok(resp
+        .items
+        .into_iter()
+        .filter(|item| item.content.kind == "Issue")
+        .collect())
+}
+
+/// Set a single-select field on a project item (e.g. Status, Priority) via
+/// `gh project item-edit`. `project_id` and `item_id` are Projects v2 node
+/// ids, not the issue number.
+pub fn set_project_field(project_id: &str, item_id: &str, field_id: &str, option_id: &str) -> Result<()> {
+    gh(&[
+        "project",
+        "item-edit",
+        "--id",
+        item_id,
+        "--project-id",
+        project_id,
+        "--field-id",
+        field_id,
+        "--single-select-option-id",
+        option_id,
+    ])?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct RawLogin {
+    login: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct NodesConnection<T> {
+    #[serde(default)]
+    nodes: Vec<T>,
+}
+
+/// A label on an issue.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct IssueLabel {
+    pub name: String,
+    pub color: String,
+}
+
+/// An issue's milestone, if any.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueMilestone {
+    pub title: String,
+    #[serde(default)]
+    pub due_on: Option<String>,
+}
+
+/// A sub-issue, or the issue's own row in `subIssues`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SubIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+}
+
+/// Sub-issue completion counts, straight from `subIssuesSummary`.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+pub struct SubIssuesSummary {
+    pub total: u64,
+    pub completed: u64,
+}
+
+/// The issue this one is a sub-issue of, if any.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ParentIssue {
+    pub number: u64,
+    pub title: String,
+}
+
+/// A PR linked to the issue via `closedByPullRequestsReferences`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedPr {
+    pub number: u64,
+    pub state: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    pub url: String,
+}
+
+/// One issue comment.
+#[derive(Debug, Clone, Default)]
+pub struct IssueComment {
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// Full detail for one issue: everything the tracker's issue panel shows.
+#[derive(Debug, Clone, Default)]
+pub struct IssueDetail {
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub url: String,
+    pub created_at: String,
+    pub assignees: Vec<String>,
+    pub labels: Vec<IssueLabel>,
+    pub milestone: Option<IssueMilestone>,
+    /// GitHub issue type name (Bug, Feature, ...), when the org has them
+    /// enabled; absent otherwise.
+    pub issue_type: Option<String>,
+    pub sub_issues: Vec<SubIssue>,
+    pub sub_issues_summary: SubIssuesSummary,
+    pub parent: Option<ParentIssue>,
+    pub linked_prs: Vec<LinkedPr>,
+    pub comments: Vec<IssueComment>,
+}
+
+/// The GraphQL response shape, matching `ISSUE_DETAIL_QUERY` field for
+/// field; converted into the flatter [`IssueDetail`] callers use.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueDetail {
+    title: String,
+    #[serde(default)]
+    body: String,
+    state: String,
+    url: String,
+    created_at: String,
+    #[serde(default)]
+    assignees: NodesConnection<RawLogin>,
+    #[serde(default)]
+    labels: NodesConnection<IssueLabel>,
+    #[serde(default)]
+    milestone: Option<IssueMilestone>,
+    #[serde(default)]
+    issue_type: Option<IssueTypeName>,
+    #[serde(default)]
+    sub_issues: NodesConnection<SubIssue>,
+    #[serde(default)]
+    sub_issues_summary: SubIssuesSummary,
+    #[serde(default)]
+    parent: Option<ParentIssue>,
+    #[serde(default)]
+    closed_by_pull_requests_references: NodesConnection<LinkedPr>,
+    #[serde(default)]
+    comments: NodesConnection<RawIssueComment>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct IssueTypeName {
+    name: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueComment {
+    author: RawLogin,
+    body: String,
+    created_at: String,
+}
+
+impl From<RawIssueDetail> for IssueDetail {
+    fn from(raw: RawIssueDetail) -> Self {
+        IssueDetail {
+            title: raw.title,
+            body: raw.body,
+            state: raw.state,
+            url: raw.url,
+            created_at: raw.created_at,
+            assignees: raw.assignees.nodes.into_iter().map(|a| a.login).collect(),
+            labels: raw.labels.nodes,
+            milestone: raw.milestone,
+            issue_type: raw.issue_type.map(|t| t.name),
+            sub_issues: raw.sub_issues.nodes,
+            sub_issues_summary: raw.sub_issues_summary,
+            parent: raw.parent,
+            linked_prs: raw.closed_by_pull_requests_references.nodes,
+            comments: raw
+                .comments
+                .nodes
+                .into_iter()
+                .map(|c| IssueComment {
+                    author: c.author.login,
+                    body: c.body,
+                    created_at: c.created_at,
+                })
+                .collect(),
+        }
+    }
+}
+
+const ISSUE_DETAIL_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!){\
+    repository(owner:$owner,name:$repo){\
+    issue(number:$number){\
+    title body state url createdAt \
+    assignees(first:20){nodes{login}} \
+    labels(first:20){nodes{name color}} \
+    milestone{title dueOn} \
+    issueType{name} \
+    subIssues(first:50){nodes{number title state}} \
+    subIssuesSummary{total completed} \
+    parent{number title} \
+    closedByPullRequestsReferences(first:20){nodes{number state isDraft url}} \
+    comments(first:50){nodes{author{login} body createdAt}}\
+    }}}";
+
+/// Full detail for `owner/repo#number`: title, body, assignees, labels,
+/// milestone, issue type, sub-issues (with summary), parent, linked PRs and
+/// comments, in one GraphQL round trip. Blocked-by relations are not
+/// included: GitHub's sub-issues GraphQL surface does not yet document a
+/// stable `blockedBy` connection on `Issue`, and an unknown field fails the
+/// whole query rather than degrading gracefully.
+pub fn issue_detail(owner: &str, repo: &str, number: u64) -> Result<IssueDetail> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Data,
+    }
+    #[derive(serde::Deserialize)]
+    struct Data {
+        repository: RepositoryField,
+    }
+    #[derive(serde::Deserialize)]
+    struct RepositoryField {
+        issue: RawIssueDetail,
+    }
+
+    let json = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={ISSUE_DETAIL_QUERY}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("repo={repo}"),
+        "-F",
+        &format!("number={number}"),
+    ])?;
+    let resp: Resp = serde_json::from_str(&json).context("unexpected gh graphql issue JSON")?;
+    Ok(resp.data.repository.issue.into())
+}
+
+/// Link `child_number` as a sub-issue of `parent_number`, via the REST
+/// sub-issues endpoint. Looks up the child's numeric database id first
+/// (the endpoint wants that, not the issue number).
+pub fn add_sub_issue(owner: &str, repo: &str, parent_number: u64, child_number: u64) -> Result<()> {
+    let child_id = gh(&[
+        "api",
+        &format!("repos/{owner}/{repo}/issues/{child_number}"),
+        "--jq",
+        ".id",
+    ])?;
+    gh(&[
+        "api",
+        "-X",
+        "POST",
+        &format!("repos/{owner}/{repo}/issues/{parent_number}/sub_issues"),
+        "-F",
+        &format!("sub_issue_id={}", child_id.trim()),
+    ])?;
+    Ok(())
+}
+
+/// Create an issue and return its number, parsed from `gh issue create`'s
+/// printed URL.
+pub fn create_issue(
+    owner: &str,
+    repo: &str,
+    title: &str,
+    body: &str,
+    labels: &[String],
+    milestone: Option<&str>,
+) -> Result<u64> {
+    let slug = format!("{owner}/{repo}");
+    let label_arg = labels.join(",");
+    let mut args = vec![
+        "issue", "create", "--repo", &slug, "--title", title, "--body", body,
+    ];
+    if !labels.is_empty() {
+        args.push("--label");
+        args.push(&label_arg);
+    }
+    if let Some(milestone) = milestone {
+        args.push("--milestone");
+        args.push(milestone);
+    }
+    let out = gh(&args)?;
+    let url = out.trim();
+    url.rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("couldn't parse issue number from gh issue create output: {url}"))
+}
+
+/// Add an existing issue (by URL) to a project board.
+pub fn add_item_to_project(owner: &str, project_number: u64, issue_url: &str) -> Result<()> {
+    gh(&[
+        "project",
+        "item-add",
+        &project_number.to_string(),
+        "--owner",
+        owner,
+        "--url",
+        issue_url,
+    ])?;
+    Ok(())
+}
+
+pub fn post_issue_comment(owner: &str, repo: &str, number: u64, body: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "comment",
+        &number.to_string(),
+        "--repo",
+        &format!("{owner}/{repo}"),
+        "--body",
+        body,
+    ])?;
+    Ok(())
+}
+
+pub fn update_issue_body(owner: &str, repo: &str, number: u64, body: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        &format!("{owner}/{repo}"),
+        "--body",
+        body,
+    ])?;
+    Ok(())
+}
+
 fn gh(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
         .args(args)
@@ -794,5 +1263,166 @@ mod tests {
         assert_eq!(prs[0].head_ref_name, "field-name-terminator");
         assert_eq!(prs[0].updated_at, "2026-07-01T12:34:56Z");
         assert!(prs[1].is_draft);
+    }
+
+    #[test]
+    fn deserializes_project_field_list_json() {
+        // Shaped like `gh project field-list --format json`.
+        let json = r#"{
+            "fields": [
+                {
+                    "id": "PVTF_1",
+                    "name": "Status",
+                    "type": "ProjectV2SingleSelectField",
+                    "options": [
+                        {"id": "opt_backlog", "name": "Backlog"},
+                        {"id": "opt_todo", "name": "Todo"},
+                        {"id": "opt_done", "name": "Done"}
+                    ]
+                },
+                {
+                    "id": "PVTF_2",
+                    "name": "Due",
+                    "type": "ProjectV2Field"
+                }
+            ]
+        }"#;
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            fields: Vec<ProjectField>,
+        }
+        let resp: Resp = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.fields.len(), 2);
+        assert_eq!(resp.fields[0].name, "Status");
+        assert_eq!(resp.fields[0].options.len(), 3);
+        assert_eq!(resp.fields[0].options[0].name, "Backlog");
+        assert_eq!(resp.fields[1].name, "Due");
+        assert!(resp.fields[1].options.is_empty());
+    }
+
+    #[test]
+    fn deserializes_project_item_list_json() {
+        // Shaped like `gh project item-list --format json`, mixing an
+        // issue (kept), a draft issue and a PR (both dropped).
+        let json = r#"{
+            "items": [
+                {
+                    "id": "PVTI_1",
+                    "content": {
+                        "type": "Issue",
+                        "number": 42,
+                        "title": "printer: crashes on empty input",
+                        "repository": "acme/widgets"
+                    },
+                    "status": "In Progress",
+                    "due": "2026-09-20",
+                    "priority": "High"
+                },
+                {
+                    "id": "PVTI_2",
+                    "content": {
+                        "type": "DraftIssue",
+                        "title": "sketch an idea"
+                    }
+                },
+                {
+                    "id": "PVTI_3",
+                    "content": {
+                        "type": "PullRequest",
+                        "number": 7,
+                        "title": "fix: printer crash",
+                        "repository": "acme/widgets"
+                    },
+                    "status": "In Progress"
+                }
+            ],
+            "totalCount": 3
+        }"#;
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            items: Vec<ProjectItem>,
+        }
+        let resp: Resp = serde_json::from_str(json).unwrap();
+        let issues: Vec<_> = resp
+            .items
+            .into_iter()
+            .filter(|item| item.content.kind == "Issue")
+            .collect();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].content.number, 42);
+        assert_eq!(issues[0].status, "In Progress");
+        assert_eq!(issues[0].due, "2026-09-20");
+        assert_eq!(issues[0].priority, "High");
+    }
+
+    #[test]
+    fn deserializes_issue_detail_graphql_json() {
+        // Shaped like the `issue` field of `ISSUE_DETAIL_QUERY`'s response.
+        let json = r#"{
+            "title": "printer: crashes on empty input",
+            "body": "Steps to reproduce...",
+            "state": "OPEN",
+            "url": "https://github.com/acme/widgets/issues/42",
+            "createdAt": "2026-08-01T09:00:00Z",
+            "assignees": {"nodes": [{"login": "alice"}]},
+            "labels": {"nodes": [{"name": "bug", "color": "d73a4a"}]},
+            "milestone": {"title": "v2.0", "dueOn": "2026-10-01T00:00:00Z"},
+            "issueType": {"name": "Bug"},
+            "subIssues": {"nodes": [{"number": 43, "title": "reproduce on CI", "state": "CLOSED"}]},
+            "subIssuesSummary": {"total": 1, "completed": 1},
+            "parent": {"number": 10, "title": "printer stability"},
+            "closedByPullRequestsReferences": {
+                "nodes": [{"number": 55, "state": "OPEN", "isDraft": false, "url": "https://github.com/acme/widgets/pull/55"}]
+            },
+            "comments": {
+                "nodes": [{"author": {"login": "bob"}, "body": "looking into it", "createdAt": "2026-08-02T10:00:00Z"}]
+            }
+        }"#;
+        let raw: RawIssueDetail = serde_json::from_str(json).unwrap();
+        let detail: IssueDetail = raw.into();
+        assert_eq!(detail.title, "printer: crashes on empty input");
+        assert_eq!(detail.created_at, "2026-08-01T09:00:00Z");
+        assert_eq!(detail.assignees, vec!["alice".to_string()]);
+        assert_eq!(detail.labels[0].name, "bug");
+        assert_eq!(detail.milestone.as_ref().unwrap().title, "v2.0");
+        assert_eq!(
+            detail.milestone.as_ref().unwrap().due_on.as_deref(),
+            Some("2026-10-01T00:00:00Z")
+        );
+        assert_eq!(detail.issue_type.as_deref(), Some("Bug"));
+        assert_eq!(detail.sub_issues.len(), 1);
+        assert_eq!(detail.sub_issues[0].number, 43);
+        assert_eq!(detail.sub_issues_summary.total, 1);
+        assert_eq!(detail.sub_issues_summary.completed, 1);
+        assert_eq!(detail.parent.as_ref().unwrap().number, 10);
+        assert_eq!(detail.linked_prs[0].number, 55);
+        assert!(!detail.linked_prs[0].is_draft);
+        assert_eq!(detail.comments[0].author, "bob");
+        assert_eq!(detail.comments[0].body, "looking into it");
+    }
+
+    #[test]
+    fn deserializes_issue_detail_with_missing_optional_fields() {
+        // No milestone, no issue type, no parent, no sub-issues: everything
+        // that's `Option`/`Vec` should default rather than fail.
+        let json = r#"{
+            "title": "quick fix",
+            "state": "OPEN",
+            "url": "https://github.com/acme/widgets/issues/50",
+            "createdAt": "2026-08-01T09:00:00Z",
+            "assignees": {"nodes": []},
+            "labels": {"nodes": []},
+            "subIssues": {"nodes": []},
+            "subIssuesSummary": {"total": 0, "completed": 0},
+            "closedByPullRequestsReferences": {"nodes": []},
+            "comments": {"nodes": []}
+        }"#;
+        let raw: RawIssueDetail = serde_json::from_str(json).unwrap();
+        let detail: IssueDetail = raw.into();
+        assert_eq!(detail.body, "");
+        assert!(detail.milestone.is_none());
+        assert!(detail.issue_type.is_none());
+        assert!(detail.parent.is_none());
+        assert!(detail.sub_issues.is_empty());
     }
 }
