@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 brokk-bifrost = "0.8.0"
 claude = { path = "../claude" }
+codex = { path = "../codex" }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
 git = { path = "../git" }

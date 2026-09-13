@@ -32,7 +32,7 @@ pub enum ChatEvent {
     /// The final `result` event of a run.
     Completed {
         session_id: String,
-        cost_usd: f64,
+        cost_usd: Option<f64>,
         is_error: bool,
         /// The complete response text (authoritative; deltas may be a
         /// strict prefix if the stream was interrupted).
@@ -118,10 +118,7 @@ pub fn parse_line(line: &str) -> Option<ChatEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            cost_usd: value
-                .get("total_cost_usd")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
+            cost_usd: value.get("total_cost_usd").and_then(|v| v.as_f64()),
             is_error: value
                 .get("is_error")
                 .and_then(|v| v.as_bool())
@@ -240,7 +237,7 @@ mod tests {
             parse_line(line),
             Some(ChatEvent::Completed {
                 session_id: "abc-123".into(),
-                cost_usd: 0.0123,
+                cost_usd: Some(0.0123),
                 is_error: false,
                 text: "final text".into(),
             })

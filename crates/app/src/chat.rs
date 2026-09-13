@@ -4,13 +4,14 @@ use crate::selection::selection_info;
 use crate::theme;
 use crate::{centered_message, row_height, ReviewApp};
 use gpui::{
-    div, prelude::*, px, Context, ScrollHandle, ScrollWheelEvent, SharedString,
+    div, prelude::*, px, Context, Hsla, ScrollHandle, ScrollWheelEvent, SharedString,
     Subscription, Window,
 };
 use gpui_component::{
     button::Button,
     input::{Escape as InputEscape, Input, InputEvent, InputState},
-    Sizable as _,
+    tooltip::Tooltip,
+    Icon, IconName, Sizable as _,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +35,34 @@ const CHAT_SYSTEM_PROMPT: &str =
 pub(crate) enum ChatRole {
     User,
     Assistant,
+}
+
+/// Which backend answers chat turns for an item. Per-item (lives on
+/// `ChatState`) and resets to `Claude` whenever the item is (re)opened; no
+/// persistence, modeled on `LspBackend`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum ChatBackend {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl ChatBackend {
+    /// Short name for the status chip.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ChatBackend::Claude => "Claude",
+            ChatBackend::Codex => "Codex",
+        }
+    }
+
+    /// The other backend, for the click-to-switch toggle.
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            ChatBackend::Claude => ChatBackend::Codex,
+            ChatBackend::Codex => ChatBackend::Claude,
+        }
+    }
 }
 
 pub(crate) struct ChatMessage {
@@ -67,6 +96,9 @@ pub(crate) struct ChatState {
     /// root for local items, a materialized scratch dir for PR items with
     /// blob-upgraded contents, None otherwise.
     pub(crate) explore_dir: Option<std::path::PathBuf>,
+    /// Which backend answers this item's chat turns; the chat panel's status
+    /// chip toggles it and starts a new conversation.
+    pub(crate) backend: ChatBackend,
 }
 
 impl ChatState {
@@ -81,6 +113,7 @@ impl ChatState {
             scroll: ScrollHandle::new(),
             stick_to_bottom: true,
             explore_dir: None,
+            backend: ChatBackend::default(),
         }
     }
 }
@@ -353,6 +386,26 @@ impl ReviewApp {
         true
     }
 
+    /// Switch the active item's chat backend (Claude ↔ Codex), stopping any
+    /// in-flight run first and starting a fresh conversation. Driven by
+    /// clicking the backend status chip in the chat panel.
+    pub(crate) fn toggle_chat_backend(&mut self, cx: &mut Context<Self>) {
+        self.cancel_chat(cx);
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        let chat = &mut data.chat;
+        chat.backend = chat.backend.toggled();
+        chat.messages.clear();
+        chat.session_id = None;
+        // The stopped run's Completed/Failed event can still land after
+        // this: in_flight = false makes apply_chat_events/finish_chat
+        // early-return instead of stamping the old run's session id (or a
+        // stray "— stopped") onto the fresh transcript.
+        chat.in_flight = false;
+        cx.notify();
+    }
+
     /// Send the chat input's text: append the user message (with a selection
     /// marker when one is included), stream the reply on the background
     /// executor, and batch deltas back at ~50ms into the transcript.
@@ -432,6 +485,7 @@ impl ReviewApp {
 
         let session = data.chat.session_id.clone();
         let system_prompt = first.then(|| CHAT_SYSTEM_PROMPT.to_string());
+        let backend = data.chat.backend;
         let cancel = Arc::new(AtomicBool::new(false));
         data.chat.cancel = cancel.clone();
         data.chat.in_flight = true;
@@ -471,17 +525,31 @@ impl ReviewApp {
                 })
                 .ok();
             }
-            let opts = claude::ChatOptions {
-                session,
-                system_prompt,
-                explore_dir,
-            };
             let (tx, rx) = std::sync::mpsc::channel();
             let cancel_bg = cancel.clone();
             let task = cx.background_spawn(async move {
-                claude::chat(&prompt, &opts, &cancel_bg, |event| {
-                    let _ = tx.send(event);
-                })
+                match backend {
+                    ChatBackend::Claude => {
+                        let opts = claude::ChatOptions {
+                            session,
+                            system_prompt,
+                            explore_dir,
+                        };
+                        claude::chat(&prompt, &opts, &cancel_bg, |event| {
+                            let _ = tx.send(event);
+                        })
+                    }
+                    ChatBackend::Codex => {
+                        let opts = codex::ChatOptions {
+                            session,
+                            system_prompt,
+                            explore_dir,
+                        };
+                        codex::chat(&prompt, &opts, &cancel_bg, |event| {
+                            let _ = tx.send(event);
+                        })
+                    }
+                }
             });
             // Throttled pump: every ~50ms drain whatever streamed in and
             // apply it as one entity update — never one update per token.
@@ -573,7 +641,7 @@ impl ReviewApp {
                         if !text.is_empty() {
                             msg.text = text;
                         }
-                        msg.cost = Some(cost_usd);
+                        msg.cost = cost_usd;
                         msg.error = is_error;
                     }
                 }
@@ -628,6 +696,46 @@ impl ReviewApp {
         cx.notify();
     }
 
+    /// Status-chip-style backend toggle for the chat panel header, matching
+    /// `render_lsp_status`'s visual treatment. Clicking it stops any
+    /// in-flight run, clears the transcript, and switches backend.
+    pub(crate) fn render_chat_backend(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let backend = self
+            .active_data()
+            .map(|data| data.chat.backend)
+            .unwrap_or_default();
+        let color = theme::overlay0();
+        let text = SharedString::from(backend.label());
+        let other = backend.toggled().label();
+        div()
+            .id("chat-backend-toggle")
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .pr_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(Hsla::from(color).opacity(0.45))
+            .bg(Hsla::from(color).opacity(0.1))
+            .text_size(px(11.))
+            .text_color(color)
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(Hsla::from(color).opacity(0.2))
+                    .border_color(Hsla::from(color).opacity(0.8))
+            })
+            .tooltip(move |window, cx| {
+                Tooltip::new(format!("Switch chat to {other}")).build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_chat_backend(cx)))
+            .child(text)
+            .child(Icon::new(IconName::ChevronDown).xsmall())
+            .into_any_element()
+    }
+
     /// The right-side chat panel: header (+ Stop while streaming), the
     /// scrollable transcript, and the multi-line input. Streaming behavior
     /// (auto-scroll, live deltas, cancel) is verified manually.
@@ -675,12 +783,7 @@ impl ReviewApp {
                     .text_color(theme::text())
                     .child(SharedString::from("chat")),
             )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("claude")),
-            )
+            .child(self.render_chat_backend(cx))
             .child(div().flex_1());
         if chat.in_flight {
             header = header.child(Button::new("chat-stop").label("Stop").small().on_click(
@@ -695,9 +798,10 @@ impl ReviewApp {
             column = column.child(
                 div()
                     .text_color(theme::overlay0())
-                    .child(SharedString::from(
-                    "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
-                )),
+                    .child(SharedString::from(format!(
+                        "Ask {} about this diff. Select text in the diff to include it. ⌘⏎ sends.",
+                        chat.backend.label(),
+                    ))),
             );
         }
         let last = chat.messages.len().saturating_sub(1);

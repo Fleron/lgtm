@@ -55,25 +55,11 @@ pub struct ChatOptions {
     pub explore_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChatEvent {
-    /// One streamed chunk of assistant text.
-    TextDelta(String),
-    /// The turn reached a terminal, non-cancelled state.
-    Completed {
-        /// The Codex thread id, for `ChatOptions::session` on the next turn.
-        session_id: String,
-        /// Codex's app-server protocol doesn't report a per-turn cost;
-        /// always None. Kept `Option` (unlike claude's `f64`) so callers can
-        /// omit the cost line instead of showing a placeholder.
-        cost_usd: Option<f64>,
-        is_error: bool,
-        text: String,
-    },
-    /// The subprocess failed: spawn-adjacent protocol error, a non-retrying
-    /// `error` notification, or the stream ended without a terminal event.
-    Failed(String),
-}
+/// Same event shape as `claude::chat` (`TextDelta`/`Completed`/`Failed`), so
+/// the app's chat rendering code doesn't need to know which backend ran.
+/// Codex's app-server protocol doesn't report a per-turn cost, so `Completed`
+/// is always built with `cost_usd: None`.
+pub use claude::ChatEvent;
 
 /// One parsed server notification, decoupled from `ChatEvent` so mapping is
 /// a pure `&str -> Option<Parsed>` function tests can exercise directly.
