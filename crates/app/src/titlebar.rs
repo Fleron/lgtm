@@ -8,6 +8,7 @@ use gpui_component::{
     Icon, IconName, Sizable as _, TitleBar,
 };
 
+/// Icon-only review + CI summary for a sidebar PR row: a warning triangle
 /// while a review is still required (a green check once it isn't), plus a
 /// passed/total CI count when the PR has any checks at all. Used in both the
 /// subscribed-PRs feed (before a PR is opened) and the open-items list
