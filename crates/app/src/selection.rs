@@ -182,7 +182,8 @@ pub(crate) fn selection_info(
 mod tests {
     use super::*;
     use crate::test_util::*;
-    use crate::{build_rows, Cell, LineKind, ViewMode, COMMENT_WRAP_CHARS};
+    use crate::comments::COMMENT_WRAP_CHARS;
+    use crate::{build_rows, Cell, LineKind, ViewMode};
     use std::collections::HashMap;
 
     fn line(text: &str) -> Row {
