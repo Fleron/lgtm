@@ -15,6 +15,8 @@ mod theme;
 mod titlebar;
 mod sidebar;
 mod tracker;
+mod tracker_panel;
+mod tracker_table;
 mod tree;
 mod urgency;
 
@@ -81,7 +83,20 @@ actions!(
         ZoomReset,
         GoToDefinition,
         NavBack,
-        NavForward
+        NavForward,
+        TrackerDown,
+        TrackerUp,
+        TrackerNextColumn,
+        TrackerOpen,
+        TrackerBack,
+        TrackerSetFlight,
+        TrackerSetReview,
+        TrackerSetHidden,
+        TrackerNewIssue,
+        TrackerFocusFilter,
+        TrackerCycleAssignee,
+        TrackerOpenGithub,
+        TrackerClosePanel
     ]
 );
 
@@ -132,7 +147,7 @@ fn main() {
     }
 
     Application::new()
-        .with_assets(gpui_component_assets::Assets)
+        .with_assets(tracker::TrackerAssets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             theme::apply_ui_theme(cx);
@@ -179,6 +194,19 @@ fn main() {
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-1", ShowReview, None),
                 KeyBinding::new("cmd-2", ShowTracker, None),
+                KeyBinding::new("j", TrackerDown, Some("Tracker")),
+                KeyBinding::new("k", TrackerUp, Some("Tracker")),
+                KeyBinding::new("tab", TrackerNextColumn, Some("Tracker")),
+                KeyBinding::new("enter", TrackerOpen, Some("Tracker")),
+                KeyBinding::new("backspace", TrackerBack, Some("Tracker")),
+                KeyBinding::new("s", TrackerSetFlight, Some("Tracker")),
+                KeyBinding::new("r", TrackerSetReview, Some("Tracker")),
+                KeyBinding::new("d", TrackerSetHidden, Some("Tracker")),
+                KeyBinding::new("n", TrackerNewIssue, Some("Tracker")),
+                KeyBinding::new("/", TrackerFocusFilter, Some("Tracker")),
+                KeyBinding::new("a", TrackerCycleAssignee, Some("Tracker")),
+                KeyBinding::new("o", TrackerOpenGithub, Some("Tracker")),
+                KeyBinding::new("escape", TrackerClosePanel, Some("Tracker")),
                 // Palette navigation. The `Palette > Input` variants are bound
                 // after gpui_component::init, so at the input's dispatch depth
                 // they take precedence over the Input's own up/down (which a

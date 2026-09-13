@@ -15,8 +15,10 @@ use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom,
     GoToDefinition, GoToTop, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
-    ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, ZoomIn, ZoomOut,
-    ZoomReset, MONO,
+    ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, TrackerBack,
+    TrackerClosePanel, TrackerCycleAssignee, TrackerDown, TrackerFocusFilter, TrackerNewIssue,
+    TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerSetFlight, TrackerSetHidden,
+    TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
 };
 use gpui::{
     div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
@@ -119,6 +121,7 @@ pub(crate) struct ReviewApp {
     /// next scheduled refresh.
     pub(crate) subscribed_refreshing: bool,
     pub(crate) subscribed_scroll: ScrollHandle,
+    pub(crate) tracker: crate::tracker::TrackerState,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -134,7 +137,8 @@ impl ReviewApp {
         let palette_input = cx.new(|cx| InputState::new(window, cx));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
-        let _subscriptions = vec![
+        let (tracker, tracker_subscriptions) = crate::tracker::TrackerState::new(window, cx);
+        let mut _subscriptions = vec![
             // Best-effort cleanup of every item's chat scratch dir on quit
             // (close_item handles the per-item case).
             cx.on_app_quit(|this: &mut Self, _cx| {
@@ -177,6 +181,7 @@ impl ReviewApp {
                 },
             ),
         ];
+        _subscriptions.extend(tracker_subscriptions);
         let subscribed_repos = load_subscribed_repos();
         let mut this = Self {
             top_view: TopView::default(),
@@ -208,6 +213,7 @@ impl ReviewApp {
             subscribed_repos,
             subscribed_refreshing: false,
             subscribed_scroll: ScrollHandle::new(),
+            tracker,
             _subscriptions,
         };
         this.refresh_cached_prs(cx);
@@ -258,6 +264,9 @@ impl ReviewApp {
             return;
         }
         self.top_view = view;
+        if view == TopView::Tracker && !self.tracker.loaded && !self.tracker.loading {
+            self.tracker_load(cx);
+        }
         cx.notify();
     }
 
@@ -619,6 +628,22 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &ShowTracker, _, cx| {
                 this.show_view(TopView::Tracker, cx)
             }))
+            .on_action(cx.listener(|this, _: &TrackerDown, _, cx| this.tracker_move(1, cx)))
+            .on_action(cx.listener(|this, _: &TrackerUp, _, cx| this.tracker_move(-1, cx)))
+            .on_action(cx.listener(|this, _: &TrackerNextColumn, _, cx| this.tracker_next_column(cx)))
+            .on_action(cx.listener(|this, _: &TrackerOpen, window, cx| this.tracker_open(window, cx)))
+            .on_action(cx.listener(|this, _: &TrackerBack, _, cx| this.tracker_back(cx)))
+            .on_action(cx.listener(|this, _: &TrackerSetFlight, _, cx| this.tracker_set_first_flight(cx)))
+            .on_action(cx.listener(|this, _: &TrackerSetReview, _, cx| this.tracker_set_named_status("In review", cx)))
+            .on_action(cx.listener(|this, _: &TrackerSetHidden, _, cx| this.tracker_set_first_hidden(cx)))
+            .on_action(cx.listener(|this, _: &TrackerNewIssue, window, cx| this.tracker_open_new_issue_composer(None, window, cx)))
+            .on_action(cx.listener(|this, _: &TrackerFocusFilter, window, cx| {
+                let input = this.tracker.filter_input.clone();
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &TrackerCycleAssignee, _, cx| this.tracker_cycle_assignee(cx)))
+            .on_action(cx.listener(|this, _: &TrackerOpenGithub, _, cx| this.tracker_open_selected_on_github(cx)))
+            .on_action(cx.listener(|this, _: &TrackerClosePanel, _, cx| this.tracker_close_panel(cx)))
             .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
             .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
             .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
@@ -764,7 +789,11 @@ impl Render for ReviewApp {
                     // renders in Tracker even if it was left open.
                     .when(self.chat_visible && self.top_view == TopView::Review, |main| {
                         main.child(self.render_chat(window, cx))
-                    }),
+                    })
+                    .when(
+                        self.top_view == TopView::Tracker && self.tracker.open_issue().is_some(),
+                        |main| main.child(self.render_tracker_panel(cx)),
+                    ),
             )
             .child(self.render_footer())
             // Root-level so the composer's input escapes the "ReviewApp" key

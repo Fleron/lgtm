@@ -273,7 +273,7 @@ impl ReviewApp {
 
     pub(crate) fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let content: Option<gpui::AnyElement> = match self.top_view {
-            TopView::Tracker => None,
+            TopView::Tracker => Some(self.render_tracker_titlebar_content(cx)),
             TopView::Review => Some(match self.active_item() {
                 None => app_title(None),
                 Some(item) => match &item.state {
@@ -301,9 +301,10 @@ impl ReviewApp {
                         .map(|err| SharedString::from(format!("refresh failed: {err}")))
                 }
             });
-        let lsp_status = (self.top_view == TopView::Review)
-            .then(|| self.render_lsp_status(cx))
-            .flatten();
+        let lsp_status = match self.top_view {
+            TopView::Review => self.render_lsp_status(cx),
+            TopView::Tracker => Some(self.render_tracker_assignee_chip(cx)),
+        };
         TitleBar::new()
             .text_size(px(13.))
             .child(self.render_view_switch(cx))

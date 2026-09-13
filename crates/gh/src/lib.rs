@@ -1019,6 +1019,12 @@ pub fn update_issue_body(owner: &str, repo: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+/// The authenticated `gh` user's login, for the tracker's assignee filter.
+pub fn current_user_login() -> Result<String> {
+    let login = gh(&["api", "user", "--jq", ".login"])?;
+    Ok(login.trim().to_string())
+}
+
 fn gh(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
         .args(args)

@@ -1,9 +1,5 @@
 //! Pure tracker layer: config persistence, status→column mapping and
 //! urgency scoring. Nothing here knows about `ReviewApp` or gpui.
-//!
-//! Not yet called from `tracker.rs` (that wiring lands with the tracker
-//! UI); allow dead code until then rather than leaving the build noisy.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
