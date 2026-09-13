@@ -16,6 +16,7 @@ mod titlebar;
 mod sidebar;
 mod tracker;
 mod tree;
+mod urgency;
 
 use gpui::{
     actions, prelude::*, px, size, App,
