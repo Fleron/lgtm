@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Where a review item's diff comes from.
 #[derive(Clone)]
 pub(crate) enum Source {
     Pr(gh::PrLocator),
