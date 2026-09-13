@@ -262,6 +262,10 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{build_rows, ViewMode};
+    use crate::comments::COMMENT_WRAP_CHARS;
+    use crate::test_util::{sample_diff, upgraded_diff};
+    use std::collections::HashMap;
 
     fn mrow(kind: MinimapKind, len_frac: f32) -> MinimapRow {
         MinimapRow { kind, len_frac }
@@ -425,4 +429,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn minimap_rows_unified_kinds_and_fracs() {
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        let mm = minimap_rows(&rows);
+        assert_eq!(mm.len(), rows.len());
+        // FileHeader and HunkHeader both map to Header ticks.
+        assert_eq!(mm[0], mrow(MinimapKind::Header, 1.));
+        assert_eq!(mm[1], mrow(MinimapKind::Header, 1.));
+        // Line rows: kind from the row, frac = chars / MAX_MINIMAP_CHARS.
+        assert_eq!(mm[2], mrow(MinimapKind::Context, 3. / 160.)); // "ctx"
+        assert_eq!(mm[3], mrow(MinimapKind::Removed, 4. / 160.)); // "old1"
+        assert_eq!(mm[5], mrow(MinimapKind::Added, 4. / 160.)); // "new1"
+                                                                // Spacer and Binary rows are blank.
+        assert_eq!(mm[14], mrow(MinimapKind::Blank, 0.));
+        assert_eq!(mm[16], mrow(MinimapKind::Blank, 0.));
+    }
+
+    #[test]
+    fn minimap_rows_split_pairs_and_gaps() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let mm = minimap_rows(&rows);
+        assert_eq!(mm.len(), rows.len());
+        // Context pair: both halves, no change flags.
+        assert_eq!(
+            mm[2].kind,
+            MinimapKind::SplitPair {
+                left_frac: 3. / 160.,
+                right_frac: 3. / 160.,
+                left: false,
+                right: false,
+            }
+        );
+        // Paired removed/added ("old1" / "new1").
+        assert_eq!(
+            mm[3].kind,
+            MinimapKind::SplitPair {
+                left_frac: 4. / 160.,
+                right_frac: 4. / 160.,
+                left: true,
+                right: true,
+            }
+        );
+        assert_eq!(mm[3].len_frac, 4. / 160.);
+        // One-sided rows: the absent half has a zero fraction and no flag.
+        let h2 = 6; // second HunkHeader (see split tests above)
+        assert_eq!(
+            mm[h2 + 2].kind,
+            MinimapKind::SplitPair {
+                left_frac: 2. / 160., // "r2"
+                right_frac: 0.,
+                left: true,
+                right: false,
+            }
+        );
+        assert_eq!(
+            mm[h2 + 4].kind,
+            MinimapKind::SplitPair {
+                left_frac: 0.,
+                right_frac: 4. / 160., // "lone"
+                left: false,
+                right: true,
+            }
+        );
+
+        // Gap rows map to Gap in both modes.
+        let (diff, upgrades) = upgraded_diff();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (rows, _, _) = build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS);
+            let mm = minimap_rows(&rows);
+            assert_eq!(mm[1], mrow(MinimapKind::Gap, 1.));
+        }
+    }
 }

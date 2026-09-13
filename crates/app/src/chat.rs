@@ -823,3 +823,174 @@ impl ReviewApp {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comments::CommentSide;
+
+    #[test]
+    fn chat_prompt_first_message_carries_header_patch_and_selection() {
+        let prompt = chat_prompt(
+            Some(("HEADER", "diff --git a/x b/x\n+new line\n")),
+            Some("Selected text (x:1-1, RIGHT (new) side):\n```\nnew line\n```\n"),
+            "why?",
+        );
+        assert!(prompt.starts_with("HEADER\n\nThe unified diff under review:\n```diff\n"));
+        assert!(prompt.contains("+new line\n```\n"));
+        assert!(!prompt.contains("truncated"));
+        assert!(prompt.contains("Selected text (x:1-1"));
+        assert!(prompt.ends_with("why?"));
+        // Later turns: no context block, just selection (if any) + question.
+        let followup = chat_prompt(None, None, "and this?");
+        assert_eq!(followup, "and this?");
+    }
+
+    #[test]
+    fn chat_prompt_truncates_patch_at_cap_on_char_boundary() {
+        // 'a' then 2-byte 'é's: char boundaries sit at odd offsets, so the
+        // even cap falls mid-char and must be shaved back to a boundary.
+        let patch = format!("a{}", "é".repeat(MAX_CHAT_PATCH_BYTES));
+        let prompt = chat_prompt(Some(("H", &patch)), None, "q");
+        assert!(prompt.contains("(patch truncated at 200KB"));
+        let (cut, truncated) = truncate_str(&patch, MAX_CHAT_PATCH_BYTES);
+        assert!(truncated);
+        assert_eq!(cut.len(), MAX_CHAT_PATCH_BYTES - 1); // boundary shaved one byte
+        assert!(cut.is_char_boundary(cut.len()));
+        let (all, truncated) = truncate_str("abc", 10);
+        assert_eq!((all, truncated), ("abc", false));
+    }
+
+    #[test]
+    fn chat_headers_describe_the_item() {
+        let meta = gh::PrMeta {
+            number: 7,
+            title: "Fix the frobnicator".into(),
+            author: gh::Author {
+                login: "alice".into(),
+            },
+            state: "OPEN".into(),
+            is_draft: false,
+            url: "https://github.com/o/r/pull/7".into(),
+            body: "It was broken.\n".into(),
+            base_ref_name: "main".into(),
+            head_ref_name: "fix".into(),
+            base_ref_oid: String::new(),
+            head_ref_oid: String::new(),
+            additions: 1,
+            deletions: 2,
+            changed_files: 3,
+            review_decision: String::new(),
+            status_check_rollup: Vec::new(),
+        };
+        let header = pr_chat_header(&meta);
+        assert!(header.contains("\"Fix the frobnicator\""));
+        assert!(header.contains("https://github.com/o/r/pull/7"));
+        assert!(header.contains("alice"));
+        assert!(header.contains("OPEN"));
+        assert!(header.contains("main ← fix"));
+        assert!(header.contains("It was broken."));
+        // Empty body → explicit placeholder, so the model doesn't guess.
+        let meta = gh::PrMeta {
+            body: "  \n".into(),
+            ..meta
+        };
+        assert!(pr_chat_header(&meta).contains("(no description)"));
+
+        let src = git::LocalSource {
+            repo_root: "/tmp/myrepo".into(),
+            branch: "feature".into(),
+            base_ref: None,
+            base_label: "origin/main".into(),
+            base_oid: None,
+        };
+        let header = local_chat_header(&src);
+        assert!(header.contains("myrepo"));
+        assert!(header.contains("feature"));
+        assert!(header.contains("origin/main"));
+    }
+
+    #[test]
+    fn local_review_prompt_matches_difit_comment_format() {
+        let src = git::LocalSource {
+            repo_root: "/tmp/myrepo".into(),
+            branch: "feature".into(),
+            base_ref: None,
+            base_label: "upstream/main".into(),
+            base_oid: None,
+        };
+        let mut review = LocalReview::default();
+        review.add_comment(
+            None,
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            7,
+            None,
+            "why remove this?\nplease explain".to_string(),
+        );
+        review.add_comment(
+            Some(1),
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            7,
+            None,
+            "because this path handles nil".to_string(),
+        );
+        review.add_comment(
+            None,
+            "src/main.rs".to_string(),
+            CommentSide::Left,
+            12,
+            None,
+            "second thread".to_string(),
+        );
+
+        assert_eq!(
+            local_review_prompt(&src, &review),
+            "Diff: upstream/main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nsrc/lib.rs:R7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
+        );
+    }
+
+    #[test]
+    fn scratch_paths_stay_inside_the_root() {
+        let root = Path::new("/tmp/lgtm-chat-1-2");
+        assert_eq!(
+            scratch_path(root, "src/main.rs"),
+            Some(root.join("src/main.rs"))
+        );
+        assert_eq!(
+            scratch_path(root, "deep/a/b/c.txt"),
+            Some(root.join("deep/a/b/c.txt"))
+        );
+        // Escapes and non-normal components are refused.
+        assert_eq!(scratch_path(root, "../evil"), None);
+        assert_eq!(scratch_path(root, "a/../../evil"), None);
+        assert_eq!(scratch_path(root, "/abs/path"), None);
+        assert_eq!(scratch_path(root, "./x"), None);
+        assert_eq!(scratch_path(root, ""), None);
+    }
+
+    #[test]
+    fn materialize_writes_files_and_skips_oversized_and_unsafe() {
+        let root = std::env::temp_dir().join(format!(
+            "lgtm-chat-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = vec![
+            ("src/lib.rs".to_string(), "fn a() {}\n".to_string()),
+            ("../escape.rs".to_string(), "nope\n".to_string()),
+            ("big.rs".to_string(), "x".repeat(MAX_EXPLORE_FILE_BYTES + 1)),
+        ];
+        let dir = materialize_files(&root, &files).unwrap();
+        assert_eq!(dir, root);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+        assert!(!root.join("big.rs").exists());
+        assert!(!root.parent().unwrap().join("escape.rs").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

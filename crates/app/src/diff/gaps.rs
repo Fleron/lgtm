@@ -300,3 +300,157 @@ pub(crate) fn upgrade_file(source: &UpgradeSource, job: &UpgradeJob) -> Option<U
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::gap_span;
+    use crate::comments::{group_comments, COMMENT_WRAP_CHARS};
+    use crate::diff::{build_rows, is_comment_row};
+    use crate::selection::{row_side_text, SelSide};
+    use crate::test_util::{rc, row_name, upgraded_diff};
+    use crate::{LineKind, Row, ViewMode};
+    use diff_core::diff_texts;
+    use std::collections::HashMap;
+
+    #[test]
+    fn gap_span_math() {
+        let (diff, upgrades) = upgraded_diff();
+        let hunks = &diff.files[0].hunks;
+        let total = upgrades[&0].new_lines.len() as u32;
+        assert_eq!(gap_span(hunks, 0, total), (1, 1, 6)); // lines 1..=6 hidden
+        assert_eq!(gap_span(hunks, 1, total), (14, 14, 7)); // lines 14..=20
+
+        // Zero hunks (e.g. a pure CRLF flip): the whole file is one gap.
+        assert_eq!(gap_span(&[], 0, total), (1, 1, 20));
+        // Added file: single hunk covers everything, both gaps empty.
+        let added = diff_texts("", "a\nb\n", 3);
+        assert_eq!(gap_span(&added, 0, 2).2, 0);
+        assert_eq!(gap_span(&added, 1, 2).2, 0);
+        // Deleted file: new side empty, no gaps and no underflow.
+        let deleted = diff_texts("a\nb\n", "", 3);
+        assert_eq!(gap_span(&deleted, 0, 0).2, 0);
+        assert_eq!(gap_span(&deleted, 1, 0).2, 0);
+    }
+
+    #[test]
+    fn upgraded_file_gets_gap_rows_and_marked_headers() {
+        let (diff, upgrades) = upgraded_diff();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS);
+            // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
+            match &rows[1] {
+                Row::Gap {
+                    file_ix,
+                    gap_ix,
+                    hidden,
+                } => {
+                    assert_eq!((*file_ix, *gap_ix, *hidden), (0, 0, 6));
+                }
+                other => panic!("expected leading gap, got {}", row_name(other)),
+            }
+            assert_eq!(hunk_rows, vec![2]);
+            assert!(matches!(rows[2], Row::HunkHeader { upgraded: true, .. }));
+            match rows.last().unwrap() {
+                Row::Gap { gap_ix, hidden, .. } => assert_eq!((*gap_ix, *hidden), (1, 7)),
+                other => panic!("expected trailing gap, got {}", row_name(other)),
+            }
+            // Gap rows are selectable-through, like headers.
+            assert!(row_side_text(&rows[1], SelSide::Unified).is_none());
+            assert!(row_side_text(&rows[1], SelSide::Left).is_none());
+        }
+        // Un-upgraded build of the same diff has no gap rows.
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
+        assert!(matches!(
+            rows[1],
+            Row::HunkHeader {
+                upgraded: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn expanded_gap_synthesizes_context_rows_with_correct_numbers() {
+        let (diff, mut upgrades) = upgraded_diff();
+        upgrades.get_mut(&0).unwrap().expanded.insert(0);
+
+        let (rows, _, hunk_rows) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true, COMMENT_WRAP_CHARS);
+        // Leading gap expanded into 6 context rows before the hunk header.
+        assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
+        for (j, row) in rows[1..7].iter().enumerate() {
+            match row {
+                Row::Line {
+                    old_no,
+                    new_no,
+                    kind,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(*kind, LineKind::Context);
+                    assert_eq!(*old_no, Some(j as u32 + 1));
+                    assert_eq!(*new_no, Some(j as u32 + 1));
+                    assert_eq!(text.as_ref(), format!("line {}", j + 1));
+                }
+                other => panic!("expected context line, got {}", row_name(other)),
+            }
+        }
+        // Trailing gap still collapsed.
+        assert!(matches!(rows.last(), Some(Row::Gap { gap_ix: 1, .. })));
+
+        // Split mode: same expansion as two-cell context rows.
+        let (rows, _, _) = build_rows(&diff, ViewMode::Split, &upgrades, None, true, COMMENT_WRAP_CHARS);
+        match &rows[1] {
+            Row::SplitLine { left, right } => {
+                let (l, r) = (left.as_ref().unwrap(), right.as_ref().unwrap());
+                assert_eq!((l.no, r.no), (1, 1));
+                assert_eq!(l.kind, LineKind::Context);
+                assert_eq!(l.text.as_ref(), "line 1");
+                assert_eq!(r.text.as_ref(), "line 1");
+            }
+            other => panic!("expected split context, got {}", row_name(other)),
+        }
+
+        // Expanding the trailing gap too: numbering continues past the hunk.
+        upgrades.get_mut(&0).unwrap().expanded.insert(1);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true, COMMENT_WRAP_CHARS);
+        assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
+        match rows.last().unwrap() {
+            Row::Line {
+                old_no,
+                new_no,
+                text,
+                ..
+            } => {
+                assert_eq!((*old_no, *new_no), (Some(20), Some(20)));
+                assert_eq!(text.as_ref(), "line 20");
+            }
+            other => panic!("expected context line, got {}", row_name(other)),
+        }
+    }
+
+    #[test]
+    fn expanded_gap_context_rows_host_threads() {
+        let (diff, mut upgrades) = upgraded_diff();
+        // a.txt line 3 lives in the leading gap (hunk covers 7..=13).
+        let index = group_comments(vec![rc(
+            9,
+            "a.txt",
+            Some("RIGHT"),
+            Some(3),
+            "gap comment",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true, COMMENT_WRAP_CHARS);
+        // Collapsed gap: the thread has no anchor row and stays hidden.
+        assert!(!rows.iter().any(is_comment_row));
+        upgrades.get_mut(&0).unwrap().expanded.insert(0);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true, COMMENT_WRAP_CHARS);
+        // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
+        assert_eq!(row_name(&rows[3]), "Line");
+        assert_eq!(row_name(&rows[4]), "CommentHeader");
+        assert_eq!(row_name(&rows[5]), "CommentBody");
+        assert_eq!(row_name(&rows[6]), "CommentActions");
+    }
+}

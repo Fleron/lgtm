@@ -142,3 +142,145 @@ pub(crate) fn merge_highlights(
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{add, ctx, rem, style};
+    use syntax::Token;
+
+    fn style_bg(token: Option<Token>) -> HighlightStyle {
+        let mut style = token.map(style).unwrap_or_default();
+        style.background_color = Some(theme::added_word_bg().into());
+        style
+    }
+
+    #[test]
+    fn merge_syntax_only() {
+        let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None, None),
+            vec![
+                (0..2, style(Token::Keyword)),
+                (3..7, style(Token::Function))
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_intra_only() {
+        let bg = Some(theme::added_word_bg());
+        assert_eq!(
+            merge_highlights(&[], &[2..5], bg, None),
+            vec![(2..5, style_bg(None))]
+        );
+    }
+
+    #[test]
+    fn merge_partial_overlap() {
+        let bg = Some(theme::added_word_bg());
+        let syntax = [(0..6, Token::String)];
+        assert_eq!(
+            merge_highlights(&syntax, &[4..8], bg, None),
+            vec![
+                (0..4, style(Token::String)),
+                (4..6, style_bg(Some(Token::String))),
+                (6..8, style_bg(None)),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_intra_spanning_multiple_tokens() {
+        let bg = Some(theme::added_word_bg());
+        let syntax = [(0..3, Token::Keyword), (5..8, Token::Number)];
+        assert_eq!(
+            merge_highlights(&syntax, &[1..7], bg, None),
+            vec![
+                (0..1, style(Token::Keyword)),
+                (1..3, style_bg(Some(Token::Keyword))),
+                (3..5, style_bg(None)),
+                (5..7, style_bg(Some(Token::Number))),
+                (7..8, style(Token::Number)),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_adjacent_ranges() {
+        // Same style across a shared boundary coalesces; different styles
+        // stay split exactly at the boundary.
+        let syntax = [(0..2, Token::Keyword), (2..4, Token::Keyword)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None, None),
+            vec![(0..4, style(Token::Keyword))]
+        );
+        let syntax = [(0..2, Token::Keyword), (2..4, Token::Type)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None, None),
+            vec![(0..2, style(Token::Keyword)), (2..4, style(Token::Type))]
+        );
+        let bg = Some(theme::added_word_bg());
+        assert_eq!(
+            merge_highlights(&[], &[0..2, 2..4], bg, None),
+            vec![(0..4, style_bg(None))]
+        );
+    }
+
+    #[test]
+    fn hunk_syntax_takes_spans_from_the_right_side() {
+        let lang = syntax::language_for_path("x.rs");
+        let rows = vec![
+            ctx(1, 1, "fn f() {"),
+            rem(2, "// gone", Vec::new()),
+            add(2, "    let b = 2;", Vec::new()),
+            ctx(3, 3, "}"),
+        ];
+        let spans = hunk_syntax(lang, &rows);
+        assert_eq!(spans.len(), 4);
+        // Context: from the new side.
+        assert!(spans[0].contains(&(0..2, Token::Keyword)));
+        // Removed: highlighted as part of old_source — a comment.
+        assert_eq!(spans[1], vec![(0..7, Token::Comment)]);
+        // Added: highlighted as part of new_source — `let` keyword.
+        assert!(spans[2].contains(&(4..7, Token::Keyword)));
+    }
+
+    #[test]
+    fn hunk_syntax_guardrails() {
+        let rows = vec![ctx(1, 1, "fn f() {}")];
+        // No language → no spans.
+        assert_eq!(hunk_syntax(None, &rows), vec![Vec::new()]);
+        // Over-long line stays plain even when the hunk is highlighted.
+        let lang = syntax::language_for_path("x.rs");
+        let long = format!("// {}", "x".repeat(5000));
+        let rows = vec![ctx(1, 1, "fn f() {}"), ctx(2, 2, &long)];
+        let spans = hunk_syntax(lang, &rows);
+        assert!(!spans[0].is_empty());
+        assert!(spans[1].is_empty());
+    }
+
+    #[test]
+    fn merge_selection_wins_over_intra() {
+        let bg = Some(theme::added_word_bg());
+        let sel_style = |token: Option<Token>| {
+            let mut style = token.map(style).unwrap_or_default();
+            style.background_color = Some(theme::selection_bg().into());
+            style
+        };
+        // Intra 2..6, selection 4..8: the overlap 4..6 paints selection bg.
+        assert_eq!(
+            merge_highlights(&[], &[2..6], bg, Some(4..8)),
+            vec![(2..4, style_bg(None)), (4..8, sel_style(None))]
+        );
+        // Selection over a syntax token keeps the token foreground.
+        let syntax = [(0..4, Token::Keyword)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None, Some(2..6)),
+            vec![
+                (0..2, style(Token::Keyword)),
+                (2..4, sel_style(Some(Token::Keyword))),
+                (4..6, sel_style(None)),
+            ]
+        );
+    }
+}

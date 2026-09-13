@@ -955,3 +955,20 @@ impl ReviewApp {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifier_hover_hit_snaps_to_the_token_start() {
+        let text = "    if cfg.font.mono_family.is_empty() {";
+        assert_eq!(identifier_start_at(text, 7), Some(7));
+        assert_eq!(identifier_start_at(text, 9), Some(7));
+        assert_eq!(identifier_start_at(text, 10), Some(7));
+        assert_eq!(identifier_start_at(text, 11), Some(11));
+        assert_eq!(identifier_start_at(text, 14), Some(11));
+        assert_eq!(identifier_start_at(text, 15), Some(11));
+        assert_eq!(identifier_start_at(text, 6), None);
+    }
+}

@@ -3,8 +3,6 @@ mod highlight;
 mod render;
 
 pub(crate) use gaps::{push_gap_rows, run_upgrade, FileUpgrade, UpgradeJob, UpgradeSource};
-#[cfg(test)]
-pub(crate) use gaps::gap_span;
 pub(crate) use highlight::{hunk_syntax, merge_highlights, MAX_SOURCE_HIGHLIGHT_BYTES, MAX_SYNTAX_LINE_BYTES};
 
 use crate::comments::{now_unix, push_thread_rows, CommentIndex, CommentSide};
@@ -527,3 +525,534 @@ pub(crate) enum CardEdge {
     Bottom,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comments::{comment_anchor, group_comments, CommentSide, COMMENT_WRAP_CHARS};
+    use crate::selection::{row_side_text, SelSide};
+    use crate::test_util::{cell, mrow, rc, row_name, sample_diff};
+    use crate::minimap::{minimap_rows, MinimapKind};
+    use std::collections::HashMap;
+
+    #[test]
+    fn split_context_fills_both_cells() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        // rows[0] = FileHeader, rows[1] = HunkHeader, rows[2] = first context.
+        match &rows[2] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (1, LineKind::Context, "ctx", &[][..]));
+                assert_eq!(cell(right), (1, LineKind::Context, "ctx", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+    }
+
+    #[test]
+    fn split_pairs_equal_runs_positionally() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        match &rows[3] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
+                assert_eq!(cell(right), (2, LineKind::Added, "new1", &[0..3][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+        match &rows[4] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (3, LineKind::Removed, "old2", &[][..]));
+                assert_eq!(cell(right), (3, LineKind::Added, "new2", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+        // Equal run + 2 context rows: 4 split lines for a 6-row hunk.
+        match &rows[5] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left).2, "tail");
+                assert_eq!(cell(right).2, "tail");
+            }
+            _ => panic!("expected split line"),
+        }
+    }
+
+    #[test]
+    fn split_unequal_and_lone_runs_are_one_sided() {
+        let (rows, _, hunk_rows) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let h2 = hunk_rows[1];
+        // 2 removed / 1 added: first row paired, second left-only.
+        match &rows[h2 + 1] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (10, LineKind::Removed, "r1", &[][..]));
+                assert_eq!(cell(right), (10, LineKind::Added, "a1", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+        match &rows[h2 + 2] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (11, LineKind::Removed, "r2", &[][..]));
+                assert!(right.is_none());
+            }
+            _ => panic!("expected split line"),
+        }
+        // Lone added run after context: right-only.
+        match &rows[h2 + 4] {
+            Row::SplitLine { left, right } => {
+                assert!(left.is_none());
+                assert_eq!(cell(right), (12, LineKind::Added, "lone", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+    }
+
+    #[test]
+    fn header_indices_are_correct_in_both_modes() {
+        let diff = sample_diff();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+            assert_eq!(file_rows.len(), 2);
+            assert_eq!(hunk_rows.len(), 2);
+            for &ix in &file_rows {
+                assert!(matches!(rows[ix], Row::FileHeader { .. }));
+            }
+            for &ix in &hunk_rows {
+                assert!(matches!(rows[ix], Row::HunkHeader { .. }));
+            }
+            // Binary file: header immediately followed by the binary row.
+            assert!(matches!(rows[file_rows[1] + 1], Row::Binary));
+        }
+        // Unified emits one row per diff row; split collapses the equal run.
+        let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let unified_lines = unified
+            .iter()
+            .filter(|r| matches!(r, Row::Line { .. }))
+            .count();
+        let split_lines = split
+            .iter()
+            .filter(|r| matches!(r, Row::SplitLine { .. }))
+            .count();
+        assert_eq!(unified_lines, 11);
+        assert_eq!(split_lines, 8); // 4 (hunk 1) + 4 (hunk 2)
+    }
+
+    /// Comments for sample_diff's a.rs: a RIGHT thread (with one reply) on
+    /// added line 2 ("new1"), a LEFT thread on removed line 2 ("old1"), and
+    /// one outdated comment.
+    fn sample_comments() -> CommentIndex {
+        group_comments(vec![
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "on new1",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(1),
+            ),
+            rc(
+                3,
+                "a.rs",
+                Some("LEFT"),
+                Some(2),
+                "on old1",
+                "carol",
+                "2026-01-03T00:00:00Z",
+                None,
+            ),
+            rc(
+                4,
+                "a.rs",
+                None,
+                None,
+                "outdated",
+                "dave",
+                "2026-01-04T00:00:00Z",
+                None,
+            ),
+        ])
+    }
+
+    #[test]
+    fn unified_rows_insert_threads_beneath_their_anchor() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
+        // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
+        let names: Vec<&str> = rows.iter().map(row_name).collect();
+        assert_eq!(
+            &names[..12],
+            &[
+                "FileHeader",
+                "HunkHeader",
+                "Line",          // ctx 1/1
+                "Line",          // rem old1 (old 2)
+                "CommentHeader", // carol on old1
+                "CommentBody",
+                "CommentActions",
+                "Line",          // rem old2
+                "Line",          // add new1 (new 2)
+                "CommentHeader", // alice
+                "CommentBody",
+                "CommentHeader", // bob's reply
+            ]
+        );
+        assert_eq!(names[12], "CommentBody");
+        assert_eq!(names[13], "CommentActions");
+        // The LEFT thread is carol's; the reply flag follows position.
+        match &rows[4] {
+            Row::CommentHeader {
+                author, is_reply, ..
+            } => {
+                assert_eq!(author.as_ref(), "carol");
+                assert!(!is_reply);
+            }
+            other => panic!("expected comment header, got {}", row_name(other)),
+        }
+        match &rows[11] {
+            Row::CommentHeader {
+                author, is_reply, ..
+            } => {
+                assert_eq!(author.as_ref(), "bob");
+                assert!(is_reply);
+            }
+            other => panic!("expected reply header, got {}", row_name(other)),
+        }
+        // Actions row targets the thread root and carries the anchor.
+        match &rows[13] {
+            Row::CommentActions {
+                root_id,
+                path,
+                side,
+                line,
+                ..
+            } => {
+                assert_eq!(*root_id, 1);
+                assert_eq!(path.as_ref(), "a.rs");
+                assert_eq!((*side, *line), (CommentSide::Right, 2));
+            }
+            other => panic!("expected actions row, got {}", row_name(other)),
+        }
+        // File header carries the counts (3 anchored, 1 outdated).
+        match &rows[0] {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
+                assert_eq!((*comments, *outdated), (3, 1));
+            }
+            other => panic!("expected file header, got {}", row_name(other)),
+        }
+        // Comment rows are selectable-through and blank in the minimap.
+        assert!(row_side_text(&rows[4], SelSide::Unified).is_none());
+        assert_eq!(minimap_rows(&rows)[4], mrow(MinimapKind::Blank, 0.));
+    }
+
+    #[test]
+    fn split_rows_anchor_threads_by_cell() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
+        // thread directly beneath it.
+        let names: Vec<&str> = rows.iter().map(row_name).collect();
+        assert_eq!(
+            &names[2..11],
+            &[
+                "SplitLine",     // ctx
+                "SplitLine",     // old1 | new1
+                "CommentHeader", // carol (LEFT)
+                "CommentBody",
+                "CommentActions",
+                "CommentHeader", // alice (RIGHT)
+                "CommentBody",
+                "CommentHeader", // bob reply
+                "CommentBody",
+            ]
+        );
+        assert_eq!(names[11], "CommentActions");
+        assert_eq!(names[12], "SplitLine"); // old2 | new2
+    }
+
+    /// The half a comment row renders in, or None for a full-width card.
+    fn row_half(row: &Row) -> Option<Option<CommentSide>> {
+        match row {
+            Row::CommentHeader { half, .. }
+            | Row::CommentBody { half, .. }
+            | Row::CommentActions { half, .. } => Some(*half),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn split_comments_render_in_the_half_they_were_left_on() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // rows[4..7] are carol's LEFT thread, rows[7..12] the RIGHT one; each
+        // row of a thread carries the side it was anchored to.
+        let halves: Vec<Option<Option<CommentSide>>> =
+            rows[4..12].iter().map(row_half).collect();
+        assert_eq!(
+            halves,
+            vec![
+                Some(Some(CommentSide::Left)),  // carol header
+                Some(Some(CommentSide::Left)),  // body
+                Some(Some(CommentSide::Left)),  // actions
+                Some(Some(CommentSide::Right)), // alice header
+                Some(Some(CommentSide::Right)), // body
+                Some(Some(CommentSide::Right)), // bob reply header
+                Some(Some(CommentSide::Right)), // body
+                Some(Some(CommentSide::Right)), // actions
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_threads_first_row_draws_the_card_top() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+        );
+        // Exactly one top edge per thread, and it's the root's header — a
+        // reply's header sits mid-card and must not cap it.
+        let mut tops = 0;
+        let mut threads = 0;
+        for row in &rows {
+            match row {
+                Row::CommentHeader { top, is_reply, .. } => {
+                    if *top {
+                        tops += 1;
+                        assert!(!is_reply, "a reply header must not open the card");
+                    }
+                }
+                // The actions row always closes a thread, so it counts them.
+                Row::CommentActions { .. } => threads += 1,
+                _ => {}
+            }
+        }
+        assert!(threads > 0, "fixture should have threads");
+        assert_eq!(tops, threads, "one top edge per thread");
+    }
+
+    #[test]
+    fn row_height_follows_the_font_size() {
+        // The default must reproduce the pre-zoom geometry exactly.
+        assert_eq!(DEFAULT_TEXT_SIZE, 13.0);
+        assert_eq!(row_height_for(DEFAULT_TEXT_SIZE), 22.0);
+        // Rows grow and shrink with the text, always leaving headroom so
+        // glyphs can't outgrow their row at either bound.
+        assert_eq!(row_height_for(20.), 34.0);
+        assert_eq!(row_height_for(8.), 14.0);
+        for size in [MIN_TEXT_SIZE, DEFAULT_TEXT_SIZE, MAX_TEXT_SIZE] {
+            assert!(
+                row_height_for(size) > size,
+                "row must be taller than {size}px text"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_bodies_wrap_to_the_requested_column_width() {
+        // One long prose line plus an unbreakable token (a URL), the two ways a
+        // body runs past the card.
+        let body = format!("{} https://example.com/{}", "word ".repeat(60), "x".repeat(200));
+        let index = group_comments(vec![rc(
+            1,
+            "a.rs",
+            Some("RIGHT"),
+            Some(2),
+            &body,
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        for (name, mode, cap) in [
+            ("unified", ViewMode::Unified, COMMENT_WRAP_CHARS),
+            ("split", ViewMode::Split, 40),
+        ] {
+            let (rows, _, _) =
+                build_rows(&sample_diff(), mode, &HashMap::new(), Some(&index), true, cap);
+            let bodies: Vec<&SharedString> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::CommentBody { line, .. } => Some(line),
+                    _ => None,
+                })
+                .collect();
+            assert!(!bodies.is_empty(), "{name} should have body rows");
+            for line in bodies {
+                assert!(
+                    line.chars().count() <= cap,
+                    "{name}: {:?} exceeds {cap} cols",
+                    line.as_ref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unified_comments_span_the_full_width() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // Unified has one column, so no comment row is confined to a half.
+        assert!(rows.iter().filter_map(row_half).all(|half| half.is_none()));
+        // ...and the diff really does contain comment rows to check.
+        assert!(rows.iter().any(is_comment_row));
+    }
+
+    #[test]
+    fn hidden_comments_keep_header_counts() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            false,
+                COMMENT_WRAP_CHARS,
+        );
+        assert!(!rows.iter().any(is_comment_row));
+        match &rows[0] {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
+                assert_eq!((*comments, *outdated), (3, 1));
+            }
+            other => panic!("expected file header, got {}", row_name(other)),
+        }
+        // And with no index at all (local items): zero counts, no rows.
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        assert!(!rows.iter().any(is_comment_row));
+        match &rows[0] {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
+                assert_eq!((*comments, *outdated), (0, 0));
+            }
+            other => panic!("expected file header, got {}", row_name(other)),
+        }
+    }
+
+    #[test]
+    fn comment_anchor_resolves_sides_and_skips_non_lines() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // Headers and comment rows anchor nothing.
+        assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
+        assert_eq!(comment_anchor(&rows, 4, SelSide::Unified), None);
+        // Context row (1,1) → RIGHT 1; removed old1 → LEFT 2; added new1 → RIGHT 2.
+        assert_eq!(
+            comment_anchor(&rows, 2, SelSide::Unified),
+            Some((CommentSide::Right, 1))
+        );
+        assert_eq!(
+            comment_anchor(&rows, 3, SelSide::Unified),
+            Some((CommentSide::Left, 2))
+        );
+        assert_eq!(
+            comment_anchor(&rows, 8, SelSide::Unified),
+            Some((CommentSide::Right, 2))
+        );
+        // Split: the half under the pointer decides; absent cells refuse.
+        let (rows, _, hunk_rows) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        assert_eq!(
+            comment_anchor(&rows, 3, SelSide::Left),
+            Some((CommentSide::Left, 2))
+        );
+        assert_eq!(
+            comment_anchor(&rows, 3, SelSide::Right),
+            Some((CommentSide::Right, 2))
+        );
+        // Second hunk: r2 has no right cell (see split tests above).
+        let h2 = hunk_rows[1];
+        assert_eq!(comment_anchor(&rows, h2 + 2, SelSide::Right), None);
+        assert_eq!(
+            comment_anchor(&rows, h2 + 2, SelSide::Left),
+            Some((CommentSide::Left, 11))
+        );
+    }
+
+    #[test]
+    fn nth_noncomment_row_maps_positions_across_comment_insertions() {
+        let index = sample_comments();
+        let (plain, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        let (with, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // Every plain row maps to the same row content with comments shown.
+        for (n, row) in plain.iter().enumerate() {
+            let ix = nth_noncomment_row(&with, n);
+            assert_eq!(row_name(&with[ix]), row_name(row), "row {n}");
+        }
+        // n beyond the end clamps to the last row.
+        assert_eq!(nth_noncomment_row(&plain, 999), plain.len() - 1);
+    }
+}

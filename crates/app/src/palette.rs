@@ -853,3 +853,57 @@ impl ReviewApp {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr(number: u64, title: &str, author: &str, branch: &str) -> gh::PrSummary {
+        gh::PrSummary {
+            number,
+            title: title.to_string(),
+            author: gh::Author {
+                login: author.to_string(),
+            },
+            state: "OPEN".to_string(),
+            is_draft: false,
+            head_ref_name: branch.to_string(),
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            review_decision: String::new(),
+            status_check_rollup: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pr_filter_empty_query_keeps_original_order() {
+        let all = vec![
+            pr(3, "fix crash", "alice", "fix-crash"),
+            pr(1, "add feature", "bob", "feat"),
+            pr(2, "docs", "carol", "docs"),
+        ];
+        assert_eq!(filter_prs(&all, ""), vec![0, 1, 2]);
+        assert_eq!(filter_prs(&all, "   "), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn pr_filter_matches_number_title_author_and_branch() {
+        let all = vec![
+            pr(3, "fix crash", "alice", "fix-crash"),
+            pr(1, "add feature", "bob", "feat"),
+        ];
+        assert_eq!(filter_prs(&all, "#3"), vec![0]);
+        assert_eq!(filter_prs(&all, "bob"), vec![1]);
+        assert_eq!(filter_prs(&all, "crash"), vec![0]);
+        assert!(filter_prs(&all, "zzzqqq").is_empty());
+    }
+
+    #[test]
+    fn source_options_filter_by_substring() {
+        assert_eq!(filtered_sources(""), vec![0, 1, 2]);
+        assert_eq!(filtered_sources("pull"), vec![0]);
+        assert_eq!(filtered_sources("subscribe"), vec![1]);
+        assert_eq!(filtered_sources("FOLDER"), vec![2]);
+        assert_eq!(filtered_sources("open"), vec![0, 2]);
+        assert!(filtered_sources("nope").is_empty());
+    }
+}
