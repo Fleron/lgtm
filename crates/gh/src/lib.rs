@@ -1019,6 +1019,19 @@ pub fn update_issue_body(owner: &str, repo: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+pub fn update_issue_title(owner: &str, repo: &str, number: u64, title: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        &format!("{owner}/{repo}"),
+        "--title",
+        title,
+    ])?;
+    Ok(())
+}
+
 /// The authenticated `gh` user's login, for the tracker's assignee filter.
 pub fn current_user_login() -> Result<String> {
     let login = gh(&["api", "user", "--jq", ".login"])?;

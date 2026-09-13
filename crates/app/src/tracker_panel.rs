@@ -3,11 +3,11 @@
 //! comment box. Sidebar/main-pane tables live in `tracker_table.rs`.
 
 use crate::comments::short_age;
-use crate::tracker::{oi, sub_issue_icon, tint, type_icon, ComposerMode};
+use crate::tracker::{oi, sub_issue_icon, tint, type_icon, ComposerMode, FocusedColumn};
 use crate::tracker_table::label_pill;
 use crate::urgency::{due_countdown, Priority};
 use crate::{centered_message, theme, ReviewApp};
-use gpui::{div, prelude::*, px, Context, SharedString};
+use gpui::{div, prelude::*, px, Context, MouseButton, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::Sizable as _;
@@ -224,23 +224,40 @@ impl ReviewApp {
     }
 
     fn render_status_row(&self, number: u64, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_status_chip(number, "tracker-status-chip", cx)
+    }
+
+    /// A status chip that opens/closes the shared status menu targeting
+    /// `number` — used for the panel header's own issue and (with a
+    /// different element id) for a highlighted sub-issue row.
+    fn render_status_chip(
+        &self,
+        number: u64,
+        element_id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let Some(item) = self.tracker.item(number) else {
             return div().into_any_element();
         };
         let status = if item.status.is_empty() { "No status".to_string() } else { item.status.clone() };
         let chip = div()
-            .id("tracker-status-chip")
+            .id(element_id)
             .px_2()
             .rounded_sm()
             .bg(tint(theme::blue(), 0.18))
             .text_color(theme::blue())
             .cursor_pointer()
             .child(SharedString::from(status))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.tracker.status_menu_open = !this.tracker.status_menu_open;
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tracker.status_menu_target = if this.tracker.status_menu_target == Some(number) {
+                    None
+                } else {
+                    Some(number)
+                };
                 cx.notify();
             }));
-        if !self.tracker.status_menu_open {
+        if self.tracker.status_menu_target != Some(number) {
             return div().child(chip).into_any_element();
         }
         let Some(field) = self.tracker.status_field.clone() else {
@@ -259,13 +276,14 @@ impl ReviewApp {
                 let name = option.name.clone();
                 let on = name == current;
                 div()
-                    .id(SharedString::from(format!("status-option-{name}")))
+                    .id(SharedString::from(format!("status-option-{element_id}-{name}")))
                     .px_2()
                     .py_0p5()
                     .cursor_pointer()
                     .when(on, |d| d.bg(theme::surface0()).text_color(theme::text()))
                     .when(!on, |d| d.text_color(theme::subtext()))
                     .child(SharedString::from(name.clone()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tracker_set_status(number, name.clone(), cx);
                     }))
@@ -378,20 +396,48 @@ impl ReviewApp {
             );
 
         let sub_issues = item.detail.sub_issues.clone();
-        let rows = div().flex().flex_col().children(sub_issues.iter().map(|sub| {
+        let panel_focused = self.tracker.focus == FocusedColumn::Panel;
+        let highlighted = self.tracker.panel_child_selected;
+        let rows = div().flex().flex_col().children(sub_issues.iter().enumerate().map(|(ix, sub)| {
             let (icon, color) = sub_issue_icon(sub, &self.tracker.items, &self.tracker.config);
             let sub_number = sub.number;
-            div()
+            let selected = panel_focused && ix == highlighted;
+            let editing_title =
+                matches!(self.tracker.composer_mode, Some(ComposerMode::EditChildTitle(n)) if n == sub_number);
+            let title: gpui::AnyElement = if editing_title {
+                self.tracker
+                    .composer_input
+                    .clone()
+                    .map(|input| Input::new(&input).small().into_any_element())
+                    .unwrap_or_else(|| div().into_any_element())
+            } else {
+                div().truncate().child(SharedString::from(sub.title.clone())).into_any_element()
+            };
+            let mut row = div()
                 .id(SharedString::from(format!("sub-issue-{sub_number}")))
                 .flex()
                 .items_center()
                 .gap_2()
                 .py_0p5()
                 .cursor_pointer()
+                .when(selected, |d| {
+                    d.bg(tint(theme::green(), 0.16)).border_l_2().border_color(theme::green())
+                })
                 .child(oi(icon, color))
                 .child(SharedString::from(format!("#{sub_number}")))
-                .child(div().truncate().child(SharedString::from(sub.title.clone())))
-                .on_click(cx.listener(move |this, _, _, cx| this.tracker_drill_into(sub_number, cx)))
+                .child(title);
+            if self.tracker.status_menu_target == Some(sub_number) {
+                row = row.child(self.render_status_chip(
+                    sub_number,
+                    "tracker-child-status-chip",
+                    cx,
+                ));
+            }
+            if editing_title {
+                row
+            } else {
+                row.on_click(cx.listener(move |this, _, _, cx| this.tracker_drill_into(sub_number, cx)))
+            }
         }));
 
         let adding = matches!(self.tracker.composer_mode, Some(ComposerMode::NewIssue { parent: Some(p) }) if p == number);
@@ -507,6 +553,9 @@ impl ReviewApp {
             ComposerMode::NewIssue { parent: None } => {
                 self.tracker_create_issue(text, cx);
             }
+            ComposerMode::EditChildTitle(number) => {
+                self.tracker_update_child_title(number, text, cx);
+            }
         }
         let _ = window;
         self.tracker_close_composer(cx);
@@ -563,6 +612,50 @@ impl ReviewApp {
                         item.detail.body = old_body;
                     }
                     app.tracker.error = Some(format!("description update failed: {err:#}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Inline sub-issue title edit (`e` on a highlighted panel row): updates
+    /// both the parent's `sub_issues` entry and the child's own row (it may
+    /// also be a board item in its own right), reverting both on failure.
+    fn tracker_update_child_title(&mut self, child_number: u64, title: String, cx: &mut Context<Self>) {
+        let Some(parent_number) = self.tracker.open_issue() else {
+            return;
+        };
+        let owner = self.tracker.owner.clone();
+        let repo = self.tracker.repo.clone();
+        let mut old_title = String::new();
+        if let Some(parent) = self.tracker.items.iter_mut().find(|it| it.number == parent_number) {
+            if let Some(sub) = parent.detail.sub_issues.iter_mut().find(|s| s.number == child_number) {
+                old_title = sub.title.clone();
+                sub.title = title.clone();
+            }
+        }
+        if let Some(child) = self.tracker.items.iter_mut().find(|it| it.number == child_number) {
+            child.detail.title = title.clone();
+        }
+        self.tracker.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { gh::update_issue_title(&owner, &repo, child_number, &title) })
+                .await;
+            this.update(cx, |app, cx| {
+                if let Err(err) = result {
+                    if let Some(parent) = app.tracker.items.iter_mut().find(|it| it.number == parent_number) {
+                        if let Some(sub) = parent.detail.sub_issues.iter_mut().find(|s| s.number == child_number) {
+                            sub.title = old_title.clone();
+                        }
+                    }
+                    if let Some(child) = app.tracker.items.iter_mut().find(|it| it.number == child_number) {
+                        child.detail.title = old_title.clone();
+                    }
+                    app.tracker.error = Some(format!("title update failed: {err:#}").into());
                 }
                 cx.notify();
             })

@@ -17,8 +17,9 @@ use crate::{
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
     ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDown, TrackerFocusFilter, TrackerNewIssue,
-    TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerSetFlight, TrackerSetHidden,
-    TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
+    TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow, TrackerPanelEditTitle,
+    TrackerPanelSpace, TrackerSetFlight, TrackerSetHidden, TrackerSetReview, TrackerUp, ZoomIn,
+    ZoomOut, ZoomReset, MONO,
 };
 use gpui::{
     div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
@@ -644,6 +645,13 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &TrackerCycleAssignee, _, cx| this.tracker_cycle_assignee(cx)))
             .on_action(cx.listener(|this, _: &TrackerOpenGithub, _, cx| this.tracker_open_selected_on_github(cx)))
             .on_action(cx.listener(|this, _: &TrackerClosePanel, _, cx| this.tracker_close_panel(cx)))
+            .on_action(cx.listener(|this, _: &TrackerPanelSpace, _, cx| this.tracker_panel_space(cx)))
+            .on_action(cx.listener(|this, _: &TrackerPanelEditTitle, window, cx| {
+                this.tracker_panel_edit_title(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TrackerPanelAddRow, window, cx| {
+                this.tracker_panel_add_row(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
             .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
             .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))

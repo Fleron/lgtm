@@ -32,11 +32,14 @@ pub(crate) struct TrackerItem {
     pub(crate) urgency: f64,
 }
 
-/// Which column currently has keyboard focus.
+/// Which column currently has keyboard focus. `Panel` is the open issue's
+/// sub-issues list — only reachable when the panel is open on a parent
+/// issue (one that has a sub-issues section at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusedColumn {
     Queue,
     Flight,
+    Panel,
 }
 
 /// What the toggled composer input is currently being used for.
@@ -44,6 +47,7 @@ pub(crate) enum FocusedColumn {
 pub(crate) enum ComposerMode {
     NewIssue { parent: Option<u64> },
     EditDescription,
+    EditChildTitle(u64),
 }
 
 pub(crate) struct TrackerState {
@@ -72,7 +76,12 @@ pub(crate) struct TrackerState {
     /// entry is the open issue, everything before it is the breadcrumb.
     pub(crate) panel_stack: Vec<u64>,
     pub(crate) panel_expanded: bool,
-    pub(crate) status_menu_open: bool,
+    /// Issue number the status menu is open for — the panel header's own
+    /// issue, or a highlighted sub-issue row.
+    pub(crate) status_menu_target: Option<u64>,
+    /// Index into the open issue's `sub_issues`, highlighted when
+    /// `focus == FocusedColumn::Panel`.
+    pub(crate) panel_child_selected: usize,
     pub(crate) comment_input: Entity<InputState>,
     pub(crate) composer_mode: Option<ComposerMode>,
     pub(crate) composer_input: Option<Entity<InputState>>,
@@ -149,7 +158,8 @@ impl TrackerState {
             filter_input,
             panel_stack: Vec::new(),
             panel_expanded: false,
-            status_menu_open: false,
+            status_menu_target: None,
+            panel_child_selected: 0,
             comment_input,
             composer_mode: None,
             composer_input: None,
@@ -377,10 +387,43 @@ impl ReviewApp {
         self.tracker_queue_rows(cx).into_iter().map(|it| it.number).collect()
     }
 
+    /// Whether the open issue has a sub-issues section at all (parents
+    /// only — a sub-issue's own panel doesn't get one), the same test
+    /// `tracker_panel.rs` uses to decide whether to render it.
+    pub(crate) fn tracker_panel_has_sub_issues_section(&self) -> bool {
+        let Some(number) = self.tracker.open_issue() else {
+            return false;
+        };
+        let Some(item) = self.tracker.item(number) else {
+            return false;
+        };
+        self.tracker.panel_stack.len() <= 1 && item.detail.parent.is_none()
+    }
+
+    fn tracker_panel_children(&self) -> Vec<gh::SubIssue> {
+        self.tracker
+            .open_issue()
+            .and_then(|number| self.tracker.item(number))
+            .map(|item| item.detail.sub_issues.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn tracker_move(&mut self, delta: i64, cx: &mut Context<Self>) {
+        if self.tracker.focus == FocusedColumn::Panel {
+            let children = self.tracker_panel_children();
+            if children.is_empty() {
+                return;
+            }
+            let next = (self.tracker.panel_child_selected as i64 + delta)
+                .clamp(0, children.len() as i64 - 1);
+            self.tracker.panel_child_selected = next as usize;
+            cx.notify();
+            return;
+        }
         let rows = match self.tracker.focus {
             FocusedColumn::Queue => self.tracker_queue_rows_flat(cx),
             FocusedColumn::Flight => self.tracker_flight_rows_flat(cx),
+            FocusedColumn::Panel => unreachable!(),
         };
         if rows.is_empty() {
             return;
@@ -388,6 +431,7 @@ impl ReviewApp {
         let selected = match self.tracker.focus {
             FocusedColumn::Queue => &mut self.tracker.queue_selected,
             FocusedColumn::Flight => &mut self.tracker.flight_selected,
+            FocusedColumn::Panel => unreachable!(),
         };
         let next = (*selected as i64 + delta).clamp(0, rows.len() as i64 - 1);
         *selected = next as usize;
@@ -397,7 +441,12 @@ impl ReviewApp {
     pub(crate) fn tracker_next_column(&mut self, cx: &mut Context<Self>) {
         self.tracker.focus = match self.tracker.focus {
             FocusedColumn::Queue => FocusedColumn::Flight,
+            FocusedColumn::Flight if self.tracker_panel_has_sub_issues_section() => {
+                self.tracker.panel_child_selected = 0;
+                FocusedColumn::Panel
+            }
             FocusedColumn::Flight => FocusedColumn::Queue,
+            FocusedColumn::Panel => FocusedColumn::Queue,
         };
         cx.notify();
     }
@@ -406,37 +455,98 @@ impl ReviewApp {
         let rows = match self.tracker.focus {
             FocusedColumn::Queue => self.tracker_queue_rows_flat(cx),
             FocusedColumn::Flight => self.tracker_flight_rows_flat(cx),
+            FocusedColumn::Panel => return None,
         };
         let selected = match self.tracker.focus {
             FocusedColumn::Queue => self.tracker.queue_selected,
             FocusedColumn::Flight => self.tracker.flight_selected,
+            FocusedColumn::Panel => return None,
         };
         rows.get(selected).copied()
     }
 
-    /// `↵`: open the panel on the focused row, or — with the panel already
-    /// open — drill into whichever sub-issue is under the panel's own
-    /// cursor. Sub-issue drill-in itself is mouse-driven (see
-    /// `tracker_panel.rs`); this only covers the top-level open.
+    /// `↵`: with the panel's sub-issues list focused, drill into the
+    /// highlighted child; otherwise open the panel on the focused row.
     pub(crate) fn tracker_open(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.tracker.focus == FocusedColumn::Panel {
+            if let Some(child) = self.tracker_panel_children().get(self.tracker.panel_child_selected) {
+                let number = child.number;
+                self.tracker_drill_into(number, cx);
+            }
+            return;
+        }
         if let Some(number) = self.tracker_selected_number(cx) {
             self.tracker.panel_stack = vec![number];
-            self.tracker.status_menu_open = false;
+            self.tracker.status_menu_target = None;
+            self.tracker.panel_child_selected = 0;
             cx.notify();
         }
     }
 
     pub(crate) fn tracker_drill_into(&mut self, number: u64, cx: &mut Context<Self>) {
         self.tracker.panel_stack.push(number);
-        self.tracker.status_menu_open = false;
+        self.tracker.status_menu_target = None;
+        self.tracker.panel_child_selected = 0;
         cx.notify();
     }
 
     pub(crate) fn tracker_back(&mut self, cx: &mut Context<Self>) {
         if self.tracker.panel_stack.len() > 1 {
             self.tracker.panel_stack.pop();
-            self.tracker.status_menu_open = false;
+            self.tracker.status_menu_target = None;
+            self.tracker.panel_child_selected = 0;
             cx.notify();
+        }
+    }
+
+    /// `space` with the panel's sub-issues list focused: open the status
+    /// menu on the highlighted child, or report it's not a board item.
+    pub(crate) fn tracker_panel_space(&mut self, cx: &mut Context<Self>) {
+        if self.tracker.focus != FocusedColumn::Panel {
+            return;
+        }
+        let Some(child) = self.tracker_panel_children().get(self.tracker.panel_child_selected).cloned() else {
+            return;
+        };
+        if self.tracker.item(child.number).is_none() {
+            self.tracker.error = Some(format!("#{} is not on the board", child.number).into());
+            cx.notify();
+            return;
+        }
+        self.tracker.status_menu_target = Some(child.number);
+        cx.notify();
+    }
+
+    /// `e` with the panel's sub-issues list focused: edit the highlighted
+    /// child's title inline.
+    pub(crate) fn tracker_panel_edit_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tracker.focus != FocusedColumn::Panel {
+            return;
+        }
+        let Some(child) = self.tracker_panel_children().get(self.tracker.panel_child_selected).cloned() else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(child.title.clone()));
+        let subscription = cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { secondary: false }) {
+                this.tracker_submit_composer(window, cx);
+            }
+        });
+        self.tracker.composer_mode = Some(ComposerMode::EditChildTitle(child.number));
+        self.tracker.composer_input = Some(input.clone());
+        self.tracker.composer_subscription = Some(subscription);
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// `+` with the panel's sub-issues list focused: same "add sub-issue"
+    /// composer the header's plus glyph opens.
+    pub(crate) fn tracker_panel_add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tracker.focus != FocusedColumn::Panel {
+            return;
+        }
+        if let Some(number) = self.tracker.open_issue() {
+            self.tracker_open_new_issue_composer(Some(number), window, cx);
         }
     }
 
@@ -445,8 +555,8 @@ impl ReviewApp {
             self.tracker_close_composer(cx);
             return;
         }
-        if self.tracker.status_menu_open {
-            self.tracker.status_menu_open = false;
+        if self.tracker.status_menu_target.is_some() {
+            self.tracker.status_menu_target = None;
             cx.notify();
             return;
         }
@@ -516,7 +626,7 @@ impl ReviewApp {
         let item_id = item.project_item_id.clone();
         self.recompute_tracker_urgency();
         self.tracker.error = None;
-        self.tracker.status_menu_open = false;
+        self.tracker.status_menu_target = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let project_id = board.id.clone();
