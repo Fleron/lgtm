@@ -385,8 +385,14 @@ impl ReviewApp {
             }
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
+        let file_ix = data
+            .file_rows
+            .iter()
+            .rposition(|&header| header <= row_ix)?;
         // A drag-selection (the same one cmd-c copies) whose near or far end
-        // is this row becomes a multi-line comment spanning the selection.
+        // is this row becomes a multi-line comment spanning the selection,
+        // as long as the other end lands in the same file and side and on a
+        // different line (GitHub requires start_line strictly below line).
         let other_end = data.selection.and_then(|sel| {
             if sel.side != side {
                 return None;
@@ -402,17 +408,17 @@ impl ReviewApp {
             } else {
                 None
             }?;
+            let other_file_ix = data.file_rows.iter().rposition(|&header| header <= other_row)?;
+            if other_file_ix != file_ix {
+                return None;
+            }
             let (other_side, other_line) = comment_anchor(&data.rows, other_row, side)?;
-            (other_side == anchor_side).then_some(other_line)
+            (other_side == anchor_side && other_line != line).then_some(other_line)
         });
         let (line, start_line) = match other_end {
             Some(other) => (line.max(other), Some(line.min(other))),
             None => (line, None),
         };
-        let file_ix = data
-            .file_rows
-            .iter()
-            .rposition(|&header| header <= row_ix)?;
         let path = data.diff.files[file_ix].display_path().to_string();
         let (bounds, offset) = {
             let state = data.scroll.0.borrow();
