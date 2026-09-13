@@ -1,4 +1,6 @@
+mod comments;
 mod lsp_client;
+mod selection;
 mod theme;
 
 use anyhow::{anyhow, bail, Context as _};
@@ -38,6 +40,12 @@ use lsp_client::{
     LspSession,
 };
 
+use comments::{
+    comment_anchor, comment_row, comment_wrap_cols, group_comments, now_unix, push_thread_rows,
+    CommentIndex, CommentSide, CommentThread, FileAnchors, LocalReview, COMMENT_WRAP_CHARS,
+};
+use selection::{row_selection_range, selection_info, selection_text, RowCol, SelSide, Selection};
+
 const MONO: &str = "Menlo";
 
 /// Diff pane font size in px, adjustable at runtime (cmd-+ / cmd-- / cmd-0).
@@ -67,7 +75,7 @@ fn row_height_for(size: f32) -> f32 {
 
 /// Height of one diff row. Derived from the font so text never outgrows its
 /// row; every scroll/hit-test/minimap calculation keys off this.
-fn row_height() -> f32 {
+pub(crate) fn row_height() -> f32 {
     row_height_for(text_size())
 }
 
@@ -76,7 +84,7 @@ fn row_height() -> f32 {
 /// each. Mouse→column math depends on these.
 const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
 const SPLIT_GUTTER: f32 = 44. + 28.;
-const SPLIT_DIVIDER: f32 = 6.0;
+pub(crate) const SPLIT_DIVIDER: f32 = 6.0;
 
 actions!(
     lgtm,
@@ -275,14 +283,14 @@ fn main() {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LineKind {
+pub(crate) enum LineKind {
     Context,
     Added,
     Removed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
+pub(crate) enum ViewMode {
     Unified,
     Split,
 }
@@ -297,7 +305,7 @@ struct Cell {
     syntax: Vec<(Range<usize>, syntax::Token)>,
 }
 
-enum Row {
+pub(crate) enum Row {
     Spacer,
     FileHeader {
         path: SharedString,
@@ -387,396 +395,6 @@ fn nth_noncomment_row(rows: &[Row], n: usize) -> usize {
         }
     }
     rows.len().saturating_sub(1)
-}
-
-// --- Review comments -------------------------------------------------------
-
-/// Which diff side a review comment anchors to, GitHub's LEFT/RIGHT.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum CommentSide {
-    Left,
-    Right,
-}
-
-impl CommentSide {
-    fn api_str(self) -> &'static str {
-        match self {
-            CommentSide::Left => "LEFT",
-            CommentSide::Right => "RIGHT",
-        }
-    }
-}
-
-/// One review thread: the top-level comment plus its replies, in
-/// created_at order.
-#[derive(Debug)]
-struct CommentThread {
-    root: gh::ReviewComment,
-    replies: Vec<gh::ReviewComment>,
-}
-
-/// One file's threads, keyed by anchor.
-type FileAnchors = HashMap<(CommentSide, u64), Vec<CommentThread>>;
-
-/// Review comments grouped for row building.
-#[derive(Debug, Default)]
-struct CommentIndex {
-    /// path → (side, line) → threads in root-created order.
-    threads: HashMap<String, FileAnchors>,
-    /// path → (anchored comment count, outdated comment count).
-    counts: HashMap<String, (usize, usize)>,
-}
-
-/// Group flat REST comments into anchored threads: replies attach to their
-/// thread via `in_reply_to_id` (orphans are dropped), threads whose root has
-/// no current line are only counted as outdated.
-fn group_comments(mut comments: Vec<gh::ReviewComment>) -> CommentIndex {
-    // ISO-8601 UTC strings sort lexicographically = chronologically, so this
-    // orders roots before their replies and threads by root creation.
-    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    let mut threads: Vec<CommentThread> = Vec::new();
-    // Comment id (root or reply) → thread index, so replies-to-replies still
-    // land in the right thread.
-    let mut thread_of: HashMap<u64, usize> = HashMap::new();
-    for comment in comments {
-        match comment.in_reply_to_id {
-            None => {
-                thread_of.insert(comment.id, threads.len());
-                threads.push(CommentThread {
-                    root: comment,
-                    replies: Vec::new(),
-                });
-            }
-            Some(parent) => {
-                if let Some(&ix) = thread_of.get(&parent) {
-                    thread_of.insert(comment.id, ix);
-                    threads[ix].replies.push(comment);
-                }
-                // Orphaned reply (parent not fetched): skip.
-            }
-        }
-    }
-    let mut index = CommentIndex::default();
-    for thread in threads {
-        let size = 1 + thread.replies.len();
-        let counts = index.counts.entry(thread.root.path.clone()).or_default();
-        let Some(line) = thread.root.line else {
-            counts.1 += size;
-            continue;
-        };
-        counts.0 += size;
-        let side = if thread.root.side.as_deref() == Some("LEFT") {
-            CommentSide::Left
-        } else {
-            CommentSide::Right
-        };
-        index
-            .threads
-            .entry(thread.root.path.clone())
-            .or_default()
-            .entry((side, line))
-            .or_default()
-            .push(thread);
-    }
-    index
-}
-
-#[derive(Debug, Default)]
-struct LocalReview {
-    comments: Vec<gh::ReviewComment>,
-    next_id: u64,
-}
-
-impl LocalReview {
-    fn index(&self) -> CommentIndex {
-        group_comments(self.comments.clone())
-    }
-
-    fn add_comment(
-        &mut self,
-        reply_to: Option<u64>,
-        path: String,
-        side: CommentSide,
-        line: u64,
-        start_line: Option<u64>,
-        body: String,
-    ) {
-        self.next_id += 1;
-        self.comments.push(gh::ReviewComment {
-            id: self.next_id,
-            path,
-            line: Some(line),
-            side: Some(side.api_str().to_string()),
-            start_line,
-            body,
-            user: gh::Author {
-                login: "you".to_string(),
-            },
-            created_at: "draft".to_string(),
-            in_reply_to_id: reply_to,
-        });
-    }
-}
-
-/// Widest a comment body ever wraps, however roomy the pane: past ~80 columns
-/// prose gets hard to track. Also the fallback before the pane is measured.
-const COMMENT_WRAP_CHARS: usize = 80;
-/// Never wrap narrower than this, however cramped the pane — below it every
-/// word lands on its own line, which is worse than clipping.
-const MIN_COMMENT_WRAP_CHARS: usize = 24;
-
-/// Chrome around a comment body inside its card: the gutter indent, the accent
-/// border, and the horizontal padding (see `comment_row`).
-const COMMENT_CARD_CHROME: f32 = 72. + 2. + 24.;
-
-/// Columns a comment body can use given the measured list width — the whole
-/// width in unified, one half in split. Wrapping is then only as narrow as the
-/// pane forces, capped at [`COMMENT_WRAP_CHARS`] for readability.
-fn comment_wrap_cols(list_width: f32, mode: ViewMode, char_width: f32) -> usize {
-    if char_width <= 0. {
-        return COMMENT_WRAP_CHARS;
-    }
-    let card = match mode {
-        ViewMode::Unified => list_width,
-        ViewMode::Split => (list_width - SPLIT_DIVIDER) / 2.,
-    };
-    let cols = ((card - COMMENT_CARD_CHROME) / char_width).floor();
-    (cols.max(0.) as usize).clamp(MIN_COMMENT_WRAP_CHARS, COMMENT_WRAP_CHARS)
-}
-
-/// Soft-wrap `text` at `width` chars: explicit newlines are preserved, wraps
-/// prefer the last space in range (the space is consumed), and a word longer
-/// than the width hard-breaks on a char boundary.
-fn wrap_body(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.split('\n') {
-        let mut line = line.strip_suffix('\r').unwrap_or(line);
-        loop {
-            // Byte offset of the (width+1)-th char; absent = the rest fits.
-            let Some((cut, _)) = line.char_indices().nth(width) else {
-                out.push(line.to_string());
-                break;
-            };
-            match line[..cut].rfind(' ') {
-                Some(space) if space > 0 => {
-                    out.push(line[..space].to_string());
-                    line = &line[space + 1..];
-                }
-                _ => {
-                    out.push(line[..cut].to_string());
-                    line = &line[cut..];
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// Unix seconds for an ISO-8601 UTC timestamp ("2026-07-01T12:34:56Z").
-fn parse_iso_utc(s: &str) -> Option<i64> {
-    if s.len() < 20 {
-        return None;
-    }
-    let num = |range: Range<usize>| s.get(range)?.parse::<i64>().ok();
-    Some(
-        days_from_civil(num(0..4)?, num(5..7)?, num(8..10)?) * 86400
-            + num(11..13)? * 3600
-            + num(14..16)? * 60
-            + num(17..19)?,
-    )
-}
-
-/// Compact "3d ago"-style age of an ISO timestamp relative to `now` (unix
-/// seconds). Unparseable input renders as-is.
-fn short_age(iso: &str, now: i64) -> String {
-    let Some(t) = parse_iso_utc(iso) else {
-        return iso.to_string();
-    };
-    let d = now - t;
-    if d < 60 {
-        "just now".to_string()
-    } else if d < 3600 {
-        format!("{}m ago", d / 60)
-    } else if d < 86400 {
-        format!("{}h ago", d / 3600)
-    } else if d < 365 * 86400 {
-        format!("{}d ago", d / 86400)
-    } else {
-        format!("{}y ago", d / (365 * 86400))
-    }
-}
-
-/// Append the display rows of every thread anchored at (side, no) — comment
-/// headers, wrapped body lines, and one reply-affordance row per thread.
-/// No-op when comments are hidden/absent (`anchors` None) or the row has no
-/// number on that side.
-fn push_thread_rows(
-    rows: &mut Vec<Row>,
-    anchors: Option<&FileAnchors>,
-    path: &str,
-    side: CommentSide,
-    no: Option<u32>,
-    now: i64,
-    mode: ViewMode,
-    wrap: usize,
-) {
-    // Split mode renders the thread inside the half it was left on, like the
-    // GitHub UI; unified has one column, so the card spans it.
-    let half = match mode {
-        ViewMode::Split => Some(side),
-        ViewMode::Unified => None,
-    };
-    let (Some(anchors), Some(no)) = (anchors, no) else {
-        return;
-    };
-    let Some(threads) = anchors.get(&(side, no as u64)) else {
-        return;
-    };
-    for thread in threads {
-        for (ix, comment) in std::iter::once(&thread.root)
-            .chain(&thread.replies)
-            .enumerate()
-        {
-            rows.push(Row::CommentHeader {
-                author: comment.user.login.clone().into(),
-                when: short_age(&comment.created_at, now).into(),
-                is_reply: ix > 0,
-                half,
-                // A thread always opens with its root's header and closes with
-                // the actions row, so those two carry the card's edges.
-                top: ix == 0,
-            });
-            for line in wrap_body(&comment.body, wrap) {
-                rows.push(Row::CommentBody {
-                    line: line.into(),
-                    half,
-                });
-            }
-        }
-        rows.push(Row::CommentActions {
-            root_id: thread.root.id,
-            path: path.to_string().into(),
-            side,
-            line: no as u64,
-            half,
-        });
-    }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Which text stream a selection runs through. Split selections are locked to
-/// the side where the drag started, like GitHub; the other side paints nothing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SelSide {
-    Unified,
-    Left,
-    Right,
-}
-
-/// A point in text space: display row index + char index into that row's text
-/// (char, not byte — convert to byte offsets only when slicing). Ordered by
-/// (row, col), which is exactly document order.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct RowCol {
-    row: usize,
-    col: usize,
-}
-
-/// Anchor stays where the drag started; head follows the mouse. The ordered
-/// pair is derived on use, so dragging upward needs no special casing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Selection {
-    side: SelSide,
-    anchor: RowCol,
-    head: RowCol,
-}
-
-impl Selection {
-    fn ordered(&self) -> (RowCol, RowCol) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-}
-
-/// The text a selection on `side` runs through for this row, if any. Rows
-/// that aren't text (headers, spacers, binary) and absent split cells yield
-/// None: they're selectable-through but contribute nothing.
-fn row_side_text(row: &Row, side: SelSide) -> Option<&str> {
-    match (row, side) {
-        (Row::Line { text, .. }, SelSide::Unified) => Some(text.as_ref()),
-        (Row::SplitLine { left, .. }, SelSide::Left) => left.as_ref().map(|c| c.text.as_ref()),
-        (Row::SplitLine { right, .. }, SelSide::Right) => right.as_ref().map(|c| c.text.as_ref()),
-        _ => None,
-    }
-}
-
-/// Byte offset of char index `col`, clamped to the end of the text.
-fn char_to_byte(text: &str, col: usize) -> usize {
-    text.char_indices()
-        .nth(col)
-        .map(|(byte, _)| byte)
-        .unwrap_or(text.len())
-}
-
-/// The selected byte range within display row `row_ix`, or None if the row
-/// contributes nothing (outside the selection, not a text row, or the selected
-/// side is absent). The range can be empty (e.g. a selected empty line): copy
-/// keeps it as an empty line, painting skips it.
-fn row_selection_range(sel: &Selection, row_ix: usize, row: &Row) -> Option<Range<usize>> {
-    let (start, end) = sel.ordered();
-    if row_ix < start.row || row_ix > end.row {
-        return None;
-    }
-    let text = row_side_text(row, sel.side)?;
-    let chars = text.chars().count();
-    let start_col = if row_ix == start.row {
-        start.col.min(chars)
-    } else {
-        0
-    };
-    let end_col = if row_ix == end.row {
-        end.col.min(chars)
-    } else {
-        chars
-    };
-    if start_col > end_col {
-        return None;
-    }
-    Some(char_to_byte(text, start_col)..char_to_byte(text, end_col))
-}
-
-/// The selected text: each contributing row's selected substring, joined with
-/// newlines. Header/spacer rows and absent split cells are skipped entirely
-/// (no blank line for them).
-fn selection_text(sel: &Selection, rows: &[Row]) -> String {
-    let (start, end) = sel.ordered();
-    let mut parts = Vec::new();
-    for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
-        if let Some(range) = row_selection_range(sel, ix, &rows[ix]) {
-            let text = row_side_text(&rows[ix], sel.side).unwrap_or_default();
-            parts.push(&text[range]);
-        }
-    }
-    parts.join("\n")
 }
 
 /// Guardrails: hunk sides bigger than this render without syntax highlighting.
@@ -997,7 +615,7 @@ fn push_gap_rows(
 /// `upgrades` use whole-file syntax spans and get gap rows between hunks.
 /// Review threads render beneath the line they anchor to when
 /// `show_comments` is set; file headers always carry the comment counts.
-fn build_rows(
+pub(crate) fn build_rows(
     diff: &PrDiff,
     mode: ViewMode,
     upgrades: &HashMap<usize, FileUpgrade>,
@@ -1408,85 +1026,10 @@ fn line_content(
 /// Where a row sits in its thread's card, so the rows together draw one
 /// continuous outline instead of a box per row.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CardEdge {
+pub(crate) enum CardEdge {
     Top,
     Middle,
     Bottom,
-}
-
-fn comment_row(
-    inner: gpui::AnyElement,
-    half: Option<CommentSide>,
-    header: bool,
-    edge: CardEdge,
-) -> gpui::AnyElement {
-    // The card itself: indented past the gutter, blue-tinted and accented so a
-    // thread reads as one block distinct from the diff behind it. The author
-    // line gets a stronger wash so each comment's start is obvious.
-    let card = |inner: gpui::AnyElement| {
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .child(div().w(px(72.)).flex_shrink_0())
-            .child({
-                // Sides on every row, caps only on the thread's first and last,
-                // so the rows stack into one unbroken outline.
-                let body = div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .bg(if header {
-                        theme::comment_header_bg()
-                    } else {
-                        theme::comment_bg()
-                    })
-                    .border_color(theme::comment_outline())
-                    .border_l_2()
-                    .border_r_1();
-                let body = match edge {
-                    CardEdge::Top => body.border_t_1().rounded_t_md(),
-                    CardEdge::Bottom => body.border_b_1().rounded_b_md(),
-                    CardEdge::Middle => body,
-                };
-                body.px_3()
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .child(inner)
-            })
-    };
-    let row = div().h(px(row_height())).w_full().flex();
-    match half {
-        // Unified: one column, so the card spans it.
-        None => row.child(card(inner)).into_any_element(),
-        // Split: sit in the half the comment was left on, mirroring the line
-        // rows' [cell | divider | cell] geometry so the divider stays aligned.
-        Some(side) => {
-            let empty = || div().flex_1().min_w_0().h_full();
-            let divider = div()
-                .w(px(SPLIT_DIVIDER))
-                .flex_shrink_0()
-                .h_full()
-                .bg(theme::crust())
-                .border_l_1()
-                .border_r_1()
-                .border_color(theme::surface0());
-            match side {
-                CommentSide::Left => row
-                    .child(card(inner))
-                    .child(divider)
-                    .child(empty())
-                    .into_any_element(),
-                CommentSide::Right => row
-                    .child(empty())
-                    .child(divider)
-                    .child(card(inner))
-                    .into_any_element(),
-            }
-        }
-    }
 }
 
 /// `selection` is this row's selected byte range (side + non-empty range),
@@ -3812,83 +3355,6 @@ fn local_comment_location(file: &str, side: Option<&str>, line: Option<u64>) -> 
     }
 }
 
-/// What a selection pins down for the chat: the anchor triple (path, side,
-/// line range) plus the selected text.
-#[derive(Debug, PartialEq)]
-struct SelectionInfo {
-    path: String,
-    side: &'static str,
-    lo: u32,
-    hi: u32,
-    text: String,
-}
-
-impl SelectionInfo {
-    fn block(&self) -> String {
-        format!(
-            "Selected text ({}:{}-{}, {} side):\n```\n{}\n```\n",
-            self.path, self.lo, self.hi, self.side, self.text
-        )
-    }
-
-    fn note(&self) -> String {
-        format!(
-            "› included selection: {}:{}-{}",
-            self.path, self.lo, self.hi
-        )
-    }
-}
-
-/// Resolve a selection to its anchor info, reusing the same row machinery as
-/// copy. Line numbers come from the selected side (unified rows prefer the
-/// new number); the path is the file containing the selection's start row.
-/// None when the selection has no text.
-fn selection_info(
-    sel: &Selection,
-    rows: &[Row],
-    file_rows: &[usize],
-    diff: &PrDiff,
-) -> Option<SelectionInfo> {
-    let text = selection_text(sel, rows);
-    if text.is_empty() {
-        return None;
-    }
-    let (start, end) = sel.ordered();
-    let file_ix = file_rows.iter().rposition(|&ix| ix <= start.row)?;
-    let path = diff.files.get(file_ix)?.display_path().to_string();
-    let (mut lo, mut hi) = (u32::MAX, 0);
-    for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
-        if row_selection_range(sel, ix, &rows[ix]).is_none() {
-            continue;
-        }
-        let no = match (&rows[ix], sel.side) {
-            (Row::Line { old_no, new_no, .. }, _) => new_no.or(*old_no),
-            (Row::SplitLine { left, .. }, SelSide::Left) => left.as_ref().map(|c| c.no),
-            (Row::SplitLine { right, .. }, SelSide::Right) => right.as_ref().map(|c| c.no),
-            _ => None,
-        };
-        if let Some(no) = no {
-            lo = lo.min(no);
-            hi = hi.max(no);
-        }
-    }
-    if lo == u32::MAX {
-        return None;
-    }
-    let side = match sel.side {
-        SelSide::Unified => "unified",
-        SelSide::Left => "LEFT (old)",
-        SelSide::Right => "RIGHT (new)",
-    };
-    Some(SelectionInfo {
-        path,
-        side,
-        lo,
-        hi,
-        text,
-    })
-}
-
 /// Scratch dir for one item's materialized exploration files. Includes the
 /// pid: item ids restart at 0 every run, and stale dirs from another process
 /// must never be reused.
@@ -4335,31 +3801,6 @@ struct ReviewApp {
     subscribed_refreshing: bool,
     subscribed_scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
-}
-
-/// The comment anchor of a display row: which (side, line) a new comment on
-/// it targets. Unified rows anchor by kind (Removed → LEFT, else RIGHT);
-/// split rows by the half under the pointer. Rows without line numbers and
-/// absent cells yield None.
-fn comment_anchor(rows: &[Row], row_ix: usize, side: SelSide) -> Option<(CommentSide, u64)> {
-    match (rows.get(row_ix)?, side) {
-        (
-            Row::Line {
-                kind: LineKind::Removed,
-                old_no,
-                ..
-            },
-            _,
-        ) => Some((CommentSide::Left, (*old_no)? as u64)),
-        (Row::Line { new_no, .. }, _) => Some((CommentSide::Right, (*new_no)? as u64)),
-        (Row::SplitLine { left, .. }, SelSide::Left) => {
-            Some((CommentSide::Left, left.as_ref()?.no as u64))
-        }
-        (Row::SplitLine { right, .. }, SelSide::Right) => {
-            Some((CommentSide::Right, right.as_ref()?.no as u64))
-        }
-        _ => None,
-    }
 }
 
 impl ReviewApp {
@@ -8971,9 +8412,137 @@ impl Render for ReviewApp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_util {
     use super::*;
     use diff_core::{FileDiff, Hunk};
+    use syntax::Token;
+
+    pub(crate) fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
+        DiffRow::Context {
+            old_no,
+            new_no,
+            text: text.to_string(),
+        }
+    }
+
+    pub(crate) fn add(new_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow {
+        DiffRow::Added {
+            new_no,
+            text: text.to_string(),
+            intra,
+        }
+    }
+
+    pub(crate) fn rem(old_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow {
+        DiffRow::Removed {
+            old_no,
+            text: text.to_string(),
+            intra,
+        }
+    }
+
+    pub(crate) fn hunk(old_start: u32, new_start: u32, rows: Vec<DiffRow>) -> Hunk {
+        Hunk {
+            old_start,
+            old_count: 0,
+            new_start,
+            new_count: 0,
+            section: String::new(),
+            rows,
+        }
+    }
+
+    pub(crate) fn sample_diff() -> PrDiff {
+        PrDiff {
+            files: vec![
+                FileDiff {
+                    old_path: Some("a.rs".into()),
+                    new_path: Some("a.rs".into()),
+                    status: FileStatus::Modified,
+                    hunks: vec![
+                        // Equal-count modified run, flanked by context.
+                        hunk(
+                            1,
+                            1,
+                            vec![
+                                ctx(1, 1, "ctx"),
+                                rem(2, "old1", vec![0..3]),
+                                rem(3, "old2", Vec::new()),
+                                add(2, "new1", vec![0..3]),
+                                add(3, "new2", Vec::new()),
+                                ctx(4, 4, "tail"),
+                            ],
+                        ),
+                        // Unequal run (2 removed, 1 added) + a lone added run.
+                        hunk(
+                            10,
+                            10,
+                            vec![
+                                rem(10, "r1", Vec::new()),
+                                rem(11, "r2", Vec::new()),
+                                add(10, "a1", Vec::new()),
+                                ctx(12, 11, "c"),
+                                add(12, "lone", Vec::new()),
+                            ],
+                        ),
+                    ],
+                    additions: 4,
+                    deletions: 4,
+                },
+                FileDiff {
+                    old_path: Some("b.png".into()),
+                    new_path: Some("b.png".into()),
+                    status: FileStatus::Binary,
+                    hunks: Vec::new(),
+                    additions: 0,
+                    deletions: 0,
+                },
+            ],
+        }
+    }
+
+    pub(crate) fn cell(cell: &Option<Cell>) -> (u32, LineKind, &str, &[Range<usize>]) {
+        let cell = cell.as_ref().expect("expected a cell");
+        (cell.no, cell.kind, cell.text.as_ref(), &cell.intra)
+    }
+
+    pub(crate) fn style(token: Token) -> HighlightStyle {
+        theme::token_style(token)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rc(
+        id: u64,
+        path: &str,
+        side: Option<&str>,
+        line: Option<u64>,
+        body: &str,
+        author: &str,
+        created_at: &str,
+        reply_to: Option<u64>,
+    ) -> gh::ReviewComment {
+        gh::ReviewComment {
+            id,
+            path: path.to_string(),
+            line,
+            side: side.map(str::to_string),
+            start_line: None,
+            body: body.to_string(),
+            user: gh::Author {
+                login: author.to_string(),
+            },
+            created_at: created_at.to_string(),
+            in_reply_to_id: reply_to,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diff_core::FileDiff;
+    use selection::row_side_text;
+    use test_util::*;
 
     #[test]
     fn repository_subscription_slugs_parse_and_deduplicate() {
@@ -9082,95 +8651,6 @@ mod tests {
         assert_eq!(identifier_start_at(text, 14), Some(11));
         assert_eq!(identifier_start_at(text, 15), Some(11));
         assert_eq!(identifier_start_at(text, 6), None);
-    }
-
-    fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
-        DiffRow::Context {
-            old_no,
-            new_no,
-            text: text.to_string(),
-        }
-    }
-
-    fn add(new_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow {
-        DiffRow::Added {
-            new_no,
-            text: text.to_string(),
-            intra,
-        }
-    }
-
-    fn rem(old_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow {
-        DiffRow::Removed {
-            old_no,
-            text: text.to_string(),
-            intra,
-        }
-    }
-
-    fn hunk(old_start: u32, new_start: u32, rows: Vec<DiffRow>) -> Hunk {
-        Hunk {
-            old_start,
-            old_count: 0,
-            new_start,
-            new_count: 0,
-            section: String::new(),
-            rows,
-        }
-    }
-
-    fn sample_diff() -> PrDiff {
-        PrDiff {
-            files: vec![
-                FileDiff {
-                    old_path: Some("a.rs".into()),
-                    new_path: Some("a.rs".into()),
-                    status: FileStatus::Modified,
-                    hunks: vec![
-                        // Equal-count modified run, flanked by context.
-                        hunk(
-                            1,
-                            1,
-                            vec![
-                                ctx(1, 1, "ctx"),
-                                rem(2, "old1", vec![0..3]),
-                                rem(3, "old2", Vec::new()),
-                                add(2, "new1", vec![0..3]),
-                                add(3, "new2", Vec::new()),
-                                ctx(4, 4, "tail"),
-                            ],
-                        ),
-                        // Unequal run (2 removed, 1 added) + a lone added run.
-                        hunk(
-                            10,
-                            10,
-                            vec![
-                                rem(10, "r1", Vec::new()),
-                                rem(11, "r2", Vec::new()),
-                                add(10, "a1", Vec::new()),
-                                ctx(12, 11, "c"),
-                                add(12, "lone", Vec::new()),
-                            ],
-                        ),
-                    ],
-                    additions: 4,
-                    deletions: 4,
-                },
-                FileDiff {
-                    old_path: Some("b.png".into()),
-                    new_path: Some("b.png".into()),
-                    status: FileStatus::Binary,
-                    hunks: Vec::new(),
-                    additions: 0,
-                    deletions: 0,
-                },
-            ],
-        }
-    }
-
-    fn cell(cell: &Option<Cell>) -> (u32, LineKind, &str, &[Range<usize>]) {
-        let cell = cell.as_ref().expect("expected a cell");
-        (cell.no, cell.kind, cell.text.as_ref(), &cell.intra)
     }
 
     #[test]
@@ -9401,10 +8881,6 @@ mod tests {
     }
 
     use syntax::Token;
-
-    fn style(token: Token) -> HighlightStyle {
-        theme::token_style(token)
-    }
 
     fn style_bg(token: Option<Token>) -> HighlightStyle {
         let mut style = token.map(style).unwrap_or_default();
@@ -9743,170 +9219,6 @@ mod tests {
         assert_eq!(split_lines, 8); // 4 (hunk 1) + 4 (hunk 2)
     }
 
-    fn line(text: &str) -> Row {
-        Row::Line {
-            old_no: Some(1),
-            new_no: Some(1),
-            kind: LineKind::Context,
-            text: text.to_string().into(),
-            intra: Vec::new(),
-            syntax: Vec::new(),
-        }
-    }
-
-    fn split(left: Option<&str>, right: Option<&str>) -> Row {
-        let cell = |text: &str| Cell {
-            no: 1,
-            kind: LineKind::Context,
-            text: text.to_string().into(),
-            intra: Vec::new(),
-            syntax: Vec::new(),
-        };
-        Row::SplitLine {
-            left: left.map(cell),
-            right: right.map(cell),
-        }
-    }
-
-    fn sel(side: SelSide, anchor: (usize, usize), head: (usize, usize)) -> Selection {
-        Selection {
-            side,
-            anchor: RowCol {
-                row: anchor.0,
-                col: anchor.1,
-            },
-            head: RowCol {
-                row: head.0,
-                col: head.1,
-            },
-        }
-    }
-
-    #[test]
-    fn selection_ordered_swaps_backward_drags() {
-        let forward = sel(SelSide::Unified, (1, 3), (4, 2));
-        let backward = sel(SelSide::Unified, (4, 2), (1, 3));
-        assert_eq!(forward.ordered(), backward.ordered());
-        // Same row, backward drag: ordered by column.
-        let same_row = sel(SelSide::Unified, (2, 7), (2, 1));
-        let (start, end) = same_row.ordered();
-        assert_eq!((start.col, end.col), (1, 7));
-    }
-
-    #[test]
-    fn char_to_byte_multibyte() {
-        let text = "let s = \"héllo\";";
-        assert_eq!(char_to_byte(text, 0), 0);
-        assert_eq!(char_to_byte(text, 10), 10); // 'é'
-        assert_eq!(char_to_byte(text, 11), 12); // first 'l': 'é' is 2 bytes
-        assert_eq!(char_to_byte(text, 99), text.len()); // clamped
-        assert_eq!(
-            &text[char_to_byte(text, 8)..char_to_byte(text, 14)],
-            "\"héllo"
-        );
-    }
-
-    #[test]
-    fn row_range_unified_multi_row() {
-        let rows = vec![line("first line"), line("middle"), line("last line")];
-        let sel = sel(SelSide::Unified, (0, 6), (2, 4));
-        // First row: from col 6 to end of text.
-        assert_eq!(row_selection_range(&sel, 0, &rows[0]), Some(6..10));
-        // Middle row: fully selected, col 0 to end.
-        assert_eq!(row_selection_range(&sel, 1, &rows[1]), Some(0..6));
-        // Last row: col 0 to col 4.
-        assert_eq!(row_selection_range(&sel, 2, &rows[2]), Some(0..4));
-        // Outside the selection.
-        assert_eq!(row_selection_range(&sel, 3, &rows[0]), None);
-    }
-
-    #[test]
-    fn row_range_skips_non_text_rows() {
-        let header = Row::HunkHeader {
-            label: "@@".into(),
-            upgraded: false,
-        };
-        let sel = sel(SelSide::Unified, (0, 0), (2, 3));
-        // Headers/spacers inside the span contribute nothing…
-        assert_eq!(row_selection_range(&sel, 1, &header), None);
-        assert_eq!(row_selection_range(&sel, 1, &Row::Spacer), None);
-        // …and split rows never match a Unified-side selection.
-        assert_eq!(
-            row_selection_range(&sel, 1, &split(Some("x"), Some("y"))),
-            None
-        );
-    }
-
-    #[test]
-    fn row_range_split_sides_and_absent_cells() {
-        let rows = vec![
-            split(Some("left one"), Some("right one")),
-            split(None, Some("right only")),
-            split(Some("left only"), None),
-        ];
-        let right = sel(SelSide::Right, (0, 6), (2, 4));
-        assert_eq!(row_selection_range(&right, 0, &rows[0]), Some(6..9));
-        assert_eq!(row_selection_range(&right, 1, &rows[1]), Some(0..10));
-        // Selected side absent: contributes nothing.
-        assert_eq!(row_selection_range(&right, 2, &rows[2]), None);
-        let left = sel(SelSide::Left, (0, 5), (1, 3));
-        assert_eq!(row_selection_range(&left, 0, &rows[0]), Some(5..8));
-        assert_eq!(row_selection_range(&left, 1, &rows[1]), None);
-    }
-
-    #[test]
-    fn row_range_clamps_columns_to_text() {
-        let rows = vec![line("ab"), line("cdef")];
-        // Anchor col way past the end of a short line.
-        let sel = sel(SelSide::Unified, (0, 99), (1, 2));
-        assert_eq!(row_selection_range(&sel, 0, &rows[0]), Some(2..2)); // empty
-        assert_eq!(row_selection_range(&sel, 1, &rows[1]), Some(0..2));
-    }
-
-    #[test]
-    fn copy_assembles_contributing_rows() {
-        let rows = vec![
-            line("fn main() {"),
-            Row::HunkHeader {
-                label: "@@".into(),
-                upgraded: false,
-            },
-            line(""),
-            line("    body();"),
-            line("}"),
-        ];
-        // From col 3 of row 0 through col 1 of row 4: the header is skipped
-        // (no blank line for it), the empty line survives as an empty line.
-        let forward = sel(SelSide::Unified, (0, 3), (4, 1));
-        assert_eq!(
-            selection_text(&forward, &rows),
-            "main() {\n\n    body();\n}"
-        );
-        // Backward drag over one row.
-        let backward = sel(SelSide::Unified, (0, 7), (0, 3));
-        assert_eq!(selection_text(&backward, &rows), "main");
-    }
-
-    #[test]
-    fn copy_split_takes_locked_side_only() {
-        let rows = vec![
-            split(Some("old a"), Some("new a")),
-            split(None, Some("new b")),
-            split(Some("old c"), None),
-        ];
-        let right = sel(SelSide::Right, (0, 0), (2, 5));
-        assert_eq!(selection_text(&right, &rows), "new a\nnew b");
-        let left = sel(SelSide::Left, (0, 0), (2, 5));
-        assert_eq!(selection_text(&left, &rows), "old a\nold c");
-    }
-
-    #[test]
-    fn copy_multibyte_slice() {
-        let rows = vec![line("let s = \"héllo\";")];
-        let quoted = sel(SelSide::Unified, (0, 8), (0, 14));
-        assert_eq!(selection_text(&quoted, &rows), "\"héllo");
-    }
-
     // --- Minimap -----------------------------------------------------------
 
     fn mrow(kind: MinimapKind, len_frac: f32) -> MinimapRow {
@@ -10152,180 +9464,6 @@ mod tests {
     }
 
     // --- Review comments ----------------------------------------------------
-
-    fn rc(
-        id: u64,
-        path: &str,
-        side: Option<&str>,
-        line: Option<u64>,
-        body: &str,
-        author: &str,
-        created_at: &str,
-        reply_to: Option<u64>,
-    ) -> gh::ReviewComment {
-        gh::ReviewComment {
-            id,
-            path: path.to_string(),
-            line,
-            side: side.map(str::to_string),
-            start_line: None,
-            body: body.to_string(),
-            user: gh::Author {
-                login: author.to_string(),
-            },
-            created_at: created_at.to_string(),
-            in_reply_to_id: reply_to,
-        }
-    }
-
-    #[test]
-    fn wrap_preserves_newlines_and_breaks_at_spaces() {
-        // Explicit newlines (and CRLF) survive; empty lines stay empty.
-        assert_eq!(wrap_body("a\n\nb\r\nc", 10), vec!["a", "", "b", "c"]);
-        // Fits exactly: no wrap.
-        assert_eq!(wrap_body("abcde", 5), vec!["abcde"]);
-        // Breaks at the last space in range; the space is consumed.
-        assert_eq!(
-            wrap_body("one two three four", 9),
-            vec!["one two", "three", "four"]
-        );
-        // A word longer than the width hard-breaks; no space is invented.
-        assert_eq!(wrap_body("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
-        // Never splits inside a word when a space exists in range.
-        assert_eq!(wrap_body("aa bbbb", 5), vec!["aa", "bbbb"]);
-        // Multibyte chars: wraps on char boundaries, not bytes.
-        assert_eq!(wrap_body("ééééé", 3), vec!["ééé", "éé"]);
-        assert_eq!(wrap_body("éé éé", 3), vec!["éé", "éé"]);
-    }
-
-    #[test]
-    fn short_age_buckets() {
-        let now = parse_iso_utc("2026-07-09T12:00:00Z").unwrap();
-        assert_eq!(short_age("2026-07-09T11:59:30Z", now), "just now");
-        assert_eq!(short_age("2026-07-09T11:15:00Z", now), "45m ago");
-        assert_eq!(short_age("2026-07-09T05:00:00Z", now), "7h ago");
-        assert_eq!(short_age("2026-07-06T12:00:00Z", now), "3d ago");
-        assert_eq!(short_age("2024-01-01T00:00:00Z", now), "2y ago");
-        // Clock skew (future timestamp) degrades to "just now".
-        assert_eq!(short_age("2026-07-09T12:05:00Z", now), "just now");
-        // Unparseable input renders as-is.
-        assert_eq!(short_age("garbage", now), "garbage");
-    }
-
-    #[test]
-    fn parse_iso_utc_matches_known_epoch() {
-        assert_eq!(parse_iso_utc("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_iso_utc("2001-09-09T01:46:40Z"), Some(1_000_000_000));
-        assert_eq!(parse_iso_utc("2026-07-09"), None);
-    }
-
-    #[test]
-    fn group_comments_threads_replies_orphans_and_outdated() {
-        let index = group_comments(vec![
-            // Deliberately out of order: grouping sorts by created_at.
-            rc(
-                2,
-                "a.rs",
-                Some("RIGHT"),
-                Some(2),
-                "reply",
-                "bob",
-                "2026-01-02T00:00:00Z",
-                Some(1),
-            ),
-            rc(
-                1,
-                "a.rs",
-                Some("RIGHT"),
-                Some(2),
-                "root",
-                "alice",
-                "2026-01-01T00:00:00Z",
-                None,
-            ),
-            // Second thread at the same anchor, created later.
-            rc(
-                3,
-                "a.rs",
-                Some("RIGHT"),
-                Some(2),
-                "later",
-                "carol",
-                "2026-01-03T00:00:00Z",
-                None,
-            ),
-            // LEFT-side thread on the same line number: distinct anchor.
-            rc(
-                4,
-                "a.rs",
-                Some("LEFT"),
-                Some(2),
-                "old side",
-                "dave",
-                "2026-01-04T00:00:00Z",
-                None,
-            ),
-            // Outdated: no current line. Counts, never anchors.
-            rc(
-                5,
-                "a.rs",
-                None,
-                None,
-                "stale",
-                "erin",
-                "2026-01-05T00:00:00Z",
-                None,
-            ),
-            // Orphaned reply: parent never fetched — dropped entirely.
-            rc(
-                6,
-                "a.rs",
-                Some("RIGHT"),
-                Some(2),
-                "orphan",
-                "mallory",
-                "2026-01-06T00:00:00Z",
-                Some(999),
-            ),
-            // Reply-to-a-reply lands in the root's thread.
-            rc(
-                7,
-                "a.rs",
-                Some("RIGHT"),
-                Some(2),
-                "nested",
-                "alice",
-                "2026-01-07T00:00:00Z",
-                Some(2),
-            ),
-            rc(
-                8,
-                "b.rs",
-                Some("RIGHT"),
-                Some(9),
-                "other file",
-                "bob",
-                "2026-01-08T00:00:00Z",
-                None,
-            ),
-        ]);
-        let a = &index.threads["a.rs"];
-        let right = &a[&(CommentSide::Right, 2)];
-        assert_eq!(right.len(), 2);
-        assert_eq!(right[0].root.id, 1);
-        assert_eq!(
-            right[0].replies.iter().map(|c| c.id).collect::<Vec<_>>(),
-            vec![2, 7]
-        );
-        assert_eq!(right[1].root.id, 3);
-        assert!(right[1].replies.is_empty());
-        assert_eq!(a[&(CommentSide::Left, 2)][0].root.id, 4);
-        // Counts: anchored = 3 (root+reply+nested) + 1 + 1 = 5 (the orphan
-        // is dropped), outdated = 1.
-        assert_eq!(index.counts["a.rs"], (5, 1));
-        assert_eq!(index.counts["b.rs"], (1, 0));
-        assert_eq!(index.threads["b.rs"][&(CommentSide::Right, 9)].len(), 1);
-    }
 
     /// Comments for sample_diff's a.rs: a RIGHT thread (with one reply) on
     /// added line 2 ("new1"), a LEFT thread on removed line 2 ("old1"), and
@@ -10619,32 +9757,6 @@ mod tests {
     }
 
     #[test]
-    fn comment_wrap_cols_follows_the_pane_width() {
-        let cw = 8.0; // 8px per column keeps the arithmetic obvious.
-        let chrome = COMMENT_CARD_CHROME;
-        // Unified uses the whole width; split only its half, so the same pane
-        // yields roughly half the columns.
-        assert_eq!(comment_wrap_cols(chrome + 40. * cw, ViewMode::Unified, cw), 40);
-        let split_pane = 2. * (chrome + 40. * cw) + SPLIT_DIVIDER;
-        assert_eq!(comment_wrap_cols(split_pane, ViewMode::Split, cw), 40);
-        // A roomy pane stops widening at the readability cap...
-        assert_eq!(
-            comment_wrap_cols(10_000., ViewMode::Unified, cw),
-            COMMENT_WRAP_CHARS
-        );
-        // ...and a cramped one bottoms out rather than wrapping every word.
-        assert_eq!(
-            comment_wrap_cols(0., ViewMode::Split, cw),
-            MIN_COMMENT_WRAP_CHARS
-        );
-        // Degenerate char width can't divide by zero.
-        assert_eq!(
-            comment_wrap_cols(800., ViewMode::Unified, 0.),
-            COMMENT_WRAP_CHARS
-        );
-    }
-
-    #[test]
     fn comment_bodies_wrap_to_the_requested_column_width() {
         // One long prose line plus an unbreakable token (a URL), the two ways a
         // body runs past the card.
@@ -10925,34 +10037,6 @@ mod tests {
     }
 
     #[test]
-    fn local_review_comments_index_like_review_threads() {
-        let mut review = LocalReview::default();
-        review.add_comment(
-            None,
-            "src/lib.rs".to_string(),
-            CommentSide::Right,
-            12,
-            None,
-            "please simplify this".to_string(),
-        );
-        review.add_comment(
-            Some(1),
-            "src/lib.rs".to_string(),
-            CommentSide::Right,
-            12,
-            None,
-            "also add a test".to_string(),
-        );
-
-        let index = review.index();
-        assert_eq!(index.counts["src/lib.rs"], (2, 0));
-        let threads = &index.threads["src/lib.rs"][&(CommentSide::Right, 12)];
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].root.body, "please simplify this");
-        assert_eq!(threads[0].replies[0].body, "also add a test");
-    }
-
-    #[test]
     fn local_review_prompt_matches_difit_comment_format() {
         let src = git::LocalSource {
             repo_root: "/tmp/myrepo".into(),
@@ -10990,45 +10074,6 @@ mod tests {
         assert_eq!(
             local_review_prompt(&src, &review),
             "Diff: upstream/main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nsrc/lib.rs:R7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
-        );
-    }
-
-    #[test]
-    fn selection_info_resolves_anchor_and_text() {
-        let (rows, file_rows, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-                COMMENT_WRAP_CHARS,
-        );
-        // rows: FileHeader, HunkHeader, ctx(1,1 "ctx"), rem(2 "old1"),
-        // rem(3 "old2"), add(2 "new1"), …
-        let unified = sel(SelSide::Unified, (2, 0), (5, 4));
-        let info = selection_info(&unified, &rows, &file_rows, &sample_diff()).unwrap();
-        assert_eq!(info.path, "a.rs");
-        assert_eq!(info.side, "unified");
-        // ctx new_no 1 .. rem old2 old_no 3 / add new1 new_no 2 → lo 1, hi 3.
-        assert_eq!((info.lo, info.hi), (1, 3));
-        assert_eq!(info.text, "ctx\nold1\nold2\nnew1");
-        assert!(info.block().contains("a.rs:1-3, unified side"));
-        assert_eq!(info.note(), "› included selection: a.rs:1-3");
-
-        // Split selection locked to the right side.
-        let (rows, file_rows, _) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
-        let right = sel(SelSide::Right, (3, 0), (4, 4));
-        let info = selection_info(&right, &rows, &file_rows, &sample_diff()).unwrap();
-        assert_eq!(info.side, "RIGHT (new)");
-        assert_eq!((info.lo, info.hi), (2, 3));
-        assert_eq!(info.text, "new1\nnew2");
-
-        // A selection with no text (headers only) yields nothing.
-        let empty = sel(SelSide::Unified, (0, 0), (0, 5));
-        assert_eq!(
-            selection_info(&empty, &rows, &file_rows, &sample_diff()),
-            None
         );
     }
 
