@@ -1,0 +1,379 @@
+<title>lgtm Tracker</title>
+<style>
+  :root{
+    --base:#1e1e2e;--mantle:#181825;--crust:#11111b;--surface0:#313244;--surface1:#45475a;
+    --text:#cdd6f4;--subtext:#a6adc8;--overlay0:#6c7086;
+    --green:#a6e3a1;--red:#f38ba8;--blue:#89b4fa;--mauve:#cba6f7;--peach:#fab387;--yellow:#f9e2af;
+    --mono:Menlo,"SF Mono",Monaco,Consolas,monospace;
+  }
+  html{color-scheme:dark}
+  body{margin:0;background:var(--crust);color:var(--text);font:13px/1.45 var(--mono);padding-block:28px;padding-inline:16px;font-variant-numeric:tabular-nums}
+  .wrap{max-width:1560px;margin:0 auto;display:grid;gap:18px}
+  h1{font-size:15px;font-weight:600;margin:0}
+  h2{font-size:12px;margin:0;color:var(--overlay0);letter-spacing:.08em;text-transform:uppercase;font-weight:500}
+  .lede{color:var(--subtext);margin:0;max-width:80ch}
+  .lede b{color:var(--text);font-weight:600}
+  svg.oi{width:14px;height:14px;fill:currentColor;vertical-align:-2px;flex:none}
+  .step{display:grid;grid-template-columns:34px 1fr;gap:14px;align-items:start}
+  .step .no{width:28px;height:28px;border-radius:50%;background:var(--mauve);color:var(--crust);font-weight:700;display:grid;place-items:center;margin-top:8px}
+  .step h3{font-size:13px;font-weight:600;margin:0 0 6px}
+  .step h3 span{color:var(--overlay0);font-weight:400}
+  .arrow{display:flex;align-items:center;gap:10px;color:var(--subtext);padding-left:48px}
+  .arrow .ln{width:2px;height:34px;background:var(--surface1);position:relative;margin-left:13px}
+  .arrow .ln::after{content:"";position:absolute;left:-5px;bottom:-2px;border:6px solid transparent;border-top:8px solid var(--surface1);border-bottom:0}
+  kbd{background:var(--surface0);color:var(--text);border-radius:3px;padding:0 5px;font:inherit}
+
+  .win{background:var(--base);border:1px solid var(--surface0);border-radius:10px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.5);display:grid;grid-template-rows:38px 1fr 30px;min-height:600px}
+  .titlebar{background:var(--mantle);border-bottom:1px solid var(--surface0);display:flex;align-items:center;gap:14px;padding:0 12px}
+  .lights{display:flex;gap:8px}.lights i{width:12px;height:12px;border-radius:50%;display:block}
+  .lights i:nth-child(1){background:#ff5f57}.lights i:nth-child(2){background:#febc2e}.lights i:nth-child(3){background:#28c840}
+  .seg{display:flex;border:1px solid var(--surface0);border-radius:6px;overflow:hidden}
+  .seg span{padding:2px 10px;color:var(--overlay0)}
+  .seg span.on{background:var(--surface0);color:var(--text)}
+  .seg span+span{border-left:1px solid var(--surface0)}
+  .tb-title{font-weight:600}
+  .tb-meta{color:var(--overlay0)}.tb-meta b{color:var(--subtext);font-weight:500}
+  .tb-right{margin-left:auto;display:flex;gap:10px}
+  .chip{border:1px solid var(--surface0);border-radius:5px;padding:1px 8px;color:var(--subtext)}
+  .chip.act{color:var(--blue);border-color:var(--blue)}
+  .k{color:var(--overlay0)}
+
+  .body{display:grid;grid-template-columns:minmax(400px,1.1fr) minmax(460px,1.7fr);min-height:0}
+  .body.open{grid-template-columns:minmax(400px,1.1fr) minmax(420px,1.5fr) 390px}
+  .col{min-width:0;display:flex;flex-direction:column;overflow:hidden;position:relative}
+  .sidebar{background:var(--mantle);border-right:1px solid var(--surface0)}
+  .detail{border-left:1px solid var(--surface0);background:var(--mantle)}
+
+  .sec{padding:10px 12px 6px;color:var(--overlay0);font-size:11px;letter-spacing:.08em;text-transform:uppercase;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .sec .n{letter-spacing:0;text-transform:none;font-size:12px}
+  .sec .l{display:flex;gap:6px;align-items:center}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 8px}
+  .ms{border:1px solid var(--surface0);border-radius:12px;padding:0 9px;color:var(--overlay0);display:inline-flex;gap:5px;align-items:center}
+  .ms.on{color:var(--text);border-color:var(--mauve)}
+  .ms small{color:var(--overlay0)}
+  .filter{margin:0 12px 6px;border:1px solid var(--surface0);border-radius:6px;padding:2px 8px;color:var(--overlay0);background:var(--base);display:flex;gap:6px;align-items:center}
+
+  table{border-collapse:collapse;width:100%;table-layout:fixed}
+  th{color:var(--overlay0);font-weight:500;text-align:left;padding:1px 5px;border-bottom:1px solid var(--surface0);font-size:12px;white-space:nowrap;overflow:hidden}
+  td{padding:1px 5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:20px}
+  th:first-child,td:first-child{padding-left:12px}
+  .r{text-align:right}
+  tr.sel td{background:rgba(166,227,161,.16)}
+  tr.sel td:first-child{box-shadow:inset 2px 0 0 var(--green)}
+  td.id{color:var(--overlay0)}
+  .ty{display:inline-flex}
+  .ty.epic{color:var(--mauve)}.ty.task{color:var(--peach)}.ty.bug{color:var(--red)}.ty.feat{color:var(--blue)}.ty.none{color:var(--green)}
+  .P{font-weight:600}.P.H{color:var(--peach)}.P.M{color:var(--yellow)}.P.L{color:var(--overlay0)}
+  td.dim{color:var(--overlay0)}
+  td.tags{color:var(--subtext);font-size:12px}
+  tr.over td{color:var(--red)}
+  tr.soon td.due,tr.soon td.urg{color:var(--yellow)}
+  tr.blk td{color:var(--overlay0);font-style:italic}
+  td.urg{font-weight:600}
+  .div{margin:6px 12px 0;padding-top:6px;border-top:1px dashed var(--surface0);color:var(--overlay0);display:flex;justify-content:space-between;align-items:center;gap:6px}
+  .div .l{display:flex;gap:6px;align-items:center}
+
+  .main{background:var(--base)}
+  .grp{margin-top:10px;padding:3px 12px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;display:flex;gap:8px;align-items:center;font-weight:600;border-left:3px solid var(--c);background:color-mix(in srgb,var(--c) 12%,transparent);color:var(--c)}
+  .grp .n{letter-spacing:0;text-transform:none;font-weight:500;color:var(--subtext)}
+  .grp.doing{--c:var(--blue)}.grp.review{--c:var(--mauve)}.grp.blocked{--c:var(--peach)}
+  .bar{display:inline-flex;align-items:center;gap:6px;color:var(--subtext)}
+  .bar b{display:inline-block;width:40px;height:6px;border-radius:3px;background:var(--surface0);position:relative;overflow:hidden;flex:none}
+  .bar b::after{content:"";position:absolute;inset:0;width:var(--w);background:var(--mauve)}
+  .pr{color:var(--blue);display:inline-flex;gap:4px;align-items:center}
+  .pr svg{color:var(--green)}.pr.merged svg{color:var(--mauve)}.pr.draft svg{color:var(--overlay0)}
+  .who{color:var(--subtext)}
+  .legend{color:var(--overlay0);padding:8px 12px;margin-top:auto;font-size:12px}
+
+  .dh{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--surface0)}
+  .dh .crumb{color:var(--overlay0);display:inline-flex;gap:4px;align-items:center}.dh .crumb b{color:var(--subtext);font-weight:500}
+  .dh .ttl{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dbody{padding:10px 12px;display:grid;gap:13px;overflow:auto}
+  .row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .pill{border-radius:5px;padding:0 8px;border:1px solid var(--surface0);color:var(--subtext)}
+  .pill.st{background:rgba(137,180,250,.18);color:var(--blue);border-color:transparent}
+  .pill.tag{border-radius:10px;font-size:12px;color:var(--text);border-color:var(--surface1)}
+  .meta{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--subtext)}
+  .meta span{display:inline-flex;gap:6px;align-items:center}
+  .meta svg{color:var(--overlay0)}
+  .meta .red{color:var(--red)}
+  .tagrow{display:flex;flex-wrap:wrap;gap:4px;margin-top:-6px}
+  .tg{font-size:11px;line-height:16px;padding:0 7px;border-radius:8px;color:var(--c);background:color-mix(in srgb,var(--c) 16%,transparent);border:1px solid color-mix(in srgb,var(--c) 40%,transparent)}
+  .lbl{color:var(--overlay0);font-size:11px;letter-spacing:.08em;text-transform:uppercase;display:flex;justify-content:space-between;align-items:center}
+  .lbl .l{display:flex;gap:6px;align-items:center}
+  .lbl .k{letter-spacing:0;text-transform:none;display:inline-flex;gap:6px;align-items:center}
+  .desc{color:var(--subtext)}
+  .desc code{color:var(--peach)}
+  .subs{display:grid;gap:2px}
+  .subs .sr{display:grid;grid-template-columns:16px 36px 1fr;gap:8px;align-items:center;padding:1px 4px;border-radius:4px;min-height:22px}
+  .subs .sr.cur{background:var(--surface0)}
+  .st-open{color:var(--green)}.st-doing{color:var(--blue)}.st-done{color:var(--mauve)}.st-draft{color:var(--overlay0)}
+  .subs .id{color:var(--overlay0)}
+  .subs .edit{border:1px solid var(--blue);border-radius:4px;padding:0 5px;background:var(--base);color:var(--text);justify-self:start}
+  .subs .edit::after{content:"▏";color:var(--blue);animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  @media (prefers-reduced-motion:reduce){.subs .edit::after{animation:none}}
+  .subs .menu{position:relative;display:inline-flex}
+  .subs .pop{position:absolute;left:0;top:18px;background:var(--mantle);border:1px solid var(--surface1);border-radius:6px;padding:4px 0;z-index:3;box-shadow:0 8px 24px rgba(0,0,0,.5);width:120px}
+  .subs .pop div{padding:1px 10px;color:var(--subtext)}
+  .subs .pop div.on{background:var(--surface0);color:var(--text)}
+  .subs .add{color:var(--overlay0)}
+  .hint{color:var(--overlay0);font-size:12px;border-left:2px solid var(--surface0);padding-left:8px}
+  .act{color:var(--subtext);display:grid;gap:1px}.act div{display:flex;gap:8px}.act .who{color:var(--text)}.act .when{color:var(--overlay0);margin-left:auto}
+  .comment{border:1px solid var(--surface0);border-radius:6px;padding:4px 8px;color:var(--overlay0);background:var(--base);display:flex;gap:6px;align-items:center}
+  .comment span:last-child{margin-left:auto}
+
+  .footer{background:var(--mantle);border-top:1px solid var(--surface0);display:flex;gap:12px;align-items:center;padding:0 12px;color:var(--overlay0);font-size:12px;overflow:hidden;white-space:nowrap}
+  .footer kbd{margin-right:4px;color:var(--subtext)}
+
+  .box{background:var(--base);border:1px solid var(--surface0);border-radius:8px;padding:12px 14px;display:grid;gap:6px}
+  .g{display:grid;grid-template-columns:120px 70px 1fr;gap:2px 14px;color:var(--subtext)}
+  .g span:nth-child(3n+2){color:var(--text);text-align:right}
+  .g span:nth-child(3n+3){color:var(--overlay0)}
+  .icons{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--subtext);font-size:12px}
+  .icons span{display:inline-flex;gap:6px;align-items:center}
+  @media (max-width:1100px){.body,.body.open{grid-template-columns:1fr}.detail,.sidebar{border:0;border-top:1px solid var(--surface0)}}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-bug" viewBox="0 0 16 16"><path d="M4.72.22a.75.75 0 0 1 1.06 0l1 .999a3.488 3.488 0 0 1 2.441 0l.999-1a.748.748 0 0 1 1.265.332.75.75 0 0 1-.205.729l-.775.776c.616.63.995 1.493.995 2.444v.327c0 .1-.009.197-.025.292.408.14.764.392 1.029.722l1.968-.787a.75.75 0 0 1 .556 1.392L13 7.258V9h2.25a.75.75 0 0 1 0 1.5H13v.5c0 .409-.049.806-.141 1.186l2.17.868a.75.75 0 0 1-.557 1.392l-2.184-.873A4.997 4.997 0 0 1 8 16a4.997 4.997 0 0 1-4.288-2.427l-2.183.873a.75.75 0 0 1-.558-1.392l2.17-.868A5.036 5.036 0 0 1 3 11v-.5H.75a.75.75 0 0 1 0-1.5H3V7.258L.971 6.446a.75.75 0 0 1 .558-1.392l1.967.787c.265-.33.62-.583 1.03-.722a1.677 1.677 0 0 1-.026-.292V4.5c0-.951.38-1.814.995-2.444L4.72 1.28a.75.75 0 0 1 0-1.06Zm.53 6.28a.75.75 0 0 0-.75.75V11a3.5 3.5 0 1 0 7 0V7.25a.75.75 0 0 0-.75-.75ZM6.173 5h3.654A.172.172 0 0 0 10 4.827V4.5a2 2 0 1 0-4 0v.327c0 .096.077.173.173.173Z"/></symbol>
+  <symbol id="i-open" viewBox="0 0 16 16"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"/></symbol>
+  <symbol id="i-closed" viewBox="0 0 16 16"><path d="M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5Z"/><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z"/></symbol>
+  <symbol id="i-draft" viewBox="0 0 16 16"><path d="M14.307 11.655a.75.75 0 0 1 .165 1.048 8.05 8.05 0 0 1-1.769 1.77.75.75 0 0 1-.883-1.214 6.552 6.552 0 0 0 1.44-1.439.75.75 0 0 1 1.047-.165Zm-2.652-9.962a.75.75 0 0 1 1.048-.165 8.05 8.05 0 0 1 1.77 1.769.75.75 0 0 1-1.214.883 6.552 6.552 0 0 0-1.439-1.44.75.75 0 0 1-.165-1.047ZM6.749.097a8.074 8.074 0 0 1 2.502 0 .75.75 0 1 1-.233 1.482 6.558 6.558 0 0 0-2.036 0A.751.751 0 0 1 6.749.097ZM.955 6.125a.75.75 0 0 1 .624.857 6.558 6.558 0 0 0 0 2.036.75.75 0 1 1-1.482.233 8.074 8.074 0 0 1 0-2.502.75.75 0 0 1 .858-.624Zm14.09 0a.75.75 0 0 1 .858.624c.13.829.13 1.673 0 2.502a.75.75 0 1 1-1.482-.233 6.558 6.558 0 0 0 0-2.036.75.75 0 0 1 .624-.857Zm-8.92 8.92a.75.75 0 0 1 .857-.624 6.558 6.558 0 0 0 2.036 0 .75.75 0 1 1 .233 1.482c-.829.13-1.673.13-2.502 0a.75.75 0 0 1-.624-.858Zm-4.432-3.39a.75.75 0 0 1 1.048.165 6.552 6.552 0 0 0 1.439 1.44.751.751 0 0 1-.883 1.212 8.05 8.05 0 0 1-1.77-1.769.75.75 0 0 1 .166-1.048Zm2.652-9.962A.75.75 0 0 1 4.18 2.74a6.556 6.556 0 0 0-1.44 1.44.751.751 0 0 1-1.212-.883 8.05 8.05 0 0 1 1.769-1.77.75.75 0 0 1 1.048.166Z"/></symbol>
+  <symbol id="i-tracks" viewBox="0 0 16 16"><path d="M1.5 8a6.5 6.5 0 0 1 13 0A.75.75 0 0 0 16 8a8 8 0 1 0-8 8 .75.75 0 0 0 0-1.5A6.5 6.5 0 0 1 1.5 8Z"/><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm1.5 1.75a.75.75 0 0 1 .75-.75h5a.75.75 0 0 1 0 1.5h-5a.75.75 0 0 1-.75-.75Zm2.75 2.25a.75.75 0 0 0 0 1.5h3a.75.75 0 0 0 0-1.5h-3Z"/></symbol>
+  <symbol id="i-trackedby" viewBox="0 0 16 16"><path d="M1.5 8a6.5 6.5 0 0 1 13 0A.75.75 0 0 0 16 8a8 8 0 1 0-8 8 .75.75 0 0 0 0-1.5A6.5 6.5 0 0 1 1.5 8Z"/><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm3.573 5.823-2.896-2.896a.25.25 0 0 1 0-.354l2.896-2.896a.25.25 0 0 1 .427.177V11.5h3.25a.75.75 0 0 1 0 1.5H12v2.146a.25.25 0 0 1-.427.177Z"/></symbol>
+  <symbol id="i-pr" viewBox="0 0 16 16"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z"/></symbol>
+  <symbol id="i-prdraft" viewBox="0 0 16 16"><path d="M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Zm9.5 14a2.25 2.25 0 1 1 0-4.5 2.25 2.25 0 0 1 0 4.5ZM2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM14 7.5a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Zm0-4.25a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Z"/></symbol>
+  <symbol id="i-merge" viewBox="0 0 16 16"><path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z"/></symbol>
+  <symbol id="i-milestone" viewBox="0 0 16 16"><path d="M7.75 0a.75.75 0 0 1 .75.75V3h3.634c.414 0 .814.147 1.13.414l2.07 1.75a1.75 1.75 0 0 1 0 2.672l-2.07 1.75a1.75 1.75 0 0 1-1.13.414H8.5v5.25a.75.75 0 0 1-1.5 0V10H2.75A1.75 1.75 0 0 1 1 8.25v-3.5C1 3.784 1.784 3 2.75 3H7V.75A.75.75 0 0 1 7.75 0Zm4.384 8.5a.25.25 0 0 0 .161-.06l2.07-1.75a.248.248 0 0 0 0-.38l-2.07-1.75a.25.25 0 0 0-.161-.06H2.75a.25.25 0 0 0-.25.25v3.5c0 .138.112.25.25.25h9.384Z"/></symbol>
+  <symbol id="i-chevr" viewBox="0 0 16 16"><path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z"/></symbol>
+  <symbol id="i-cal" viewBox="0 0 16 16"><path d="M4.75 0a.75.75 0 0 1 .75.75V2h5V.75a.75.75 0 0 1 1.5 0V2h1.25c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 13.25 16H2.75A1.75 1.75 0 0 1 1 14.25V3.75C1 2.784 1.784 2 2.75 2H4V.75A.75.75 0 0 1 4.75 0ZM2.5 7.5v6.75c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25V7.5Zm10.75-4H2.75a.25.25 0 0 0-.25.25V6h11V3.75a.25.25 0 0 0-.25-.25Z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm7-3.25v2.992l2.028.812a.75.75 0 0 1-.557 1.392l-2.5-1A.751.751 0 0 1 7 8.25v-3.5a.75.75 0 0 1 1.5 0Z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 16 16"><path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61Zm.176 4.823L9.75 4.81l-6.286 6.287a.253.253 0 0 0-.064.108l-.558 1.953 1.953-.558a.253.253 0 0 0 .108-.064Zm1.238-3.763a.25.25 0 0 0-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354Z"/></symbol>
+  <symbol id="i-comment" viewBox="0 0 16 16"><path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></symbol>
+  <symbol id="i-ext" viewBox="0 0 16 16"><path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 16 16"><path d="M.75 3h14.5a.75.75 0 0 1 0 1.5H.75a.75.75 0 0 1 0-1.5ZM3 7.75A.75.75 0 0 1 3.75 7h8.5a.75.75 0 0 1 0 1.5h-8.5A.75.75 0 0 1 3 7.75Zm3 4a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z"/></symbol>
+  <symbol id="i-full" viewBox="0 0 16 16"><path d="M1.75 10a.75.75 0 0 1 .75.75v2.5c0 .138.112.25.25.25h2.5a.75.75 0 0 1 0 1.5h-2.5A1.75 1.75 0 0 1 1 13.25v-2.5a.75.75 0 0 1 .75-.75Zm12.5 0a.75.75 0 0 1 .75.75v2.5A1.75 1.75 0 0 1 13.25 15h-2.5a.75.75 0 0 1 0-1.5h2.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 .75-.75ZM2.75 2.5a.25.25 0 0 0-.25.25v2.5a.75.75 0 0 1-1.5 0v-2.5C1 1.784 1.784 1 2.75 1h2.5a.75.75 0 0 1 0 1.5ZM10 1.75a.75.75 0 0 1 .75-.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a.75.75 0 0 1-1.5 0v-2.5a.25.25 0 0 0-.25-.25h-2.5a.75.75 0 0 1-.75-.75Z"/></symbol>
+  <symbol id="i-flame" viewBox="0 0 16 16"><path d="M9.533.753V.752c.217 2.385 1.463 3.626 2.653 4.81C13.37 6.74 14.498 7.863 14.498 10c0 3.5-3 6-6.5 6S1.5 13.512 1.5 10c0-1.298.536-2.56 1.425-3.286.376-.308.862 0 1.035.454C4.46 8.487 5.581 8.419 6 8c.282-.282.341-.811-.003-1.5C4.34 3.187 7.035.75 8.77.146c.39-.137.726.194.763.607ZM7.998 14.5c2.832 0 5-1.98 5-4.5 0-1.463-.68-2.19-1.879-3.383l-.036-.037c-1.013-1.008-2.3-2.29-2.834-4.434-.322.256-.63.579-.864.953-.432.696-.621 1.58-.046 2.73.473.947.67 2.284-.278 3.232-.61.61-1.545.84-2.403.633a2.79 2.79 0 0 1-1.436-.874A3.198 3.198 0 0 0 3 10c0 2.53 2.164 4.5 4.998 4.5Z"/></symbol>
+  <symbol id="i-prio" viewBox="0 0 16 16"><path d="M5 3.25a.75.75 0 0 1 .75-.75h8.5a.75.75 0 0 1 0 1.5h-8.5A.75.75 0 0 1 5 3.25Zm0 5a.75.75 0 0 1 .75-.75h8.5a.75.75 0 0 1 0 1.5h-8.5A.75.75 0 0 1 5 8.25Zm0 5a.75.75 0 0 1 .75-.75h8.5a.75.75 0 0 1 0 1.5h-8.5a.75.75 0 0 1-.75-.75ZM.924 10.32a.5.5 0 0 1-.851-.525l.001-.001.001-.002.002-.004.007-.011c.097-.144.215-.273.348-.384.228-.19.588-.392 1.068-.392.468 0 .858.181 1.126.484.259.294.377.673.377 1.038 0 .987-.686 1.495-1.156 1.845l-.047.035c-.303.225-.522.4-.654.597h1.357a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5c0-1.005.692-1.52 1.167-1.875l.035-.025c.531-.396.8-.625.8-1.078a.57.57 0 0 0-.128-.376C1.806 10.068 1.695 10 1.5 10a.658.658 0 0 0-.429.163.835.835 0 0 0-.144.153ZM2.003 2.5V6h.503a.5.5 0 0 1 0 1H.5a.5.5 0 0 1 0-1h.503V3.308l-.28.14a.5.5 0 0 1-.446-.895l1.003-.5a.5.5 0 0 1 .723.447Z"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 16 16"><path d="M1 7.775V2.75C1 1.784 1.784 1 2.75 1h5.025c.464 0 .91.184 1.238.513l6.25 6.25a1.75 1.75 0 0 1 0 2.474l-5.026 5.026a1.75 1.75 0 0 1-2.474 0l-6.25-6.25A1.752 1.752 0 0 1 1 7.775Zm1.5 0c0 .066.026.13.073.177l6.25 6.25a.25.25 0 0 0 .354 0l5.025-5.025a.25.25 0 0 0 0-.354l-6.25-6.25a.25.25 0 0 0-.177-.073H2.75a.25.25 0 0 0-.25.25ZM6 5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></symbol>
+  <symbol id="i-person" viewBox="0 0 16 16"><path d="M10.561 8.073a6.005 6.005 0 0 1 3.432 5.142.75.75 0 1 1-1.498.07 4.5 4.5 0 0 0-8.99 0 .75.75 0 0 1-1.498-.07 6.004 6.004 0 0 1 3.431-5.142 3.999 3.999 0 1 1 5.123 0ZM10.5 5a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"/></symbol>
+  <symbol id="i-bulb" viewBox="0 0 16 16"><path d="M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM6 15.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z"/></symbol>
+  <symbol id="i-checklist" viewBox="0 0 16 16"><path d="M2.5 1.75v11.5c0 .138.112.25.25.25h3.17a.75.75 0 0 1 0 1.5H2.75A1.75 1.75 0 0 1 1 13.25V1.75C1 .784 1.784 0 2.75 0h8.5C12.216 0 13 .784 13 1.75v7.736a.75.75 0 0 1-1.5 0V1.75a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25Zm13.274 9.537v-.001l-4.557 4.45a.75.75 0 0 1-1.055-.008l-1.943-1.95a.75.75 0 0 1 1.062-1.058l1.419 1.425 4.026-3.932a.75.75 0 1 1 1.048 1.074ZM4.75 4h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM4 7.75A.75.75 0 0 1 4.75 7h2a.75.75 0 0 1 0 1.5h-2A.75.75 0 0 1 4 7.75Z"/></symbol>
+  <symbol id="i-goal" viewBox="0 0 16 16"><path d="M13.637 2.363h-.001l1.676.335c.09.018.164.084.19.173a.25.25 0 0 1-.062.249l-1.373 1.374a.876.876 0 0 1-.619.256H12.31L9.45 7.611A1.5 1.5 0 1 1 6.5 8a1.501 1.501 0 0 1 1.889-1.449l2.861-2.862V2.552c0-.232.092-.455.256-.619L12.88.559a.25.25 0 0 1 .249-.062c.089.026.155.1.173.19Z"/><path d="M2 8a6 6 0 1 0 11.769-1.656.751.751 0 1 1 1.442-.413 7.502 7.502 0 0 1-12.513 7.371A7.501 7.501 0 0 1 10.069.789a.75.75 0 0 1-.413 1.442A6.001 6.001 0 0 0 2 8Z"/><path d="M5 8a3.002 3.002 0 0 0 4.699 2.476 3 3 0 0 0 1.28-2.827.748.748 0 0 1 1.045-.782.75.75 0 0 1 .445.61A4.5 4.5 0 1 1 8.516 3.53a.75.75 0 1 1-.17 1.49A3 3 0 0 0 5 8Z"/></symbol>
+</svg>
+
+<div class="wrap">
+  <div>
+    <h1>lgtm Tracker view, sketch v9 (accepted 2026-09-13)</h1>
+    <p class="lede">Three states, top to bottom: panel closed, epic <b>#42</b> open with its sub-issues being edited, then sub-issue <b>#44</b> drilled into. Icons only where they replace a word. Type column is the GitHub issue type; labels are a compact text column. Spec: <code>docs/tasks/tracker.md</code> in the lgtm repo.</p>
+  </div>
+
+  <div class="step">
+    <div class="no">1</div>
+    <div>
+      <h3>Issue panel closed <span>· default on cmd-2</span></h3>
+      <div class="win">
+        <div class="titlebar" data-tb></div>
+        <div class="body">
+          <div class="col sidebar" data-left></div>
+          <div class="col main" data-middle=""></div>
+        </div>
+        <div class="footer" data-footer></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow"><div class="ln"></div><span><kbd>j</kbd>/<kbd>k</kbd> to #42 in the middle, <kbd>↵</kbd> opens the panel</span></div>
+
+  <div class="step">
+    <div class="no">2</div>
+    <div>
+      <h3>Epic #42 open <span>· sub-issue rows carry one icon that is both "issue" and its state; three edits shown at once</span></h3>
+      <div class="win">
+        <div class="titlebar" data-tb></div>
+        <div class="body open">
+          <div class="col sidebar" data-left></div>
+          <div class="col main" data-middle="sel42"></div>
+          <div class="col detail">
+            <div class="dh"><span class="ty epic"><svg class="oi"><use href="#i-open"/></svg></span><span class="ttl">#42 Tracker view</span><svg class="oi k"><use href="#i-ext"/></svg><svg class="oi k"><use href="#i-full"/></svg><svg class="oi k"><use href="#i-x"/></svg></div>
+            <div class="dbody">
+              <div class="row"><span class="pill st">Doing</span></div>
+              <div class="meta"><span><svg class="oi"><use href="#i-cal"/></svg>2026-09-18 · 5d</span><span><svg class="oi"><use href="#i-milestone"/></svg>v0.3</span><span><svg class="oi"><use href="#i-person"/></svg>emil</span><span><svg class="oi"><use href="#i-prio"/></svg>high</span><span><svg class="oi"><use href="#i-flame"/></svg>8.0</span></div>
+              <div class="tagrow"><svg class="oi k"><use href="#i-tag"/></svg><span class="tg" style="--c:var(--blue)">ui</span><span class="tg" style="--c:var(--mauve)">tracker</span></div>
+              <div>
+                <div class="lbl"><span>Description</span><svg class="oi k"><use href="#i-pencil"/></svg></div>
+                <div class="desc">Second top-level view in lgtm. Left is the pick-next queue, middle is what is in flight, right is the issue. Backed by the repo's Projects v2 board through <code>gh</code>.</div>
+              </div>
+              <div class="subs">
+                <div class="lbl"><span class="l"><svg class="oi"><use href="#i-tracks"/></svg>Sub-issues</span><span class="k"><span class="bar"><b style="--w:40%"></b>2/5</span> <svg class="oi" style="color:var(--text)"><use href="#i-plus"/></svg></span></div>
+                <div class="sr"><svg class="oi st-done"><use href="#i-closed"/></svg><span class="id">#43</span><span>module split</span></div>
+                <div class="sr cur"><svg class="oi st-doing"><use href="#i-open"/></svg><span class="id">#44</span><span>view switch</span></div>
+                <div class="sr"><span class="menu"><svg class="oi st-open"><use href="#i-open"/></svg>
+                  <div class="pop"><div>Backlog</div><div>Todo</div><div class="on">Ready</div><div>Doing</div><div>In review</div><div>Blocked</div><div>Done</div></div></span><span class="id">#45</span><span>issue table</span></div>
+                <div class="sr"><svg class="oi st-open"><use href="#i-open"/></svg><span class="id">#46</span><span class="edit">Detail pane, read-only firs</span></div>
+                <div class="sr"><svg class="oi st-draft"><use href="#i-draft"/></svg><span class="id">#47</span><span>sync via gh</span></div>
+                <div class="sr add"><svg class="oi"><use href="#i-plus"/></svg><span></span><span>new sub-issue title…</span></div>
+              </div>
+              <div class="hint"><kbd>j</kbd><kbd>k</kbd> move · <kbd>↵</kbd> drills in (page 3) · <kbd>space</kbd> on a row opens the status menu (#45) · <kbd>e</kbd> edits the title inline (#46) · <kbd>+</kbd> adds a row, <kbd>↵</kbd> creates it under #42</div>
+              <div class="act">
+                <div class="lbl"><span>Activity</span></div>
+                <div><span class="who">emil</span><span>opened</span><span class="when">12d</span></div>
+                <div><span class="who">emil</span><span>added sub-issues #43–#47</span><span class="when">4d</span></div>
+                <div><span class="who">emil</span><span>#43 done</span><span class="when">2d</span></div>
+              </div>
+              <div class="comment"><svg class="oi"><use href="#i-comment"/></svg>write a comment…<span>⌘↵</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="footer" data-footer></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow"><div class="ln"></div><span><kbd>↵</kbd> on #44 in the sub-issues list drills in. Breadcrumb goes back; the middle keeps its selection</span></div>
+
+  <div class="step">
+    <div class="no">3</div>
+    <div>
+      <h3>Sub-issue #44 open <span>· only what a sub-issue can do: no sub-issues section</span></h3>
+      <div class="win">
+        <div class="titlebar" data-tb></div>
+        <div class="body open">
+          <div class="col sidebar" data-left></div>
+          <div class="col main" data-middle="sel44"></div>
+          <div class="col detail">
+            <div class="dh"><span class="crumb"><svg class="oi"><use href="#i-trackedby"/></svg><b>#42</b><svg class="oi"><use href="#i-chevr"/></svg></span><span class="ty task"><svg class="oi"><use href="#i-open"/></svg></span><span class="ttl">#44 Top-level view switch</span><svg class="oi k"><use href="#i-ext"/></svg><svg class="oi k"><use href="#i-full"/></svg><svg class="oi k"><use href="#i-x"/></svg></div>
+            <div class="dbody">
+              <div class="row"><span class="pill st">Doing</span></div>
+              <div class="meta"><span class="red"><svg class="oi" style="color:var(--red)"><use href="#i-cal"/></svg>2026-09-12 14:00 · -3h</span><span><svg class="oi"><use href="#i-milestone"/></svg>v0.3</span><span><svg class="oi"><use href="#i-person"/></svg>emil</span><span><svg class="oi"><use href="#i-prio"/></svg>high</span><span><svg class="oi"><use href="#i-flame"/></svg>13.4</span><span class="pr"><svg class="oi"><use href="#i-pr"/></svg>#71</span></div>
+              <div class="tagrow"><svg class="oi k"><use href="#i-tag"/></svg><span class="tg" style="--c:var(--blue)">ui</span></div>
+              <div>
+                <div class="lbl"><span>Description</span><svg class="oi k"><use href="#i-pencil"/></svg></div>
+                <div class="desc">Add <code>TopView { Review, Tracker }</code> on ReviewApp. cmd-1 / cmd-2 plus a segmented control left of the app title. Titlebar and footer shared, sidebar and main pane swap. Review state untouched by switching.</div>
+              </div>
+              <div class="hint"><kbd>⌫</kbd> or click the breadcrumb returns to #42 · <kbd>s</kbd> <kbd>r</kbd> <kbd>d</kbd> change status here too · chips click to edit</div>
+              <div class="act">
+                <div class="lbl"><span>Activity</span></div>
+                <div><span class="who">emil</span><span>opened</span><span class="when">2d</span></div>
+                <div><span class="who">emil</span><span>ready → doing</span><span class="when">1d</span></div>
+                <div><span class="who">emil</span><span>linked PR #71</span><span class="when">6h</span></div>
+              </div>
+              <div class="comment"><svg class="oi"><use href="#i-comment"/></svg>write a comment…<span>⌘↵</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="footer" data-footer></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="box">
+    <h2>Icon key</h2>
+    <div class="icons">
+      <span class="ty bug"><svg class="oi"><use href="#i-bug"/></svg><span style="color:var(--subtext)">type Bug</span></span>
+      <span class="ty feat"><svg class="oi"><use href="#i-open"/></svg><span style="color:var(--subtext)">type Feature</span></span>
+      <span class="ty task"><svg class="oi"><use href="#i-open"/></svg><span style="color:var(--subtext)">type Task</span></span>
+      <span class="ty none"><svg class="oi"><use href="#i-open"/></svg><span style="color:var(--subtext)">no type</span></span>
+      <span class="ty epic"><svg class="oi"><use href="#i-open"/></svg><span style="color:var(--subtext)">type Epic (colour is my pick)</span></span>
+      <span><svg class="oi st-draft"><use href="#i-draft"/></svg>sub-issue: draft / backlog</span>
+      <span><svg class="oi st-open"><use href="#i-open"/></svg>sub-issue: open (blue when in flight)</span>
+      <span><svg class="oi st-done"><use href="#i-closed"/></svg>sub-issue: done</span>
+      <span><svg class="oi"><use href="#i-tracks"/></svg>has sub-issues</span>
+      <span><svg class="oi"><use href="#i-trackedby"/></svg>is a sub-issue of</span>
+      <span class="pr"><svg class="oi"><use href="#i-pr"/></svg>PR open</span>
+      <span class="pr merged"><svg class="oi"><use href="#i-merge"/></svg>merged</span>
+      <span class="pr draft"><svg class="oi"><use href="#i-prdraft"/></svg>draft</span>
+      <span><svg class="oi"><use href="#i-cal"/></svg>due</span>
+      <span><svg class="oi"><use href="#i-milestone"/></svg>milestone</span>
+      <span><svg class="oi"><use href="#i-person"/></svg>assignee</span>
+      <span><svg class="oi"><use href="#i-prio"/></svg>priority</span>
+      <span><svg class="oi"><use href="#i-flame"/></svg>urgency</span>
+      <span><svg class="oi"><use href="#i-tag"/></svg>labels</span>
+    </div>
+    <p class="lede" style="font-size:12px">Type is shown with the issue-opened octicon coloured by type name: Feature blue, Task orange, no type green, Epic mauve. Bug is the only distinct glyph, the red bug. Mapping lives in tracker.json.</p>
+  </div>
+
+  <div class="box">
+    <h2>Urgency, Taskwarrior coefficients mapped to GitHub</h2>
+    <div class="g">
+      <span>due</span><span>12.0</span><span>Due field. 0.2 at 14d out, linear to 1.0 at due, stays 1.0 after.</span>
+      <span>blocking</span><span>8.0</span><span>open issues have a "blocked by" relation pointing at this one</span>
+      <span>priority</span><span>6 / 3.9 / 1.8</span><span>Priority field High / Medium / Low</span>
+      <span>active</span><span>4.0</span><span>status mapped to flight</span>
+      <span>age</span><span>2.0</span><span>created-at, linear to 1.0 at 365d</span>
+      <span>milestone</span><span>1.0</span><span>has a milestone</span>
+      <span>labels</span><span>1.0</span><span>has any label</span>
+      <span>comments</span><span>1.0</span><span>has comments</span>
+      <span>blocked</span><span>-5.0</span><span>status Blocked, or an open "blocked by" relation</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const I=(id,cls)=>`<svg class="oi ${cls||''}"><use href="#${id}"/></svg>`;
+  const T={task:`<span class="ty task">${I('i-open')}</span>`,bug:`<span class="ty bug">${I('i-bug')}</span>`,epic:`<span class="ty epic">${I('i-open')}</span>`,feat:`<span class="ty feat">${I('i-open')}</span>`,none:`<span class="ty none">${I('i-open')}</span>`};
+  const tb=`
+    <div class="lights"><i></i><i></i><i></i></div>
+    <div class="seg"><span>Review</span><span class="on">Tracker</span></div>
+    <span class="tb-title">Fleron/lgtm</span>
+    <span class="tb-meta"><b>4</b> doing · <b>2</b> in review · <b>1</b> blocked · <b>11</b> ready · <b>20</b> later</span>
+    <div class="tb-right"><span class="chip act">me + unassigned</span></div>`;
+  const left=`
+    <div class="sec"><span class="l">${I('i-milestone')}Milestones</span><span class="n">none = all · closed hidden</span></div>
+    <div class="chips">
+      <span class="ms on">v0.3 <small>5/12</small></span>
+      <span class="ms on">v0.4 <small>2/6</small></span>
+      <span class="ms">v0.5 <small>0/9</small></span>
+    </div>
+    <div class="sec"><span>Next up</span><span class="n">ready 11</span></div>
+    <div class="filter">${I('i-filter')}filter…</div>
+    <table>
+      <colgroup><col style="width:42px"><col style="width:22px"><col><col style="width:64px"><col style="width:34px"><col style="width:20px"><col style="width:38px"><col style="width:46px"><col style="width:46px"></colgroup>
+      <thead><tr><th>ID</th><th></th><th>Title</th><th>${I('i-tag')}</th><th class="r">Age</th><th>${I('i-prio')}</th><th>${I('i-milestone')}</th><th class="r">${I('i-cal')}</th><th class="r">${I('i-flame')}</th></tr></thead>
+      <tbody>
+        <tr class="over"><td class="id">61</td><td>${T.bug}</td><td>Minimap scrub off by one</td><td class="tags">ui</td><td class="r">1d</td><td class="P M">M</td><td>0.3</td><td class="r due">-6h</td><td class="r urg">14.2</td></tr>
+        <tr class="soon"><td class="id">45</td><td>${T.task}</td><td>Issue table with milestone filter</td><td class="tags">ui,tracker</td><td class="r">3d</td><td class="P H">H</td><td>0.3</td><td class="r due">20h</td><td class="r urg">11.8</td></tr>
+        <tr><td class="id">46</td><td>${T.task}</td><td>Detail pane, read-only first</td><td class="tags">ui,tracker</td><td class="r">3d</td><td class="P H">H</td><td>0.3</td><td class="r due">6d</td><td class="r urg">8.1</td></tr>
+        <tr><td class="id">47</td><td>${T.task}</td><td>Project sync via gh</td><td class="tags">gh</td><td class="r">3d</td><td class="P M">M</td><td>0.3</td><td class="r due dim">–</td><td class="r urg">5.0</td></tr>
+        <tr><td class="id">39</td><td>${T.feat}</td><td>Draft PR label in sidebar</td><td class="tags">ui</td><td class="r">9d</td><td class="P L">L</td><td>0.4</td><td class="r due dim">–</td><td class="r urg">3.0</td></tr>
+        <tr><td class="id">40</td><td>${T.feat}</td><td>Multiline comments</td><td class="tags dim">–</td><td class="r">9d</td><td class="P L">L</td><td>0.4</td><td class="r due dim">–</td><td class="r urg">3.0</td></tr>
+        <tr><td class="id">62</td><td>${T.bug}</td><td>Palette fuzzy match ignores number</td><td class="tags">palette</td><td class="r">4h</td><td class="P L">–</td><td class="dim">–</td><td class="r due dim">–</td><td class="r urg">0.1</td></tr>
+        <tr><td class="id">63</td><td>${T.task}</td><td>Footer hints per view</td><td class="tags dim">–</td><td class="r">4h</td><td class="P L">–</td><td class="dim">–</td><td class="r due dim">–</td><td class="r urg">0.1</td></tr>
+        <tr class="blk"><td class="id">64</td><td>${T.feat}</td><td>Cross-repo boards</td><td class="tags">gh,later</td><td class="r">2d</td><td class="P L">–</td><td class="dim">–</td><td class="r due dim">–</td><td class="r urg">-4.9</td></tr>
+      </tbody>
+    </table>
+    <div class="div"><span class="l">${I('i-chevr')}todo 8 · backlog 12</span><span>collapsed</span></div>`;
+  const cols=`<colgroup><col style="width:42px"><col style="width:22px"><col><col style="width:70px"><col style="width:96px"><col style="width:60px"><col style="width:56px"><col style="width:46px"></colgroup>`;
+  const pr=(n,k)=>`<span class="pr ${k||''}">${I(k==='merged'?'i-merge':k==='draft'?'i-prdraft':'i-pr')}#${n}</span>`;
+  const middle=sel=>`
+    <div class="grp doing">Doing <span class="n">4</span></div>
+    <table>${cols}
+      <thead><tr><th>ID</th><th></th><th>Title</th><th>${I('i-tag')}</th><th>${I('i-tracks')}</th><th>${I('i-pr')}</th><th>${I('i-person')}</th><th class="r">${I('i-flame')}</th></tr></thead>
+      <tbody>
+        <tr class="over ${sel==='sel44'?'sel':''}"><td class="id">44</td><td>${T.task}</td><td>Top-level view switch</td><td class="tags">ui</td><td class="dim">–</td><td>${pr(71)}</td><td class="who">emil</td><td class="r urg">13.4</td></tr>
+        <tr class="soon"><td class="id">52</td><td>${T.task}</td><td>Codex network allowlist</td><td class="tags">codex,sec</td><td class="dim">–</td><td class="dim">–</td><td class="who">emil</td><td class="r urg">10.1</td></tr>
+        <tr class="${sel==='sel42'?'sel':''}"><td class="id">42</td><td>${T.epic}</td><td>Tracker view</td><td class="tags">ui,tracker</td><td><span class="bar"><b style="--w:40%"></b>2/5</span></td><td class="dim">–</td><td class="who">emil</td><td class="r urg">8.0</td></tr>
+        <tr><td class="id">60</td><td>${T.bug}</td><td>Sidebar scrollbar anchoring</td><td class="tags">ui</td><td class="dim">–</td><td>${pr(69,'merged')}</td><td class="who">–</td><td class="r urg">5.8</td></tr>
+      </tbody>
+    </table>
+    <div class="grp review">In review <span class="n">2</span></div>
+    <table>${cols}<tbody>
+        <tr class="soon"><td class="id">51</td><td>${T.task}</td><td>Codex read-only gap</td><td class="tags">codex</td><td><span class="bar"><b style="--w:0%"></b>0/1</span></td><td>${pr(72)}</td><td class="who">emil</td><td class="r urg">9.5</td></tr>
+        <tr><td class="id">38</td><td>${T.feat}</td><td>Draft PR label</td><td class="tags">ui</td><td class="dim">–</td><td>${pr(68,'draft')}</td><td class="who">emil</td><td class="r urg">6.0</td></tr>
+    </tbody></table>
+    <div class="grp blocked">Blocked <span class="n">1</span></div>
+    <table>${cols}<tbody>
+        <tr class="blk over"><td class="id">53</td><td>${T.bug}</td><td>gh rate limit on poll</td><td class="tags">gh</td><td class="dim">–</td><td class="dim">–</td><td class="who">–</td><td class="r urg">7.0</td></tr>
+    </tbody></table>
+    <p class="legend">sorted by urgency within each group · red = overdue · yellow = due &lt;24h · italic grey = blocked · tags column clips, full list in the panel</p>`;
+  const footer=`<span><kbd>⌘1</kbd>review</span><span><kbd>⌘2</kbd>tracker</span><span><kbd>j</kbd><kbd>k</kbd>move</span><span><kbd>⇥</kbd>column</span><span><kbd>↵</kbd>open</span><span><kbd>s</kbd>start</span><span><kbd>r</kbd>review</span><span><kbd>d</kbd>done</span><span><kbd>n</kbd>new</span><span><kbd>/</kbd>filter</span><span><kbd>a</kbd>assignee</span><span><kbd>o</kbd>github</span><span><kbd>⌘K</kbd>palette</span>`;
+  document.querySelectorAll('[data-tb]').forEach(e=>e.innerHTML=tb);
+  document.querySelectorAll('[data-left]').forEach(e=>e.innerHTML=left);
+  document.querySelectorAll('[data-middle]').forEach(e=>e.innerHTML=middle(e.dataset.middle));
+  document.querySelectorAll('[data-footer]').forEach(e=>e.innerHTML=footer);
+})();
+</script>
