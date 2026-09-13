@@ -162,6 +162,32 @@ fn turn_interrupt_params(thread_id: &str, turn_id: &str) -> Value {
     json!({ "threadId": thread_id, "turnId": turn_id })
 }
 
+/// Build the JSON-RPC response to a server-initiated request (`id` and
+/// `method` both present) that declines it: `denied`/`decline` for the
+/// approval request types the schema defines a decision enum for, a
+/// JSON-RPC error for everything else (permission-profile requests, tool
+/// calls, elicitations, ...), since those have no decline-shaped response
+/// and must not be answered with a guessed payload.
+fn deny_response(id: Value, method: &str) -> Value {
+    let result = match method {
+        "execCommandApproval" | "applyPatchApproval" => Some(json!({
+            "decision": { "denied": { "rejection": "lgtm runs Codex read-only and declines approval requests" } }
+        })),
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some(json!({ "decision": "decline" }))
+        }
+        _ => None,
+    };
+    match result {
+        Some(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        None => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32000, "message": format!("lgtm declines unsupported codex request: {method}") },
+        }),
+    }
+}
+
 fn send_request(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) -> Result<()> {
     write_line(stdin, &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
 }
@@ -241,6 +267,14 @@ fn stream_turn(
                 let Some(method) = value.get("method").and_then(Value::as_str) else {
                     continue;
                 };
+                if let Some(id) = value.get("id").cloned() {
+                    // Server-initiated request (an approval prompt, despite
+                    // approvalPolicy "never", or a tool/elicitation request
+                    // we don't support). Always reply so the turn can't
+                    // stall waiting for a response we'd never send.
+                    let _ = write_line(stdin, &deny_response(id, method));
+                    continue;
+                }
                 let params = value.get("params").unwrap_or(&Value::Null);
                 match parse_notification(method, params) {
                     Some(Parsed::TextDelta(text)) => on_event(ChatEvent::TextDelta(text)),
@@ -365,7 +399,26 @@ pub fn chat(
     });
 
     let mut stdin = child.stdin.take().expect("stdin was piped");
+    // Guards against a panicking `on_event` leaking the child process: if
+    // `drive` unwinds, this still runs (armed by default) and kills it.
+    // Disarmed on a normal return since the explicit kill below covers that
+    // path.
+    struct KillOnDrop<'a> {
+        child: &'a mut Child,
+        armed: bool,
+    }
+    impl Drop for KillOnDrop<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+    let mut guard = KillOnDrop { child: &mut child, armed: true };
     let outcome = drive(&mut stdin, &rx, prompt, opts, cancel, &mut on_event);
+    guard.armed = false;
+    drop(guard);
     drop(stdin);
 
     let _ = child.kill();
@@ -452,5 +505,31 @@ mod tests {
             parse_notification(value["method"].as_str().unwrap(), &value["params"]),
             None
         );
+    }
+
+    #[test]
+    fn deny_response_declines_known_approval_requests_and_errors_on_the_rest() {
+        assert_eq!(
+            deny_response(json!(7), "execCommandApproval")["result"]["decision"]["denied"]
+                .is_object(),
+            true
+        );
+        assert_eq!(
+            deny_response(json!(8), "applyPatchApproval")["result"]["decision"]["denied"]
+                .is_object(),
+            true
+        );
+        assert_eq!(
+            deny_response(json!(9), "item/commandExecution/requestApproval")["result"]["decision"],
+            json!("decline")
+        );
+        assert_eq!(
+            deny_response(json!(10), "item/fileChange/requestApproval")["result"]["decision"],
+            json!("decline")
+        );
+        let unsupported = deny_response(json!(11), "item/permissions/requestApproval");
+        assert!(unsupported.get("result").is_none());
+        assert_eq!(unsupported["error"]["code"], json!(-32000));
+        assert_eq!(unsupported["id"], json!(11));
     }
 }
