@@ -26,7 +26,7 @@ fn header_row(cells: Vec<(f32, bool, gpui::AnyElement)>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap_2()
+        .gap_1()
         .px_2()
         .py_1()
         .text_size(px(11.))
@@ -101,19 +101,19 @@ impl ReviewApp {
         );
 
         let table_header = header_row(vec![
-            (42., false, text_cell("ID", theme::overlay0())),
-            (22., false, div().into_any_element()),
+            (30., false, text_cell("ID", theme::overlay0())),
+            (18., false, div().into_any_element()),
             (0., true, text_cell("Title", theme::overlay0())),
-            (64., false, oi("tag-16", theme::overlay0())),
-            (34., false, text_cell("Age", theme::overlay0())),
-            (20., false, oi("list-ordered-16", theme::overlay0())),
-            (38., false, oi("milestone-16", theme::overlay0())),
-            (46., false, oi("calendar-16", theme::overlay0())),
-            (46., false, oi("flame-16", theme::overlay0())),
+            (56., false, oi("tag-16", theme::overlay0())),
+            (26., false, text_cell("Age", theme::overlay0())),
+            (14., false, oi("list-ordered-16", theme::overlay0())),
+            (36., false, oi("milestone-16", theme::overlay0())),
+            (36., false, oi("calendar-16", theme::overlay0())),
+            (30., false, oi("flame-16", theme::overlay0())),
         ]);
 
         let table_rows = div().flex().flex_col().children(rows.iter().enumerate().map(|(ix, item)| {
-            self.render_queue_row(item, ix == selected_ix && focused, now, cx)
+            self.render_queue_row(item, ix, ix == selected_ix && focused, now, cx)
         }));
 
         let divider = div()
@@ -143,7 +143,7 @@ impl ReviewApp {
             });
 
         div()
-            .w(px(360.))
+            .w(px(400.))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -151,7 +151,7 @@ impl ReviewApp {
             .bg(theme::mantle())
             .border_r_1()
             .border_color(theme::surface0())
-            .text_size(px(12.))
+            .text_size(px(11.))
             .child(
                 div()
                     .flex()
@@ -192,6 +192,7 @@ impl ReviewApp {
     fn render_queue_row(
         &self,
         item: &TrackerItem,
+        row_ix: usize,
         selected: bool,
         now: i64,
         cx: &mut Context<Self>,
@@ -219,7 +220,7 @@ impl ReviewApp {
             .id(SharedString::from(format!("queue-row-{number}")))
             .flex()
             .items_center()
-            .gap_2()
+            .gap_1()
             .px_2()
             .py_1()
             .cursor_pointer()
@@ -229,17 +230,18 @@ impl ReviewApp {
                     .border_color(theme::green())
             })
             .when(style.italic, |d| d.italic())
-            .child(cell(42., false).text_color(style.text).child(SharedString::from(number.to_string())))
-            .child(cell(22., false).child(oi(icon, color)))
+            .child(cell(30., false).text_color(style.text).child(SharedString::from(number.to_string())))
+            .child(cell(18., false).child(oi(icon, color)))
             .child(cell(0., true).text_color(style.text).child(div().truncate().child(SharedString::from(item.detail.title.clone()))))
-            .child(cell(64., false).text_color(style.text).child(div().truncate().text_size(px(11.)).child(SharedString::from(tags))))
-            .child(cell(34., false).text_color(style.text).child(SharedString::from(age)))
-            .child(cell(20., false).text_color(style.text).child(SharedString::from(priority)))
-            .child(cell(38., false).text_color(style.text).child(div().truncate().child(SharedString::from(milestone))))
-            .child(cell(46., false).text_color(style.due_urgency_text).child(SharedString::from(due_text)))
-            .child(cell(46., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
+            .child(cell(56., false).text_color(style.text).child(div().truncate().child(SharedString::from(tags))))
+            .child(cell(26., false).text_color(style.text).child(SharedString::from(age)))
+            .child(cell(14., false).text_color(style.text).child(SharedString::from(priority)))
+            .child(cell(36., false).text_color(style.text).child(div().truncate().child(SharedString::from(milestone))))
+            .child(cell(36., false).text_color(style.due_urgency_text).child(SharedString::from(due_text)))
+            .child(cell(30., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tracker.focus = FocusedColumn::Queue;
+                this.tracker.queue_selected = row_ix;
                 this.tracker.panel_stack = vec![number];
                 cx.notify();
             }))
@@ -265,14 +267,14 @@ impl ReviewApp {
         let mut row_ix = 0usize;
 
         let header = header_row(vec![
-            (42., false, text_cell("ID", theme::overlay0())),
-            (22., false, div().into_any_element()),
+            (36., false, text_cell("ID", theme::overlay0())),
+            (18., false, div().into_any_element()),
             (0., true, text_cell("Title", theme::overlay0())),
-            (70., false, oi("tag-16", theme::overlay0())),
-            (96., false, oi("issue-tracks-16", theme::overlay0())),
-            (60., false, oi("git-pull-request-16", theme::overlay0())),
-            (56., false, oi("person-16", theme::overlay0())),
-            (46., false, oi("flame-16", theme::overlay0())),
+            (90., false, oi("issue-tracks-16", theme::overlay0())),
+            (110., false, oi("tag-16", theme::overlay0())),
+            (56., false, oi("git-pull-request-16", theme::overlay0())),
+            (70., false, oi("person-16", theme::overlay0())),
+            (36., false, oi("flame-16", theme::overlay0())),
         ]);
 
         let mut body = div().id("flight-table-scroll").flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
@@ -296,7 +298,7 @@ impl ReviewApp {
             );
             for item in rows {
                 let selected = focused && row_ix == flat_selected;
-                body = body.child(self.render_flight_row(item, selected, now, cx));
+                body = body.child(self.render_flight_row(item, row_ix, selected, now, cx));
                 row_ix += 1;
             }
         }
@@ -308,6 +310,7 @@ impl ReviewApp {
             .size_full()
             .flex()
             .flex_col()
+            .text_size(px(11.))
             .child(header)
             .child(body)
             .into_any_element()
@@ -316,6 +319,7 @@ impl ReviewApp {
     fn render_flight_row(
         &self,
         item: &TrackerItem,
+        row_ix: usize,
         selected: bool,
         now: i64,
         cx: &mut Context<Self>,
@@ -377,7 +381,7 @@ impl ReviewApp {
             .id(SharedString::from(format!("flight-row-{number}")))
             .flex()
             .items_center()
-            .gap_2()
+            .gap_1()
             .px_2()
             .py_1()
             .cursor_pointer()
@@ -387,16 +391,17 @@ impl ReviewApp {
                     .border_color(theme::green())
             })
             .when(style.italic, |d| d.italic())
-            .child(cell(42., false).text_color(style.text).child(SharedString::from(number.to_string())))
-            .child(cell(22., false).child(oi(icon, color)))
+            .child(cell(36., false).text_color(style.text).child(SharedString::from(number.to_string())))
+            .child(cell(18., false).child(oi(icon, color)))
             .child(cell(0., true).text_color(style.text).child(div().truncate().child(SharedString::from(item.detail.title.clone()))))
-            .child(cell(70., false).text_color(style.text).child(div().truncate().text_size(px(11.)).child(SharedString::from(tags))))
-            .child(cell(96., false).text_color(style.text).child(sub_issues))
-            .child(cell(60., false).text_color(style.text).child(pr))
-            .child(cell(56., false).text_color(style.text).child(div().truncate().child(SharedString::from(assignee))))
-            .child(cell(46., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
+            .child(cell(90., false).text_color(style.text).child(sub_issues))
+            .child(cell(110., false).text_color(style.text).child(div().truncate().child(SharedString::from(tags))))
+            .child(cell(56., false).text_color(style.text).child(pr))
+            .child(cell(70., false).text_color(style.text).child(div().truncate().child(SharedString::from(assignee))))
+            .child(cell(36., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tracker.focus = FocusedColumn::Flight;
+                this.tracker.flight_selected = row_ix;
                 this.tracker.panel_stack = vec![number];
                 cx.notify();
             }))

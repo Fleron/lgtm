@@ -266,6 +266,7 @@ impl ReviewApp {
             .items_center()
             .gap_1()
             .pl_3()
+            .pr_3()
             .child(review)
             .child(tracker)
             .into_any_element()

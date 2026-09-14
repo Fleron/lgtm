@@ -177,6 +177,8 @@ impl TrackerState {
     }
 }
 
+const DETAIL_CONCURRENCY: usize = 8;
+
 struct LoadedTracker {
     board: ProjectBoard,
     status_field: Option<ProjectField>,
@@ -199,11 +201,24 @@ fn load_tracker_data(owner: &str, repo: &str) -> Result<LoadedTracker> {
     let due_field_id = fields.iter().find(|f| f.name == "Due").map(|f| f.id.clone());
     let project_items: Vec<ProjectItem> = gh::project_items(owner, board.number)?;
     let mut items = Vec::with_capacity(project_items.len());
-    for pi in project_items {
-        // Sub-issue and blocking data (queried per issue below) is what
-        // makes issue_detail worth a round trip per item; the tracker has
-        // no bulk endpoint for it.
-        let detail = gh::issue_detail(owner, repo, pi.content.number)?;
+    // One gh round trip per issue (no bulk endpoint for sub-issues); run
+    // them a few at a time to stay clear of GitHub's secondary rate limit.
+    let mut details = Vec::with_capacity(project_items.len());
+    for chunk in project_items.chunks(DETAIL_CONCURRENCY) {
+        let fetched: Vec<Result<IssueDetail>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|pi| {
+                    let number = pi.content.number;
+                    scope.spawn(move || gh::issue_detail(owner, repo, number))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("issue_detail thread panicked")).collect()
+        });
+        details.extend(fetched);
+    }
+    for (pi, detail) in project_items.into_iter().zip(details) {
+        let detail = detail?;
         items.push(TrackerItem {
             project_item_id: pi.id,
             number: pi.content.number,
