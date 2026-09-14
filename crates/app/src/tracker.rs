@@ -325,6 +325,12 @@ impl ReviewApp {
                 active: config.column_for(status_opt(&item.status)) == Column::Flight,
                 created_at: parse_iso_utc(&item.detail.created_at).unwrap_or(now),
                 has_milestone: item.detail.milestone.is_some(),
+                milestone_due: item
+                    .detail
+                    .milestone
+                    .as_ref()
+                    .and_then(|m| m.due_on.as_deref())
+                    .and_then(parse_iso_utc),
                 has_labels: !item.detail.labels.is_empty(),
                 has_comments: !item.detail.comments.is_empty(),
                 blocked: item.status == "Blocked",

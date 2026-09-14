@@ -169,6 +169,8 @@ pub(crate) struct UrgencyInput {
     pub(crate) active: bool,
     pub(crate) created_at: i64,
     pub(crate) has_milestone: bool,
+    /// The milestone's due date, when it has one.
+    pub(crate) milestone_due: Option<i64>,
     pub(crate) has_labels: bool,
     pub(crate) has_comments: bool,
     pub(crate) blocked: bool,
@@ -176,6 +178,9 @@ pub(crate) struct UrgencyInput {
 
 /// One day, in seconds.
 const DAY: f64 = 86400.0;
+
+/// Due factor for anything 14+ days out, and for a milestone with no date.
+const FAR_DUE_FACTOR: f64 = 0.2;
 
 /// Due-date term: 0.2 at 14 days out, linear up to 1.0 at the due date and
 /// 1.0 for anything already overdue. `None` contributes nothing.
@@ -187,7 +192,7 @@ fn due_factor(due: Option<i64>, now: i64) -> f64 {
     if days_out <= 0.0 {
         1.0
     } else if days_out >= 14.0 {
-        0.2
+        FAR_DUE_FACTOR
     } else {
         1.0 - days_out / 14.0 * 0.8
     }
@@ -217,7 +222,7 @@ pub(crate) fn urgency(input: &UrgencyInput, coeffs: &Coefficients) -> f64 {
     let active_term = if input.active { coeffs.active } else { 0.0 };
     let age_term = coeffs.age * age_factor(input.created_at, input.now);
     let milestone_term = if input.has_milestone {
-        coeffs.milestone
+        coeffs.milestone * input.milestone_due.map_or(FAR_DUE_FACTOR, |due| due_factor(Some(due), input.now))
     } else {
         0.0
     };
@@ -318,10 +323,25 @@ mod tests {
             active: false,
             created_at: now,
             has_milestone: false,
+            milestone_due: None,
             has_labels: false,
             has_comments: false,
             blocked: false,
         }
+    }
+
+    #[test]
+    fn milestone_term_scales_with_its_due_date() {
+        let coeffs = Coefficients::default();
+        let now = 1_000_000;
+        let undated = UrgencyInput { has_milestone: true, ..base_input(now) };
+        let far = UrgencyInput { milestone_due: Some(now + 30 * 86400), ..undated };
+        let soon = UrgencyInput { milestone_due: Some(now + 7 * 86400), ..undated };
+        let overdue = UrgencyInput { milestone_due: Some(now - 86400), ..undated };
+        assert_eq!(urgency(&undated, &coeffs), coeffs.milestone * 0.2);
+        assert_eq!(urgency(&far, &coeffs), coeffs.milestone * 0.2);
+        assert!((urgency(&soon, &coeffs) - coeffs.milestone * 0.6).abs() < 1e-9);
+        assert_eq!(urgency(&overdue, &coeffs), coeffs.milestone);
     }
 
     #[test]
