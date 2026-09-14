@@ -876,9 +876,7 @@ impl From<RawIssueDetail> for IssueDetail {
     }
 }
 
-const ISSUE_DETAIL_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!){\
-    repository(owner:$owner,name:$repo){\
-    issue(number:$number){\
+const ISSUE_DETAIL_FIELDS: &str = "\
     title body state url createdAt \
     assignees(first:20){nodes{login}} \
     labels(first:20){nodes{name color}} \
@@ -888,8 +886,7 @@ const ISSUE_DETAIL_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int
     subIssuesSummary{total completed} \
     parent{number title} \
     closedByPullRequestsReferences(first:20){nodes{number state isDraft url}} \
-    comments(first:50){nodes{author{login} body createdAt}}\
-    }}}";
+    comments(first:50){nodes{author{login} body createdAt}}";
 
 /// Full detail for `owner/repo#number`: title, body, assignees, labels,
 /// milestone, issue type, sub-issues (with summary), parent, linked PRs and
@@ -898,33 +895,57 @@ const ISSUE_DETAIL_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int
 /// stable `blockedBy` connection on `Issue`, and an unknown field fails the
 /// whole query rather than degrading gracefully.
 pub fn issue_detail(owner: &str, repo: &str, number: u64) -> Result<IssueDetail> {
+    issue_details(owner, repo, &[number])?
+        .pop()
+        .map(|(_, detail)| detail)
+        .with_context(|| format!("issue #{number} not found"))
+}
+
+/// [`issue_detail`] for many issues in one GraphQL request, one alias per
+/// issue (`i114: issue(number:114){...}`). Issues GitHub returns as null
+/// (deleted, transferred) are skipped. Keep batches to a few dozen: the
+/// query grows linearly and GitHub caps request size and node count.
+pub fn issue_details(owner: &str, repo: &str, numbers: &[u64]) -> Result<Vec<(u64, IssueDetail)>> {
+    if numbers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let selections: String = numbers
+        .iter()
+        .map(|n| format!("i{n}:issue(number:{n}){{{ISSUE_DETAIL_FIELDS}}} "))
+        .collect();
+    let query =
+        format!("query($owner:String!,$repo:String!){{repository(owner:$owner,name:$repo){{{selections}}}}}");
+    let json = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("repo={repo}"),
+    ])?;
+    parse_issue_details(&json, numbers)
+}
+
+fn parse_issue_details(json: &str, numbers: &[u64]) -> Result<Vec<(u64, IssueDetail)>> {
     #[derive(serde::Deserialize)]
     struct Resp {
         data: Data,
     }
     #[derive(serde::Deserialize)]
     struct Data {
-        repository: RepositoryField,
-    }
-    #[derive(serde::Deserialize)]
-    struct RepositoryField {
-        issue: RawIssueDetail,
+        repository: std::collections::BTreeMap<String, Option<RawIssueDetail>>,
     }
 
-    let json = gh(&[
-        "api",
-        "graphql",
-        "-f",
-        &format!("query={ISSUE_DETAIL_QUERY}"),
-        "-f",
-        &format!("owner={owner}"),
-        "-f",
-        &format!("repo={repo}"),
-        "-F",
-        &format!("number={number}"),
-    ])?;
-    let resp: Resp = serde_json::from_str(&json).context("unexpected gh graphql issue JSON")?;
-    Ok(resp.data.repository.issue.into())
+    let resp: Resp = serde_json::from_str(json).context("unexpected gh graphql issue JSON")?;
+    Ok(numbers
+        .iter()
+        .filter_map(|n| {
+            let raw = resp.data.repository.get(&format!("i{n}"))?.clone()?;
+            Some((*n, raw.into()))
+        })
+        .collect())
 }
 
 /// Link `child_number` as a sub-issue of `parent_number`, via the REST
@@ -1056,6 +1077,21 @@ fn gh(args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_details_maps_aliases_and_skips_nulls() {
+        let json = r#"{"data":{"repository":{
+            "i7":{"title":"Seven","state":"OPEN","url":"u7","createdAt":"2026-01-01T00:00:00Z"},
+            "i9":null,
+            "i11":{"title":"Eleven","state":"OPEN","url":"u11","createdAt":"2026-01-01T00:00:00Z",
+                   "labels":{"nodes":[{"name":"bug","color":"ff0000"}]}}
+        }}}"#;
+        let details = parse_issue_details(json, &[7, 9, 11]).unwrap();
+        let numbers: Vec<u64> = details.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, vec![7, 11]);
+        assert_eq!(details[0].1.title, "Seven");
+        assert_eq!(details[1].1.labels[0].name, "bug");
+    }
 
     #[test]
     fn parses_slug_form() {
