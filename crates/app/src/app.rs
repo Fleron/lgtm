@@ -768,6 +768,9 @@ impl Render for ReviewApp {
             // The open input propagates Escape when it has nothing of its own
             // to dismiss: hand focus back to the diff.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                if this.tracker.composer_mode.is_some() {
+                    this.tracker_close_composer(cx);
+                }
                 window.focus(&this.focus_handle);
                 cx.notify();
             }))

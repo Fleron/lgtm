@@ -5,7 +5,7 @@
 use crate::comments::now_unix;
 use crate::tracker::{
     assignee_chip_label, milestone_summary, oi, oi_sized, queue_other_groups, row_style, tint, type_icon,
-    FocusedColumn, TrackerItem,
+    ComposerMode, FocusedColumn, TrackerItem,
 };
 use crate::urgency::due_countdown;
 use crate::{centered_message, theme, ReviewApp};
@@ -103,6 +103,10 @@ impl ReviewApp {
         let rows = self.tracker_queue_rows(cx);
         let selected_ix = self.tracker.queue_selected;
         let focused = self.tracker.focus == FocusedColumn::Queue;
+        let new_issue_input = match self.tracker.composer_mode {
+            Some(ComposerMode::NewIssue { parent: None }) => self.tracker.composer_input.clone(),
+            _ => None,
+        };
 
         let milestone_chips = div().flex().flex_wrap().gap_2().px_2().py_1().children(
             milestones.into_iter().map(|(title, done, total)| {
@@ -217,6 +221,18 @@ impl ReviewApp {
                     ),
             )
             .child(div().px_2().py_1().child(Input::new(&self.tracker.filter_input).small()))
+            .when_some(new_issue_input, |d, input| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .child(oi("plus-16", theme::overlay0()))
+                        .child(Input::new(&input).small()),
+                )
+            })
             .child(table_header)
             .child(table_rows)
             .child(divider)
