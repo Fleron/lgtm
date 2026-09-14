@@ -36,6 +36,31 @@ fn header_row(cells: Vec<(f32, bool, gpui::AnyElement)>) -> impl IntoElement {
         .children(cells.into_iter().map(|(w, grow, child)| cell(w, grow).child(child)))
 }
 
+/// Title with the issue's labels on a second, indented line (same
+/// treatment as the review sidebar's PR rows).
+fn title_cell(title: &str, labels: &[gh::IssueLabel], color: gpui::Rgba) -> gpui::AnyElement {
+    let tags = labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ");
+    div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .child(div().truncate().text_color(color).child(SharedString::from(title.to_string())))
+        .when(!labels.is_empty(), |d| {
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl_2()
+                    .text_size(px(10.))
+                    .text_color(theme::subtext())
+                    .child(oi("tag-16", theme::subtext()))
+                    .child(div().truncate().child(SharedString::from(tags))),
+            )
+        })
+        .into_any_element()
+}
+
 fn text_cell(text: impl Into<SharedString>, color: gpui::Rgba) -> gpui::AnyElement {
     div()
         .truncate()
@@ -104,7 +129,6 @@ impl ReviewApp {
             (30., false, text_cell("ID", theme::overlay0())),
             (18., false, div().into_any_element()),
             (0., true, text_cell("Title", theme::overlay0())),
-            (56., false, oi("tag-16", theme::overlay0())),
             (26., false, text_cell("Age", theme::overlay0())),
             (14., false, oi("list-ordered-16", theme::overlay0())),
             (36., false, oi("milestone-16", theme::overlay0())),
@@ -201,11 +225,6 @@ impl ReviewApp {
         let (icon, color) = type_icon(item.detail.issue_type.as_deref(), &self.tracker.config);
         let number = item.number;
         let due_text = item.due.map(|d| due_countdown(d, now)).unwrap_or_else(|| "–".to_string());
-        let tags = if item.detail.labels.is_empty() {
-            "–".to_string()
-        } else {
-            item.detail.labels.iter().map(|l| l.name.clone()).collect::<Vec<_>>().join(",")
-        };
         let priority = match item.priority {
             Some(crate::urgency::Priority::High) => "H",
             Some(crate::urgency::Priority::Medium) => "M",
@@ -232,8 +251,7 @@ impl ReviewApp {
             .when(style.italic, |d| d.italic())
             .child(cell(30., false).text_color(style.text).child(SharedString::from(number.to_string())))
             .child(cell(18., false).child(oi(icon, color)))
-            .child(cell(0., true).text_color(style.text).child(div().truncate().child(SharedString::from(item.detail.title.clone()))))
-            .child(cell(56., false).text_color(style.text).child(div().truncate().child(SharedString::from(tags))))
+            .child(cell(0., true).child(title_cell(&item.detail.title, &item.detail.labels, style.text)))
             .child(cell(26., false).text_color(style.text).child(SharedString::from(age)))
             .child(cell(14., false).text_color(style.text).child(SharedString::from(priority)))
             .child(cell(36., false).text_color(style.text).child(div().truncate().child(SharedString::from(milestone))))
@@ -271,7 +289,6 @@ impl ReviewApp {
             (18., false, div().into_any_element()),
             (0., true, text_cell("Title", theme::overlay0())),
             (90., false, oi("issue-tracks-16", theme::overlay0())),
-            (110., false, oi("tag-16", theme::overlay0())),
             (56., false, oi("git-pull-request-16", theme::overlay0())),
             (70., false, oi("person-16", theme::overlay0())),
             (36., false, oi("flame-16", theme::overlay0())),
@@ -327,11 +344,6 @@ impl ReviewApp {
         let style = row_style(item, now);
         let (icon, color) = type_icon(item.detail.issue_type.as_deref(), &self.tracker.config);
         let number = item.number;
-        let tags = if item.detail.labels.is_empty() {
-            "–".to_string()
-        } else {
-            item.detail.labels.iter().map(|l| l.name.clone()).collect::<Vec<_>>().join(",")
-        };
         let (done, total) = (item.detail.sub_issues_summary.completed, item.detail.sub_issues_summary.total);
         let sub_issues: gpui::AnyElement = if total > 0 {
             let pct = (done as f32 / total as f32 * 100.0).round();
@@ -393,9 +405,8 @@ impl ReviewApp {
             .when(style.italic, |d| d.italic())
             .child(cell(36., false).text_color(style.text).child(SharedString::from(number.to_string())))
             .child(cell(18., false).child(oi(icon, color)))
-            .child(cell(0., true).text_color(style.text).child(div().truncate().child(SharedString::from(item.detail.title.clone()))))
+            .child(cell(0., true).child(title_cell(&item.detail.title, &item.detail.labels, style.text)))
             .child(cell(90., false).text_color(style.text).child(sub_issues))
-            .child(cell(110., false).text_color(style.text).child(div().truncate().child(SharedString::from(tags))))
             .child(cell(56., false).text_color(style.text).child(pr))
             .child(cell(70., false).text_color(style.text).child(div().truncate().child(SharedString::from(assignee))))
             .child(cell(36., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
