@@ -498,6 +498,7 @@ impl LocalReview {
         path: String,
         side: CommentSide,
         line: u64,
+        start_line: Option<u64>,
         body: String,
     ) {
         self.next_id += 1;
@@ -506,7 +507,7 @@ impl LocalReview {
             path,
             line: Some(line),
             side: Some(side.api_str().to_string()),
-            start_line: None,
+            start_line,
             body,
             user: gh::Author {
                 login: "you".to_string(),
@@ -1570,6 +1571,7 @@ fn render_row(
                                 path.to_string(),
                                 side,
                                 line,
+                                None,
                                 ix,
                                 window,
                                 cx,
@@ -2535,6 +2537,9 @@ impl ReviewItem {
         match &self.source {
             Source::Local(_) => theme::blue(),
             Source::Pr(_) => match &self.state {
+                ItemState::Ready(data) if data.pr_meta.as_ref().is_some_and(|m| m.is_draft) => {
+                    theme::overlay0()
+                }
                 ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
                     Some("OPEN") => theme::green(),
                     Some("MERGED") => theme::mauve(),
@@ -2919,12 +2924,54 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
     title.into_any_element()
 }
 
+/// Icon-only review + CI summary for a sidebar PR row: a warning triangle
+/// while a review is still required (a green check once it isn't), plus a
+/// passed/total CI count when the PR has any checks at all. Used in both the
+/// subscribed-PRs feed (before a PR is opened) and the open-items list
+/// (after), so it takes plain fields rather than `PrSummary`/`PrMeta`.
+fn review_ci_indicator(review_decision: &str, checks: &[gh::CheckRun]) -> gpui::AnyElement {
+    let (icon, icon_color) = if review_decision == "REVIEW_REQUIRED" {
+        (IconName::TriangleAlert, theme::peach())
+    } else {
+        (IconName::CircleCheck, theme::green())
+    };
+    let checks_text = (!checks.is_empty()).then(|| {
+        let total = checks.len();
+        let passed = checks.iter().filter(|c| c.passed()).count();
+        let color = if passed == total {
+            theme::green()
+        } else {
+            theme::red()
+        };
+        (color, format!("{passed}/{total}"))
+    });
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .flex_shrink_0()
+        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .when_some(checks_text, |row, (color, label)| {
+            row.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(Hsla::from(color))
+                    .child(SharedString::from(label)),
+            )
+        })
+        .into_any_element()
+}
+
 fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
-    let (state_color, state_label) = match meta.state.as_str() {
-        "OPEN" => (theme::green(), "open"),
-        "MERGED" => (theme::mauve(), "merged"),
-        "CLOSED" => (theme::red(), "closed"),
-        other => (theme::overlay0(), other),
+    let (state_color, state_label) = if meta.is_draft {
+        (theme::overlay0(), "draft")
+    } else {
+        match meta.state.as_str() {
+            "OPEN" => (theme::green(), "open"),
+            "MERGED" => (theme::mauve(), "merged"),
+            "CLOSED" => (theme::red(), "closed"),
+            other => (theme::overlay0(), other),
+        }
     };
     let state: Hsla = state_color.into();
     // The PR's overall review decision, when it has one.
@@ -3518,6 +3565,9 @@ struct Composer {
     path: String,
     side: CommentSide,
     line: u64,
+    /// Set when the comment spans multiple lines (a drag-selection covered
+    /// more than one row when "+" was clicked); anchors at `line`, the end.
+    start_line: Option<u64>,
     /// Display row the composer is anchored beneath (best effort; goes stale
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
@@ -6068,6 +6118,7 @@ impl ReviewApp {
         path: String,
         side: CommentSide,
         line: u64,
+        start_line: Option<u64>,
         row_ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6126,6 +6177,7 @@ impl ReviewApp {
             path,
             side,
             line,
+            start_line,
             row_ix,
             input,
             error: None,
@@ -6207,7 +6259,7 @@ impl ReviewApp {
         let item_id = item.id;
         let source = item.source.clone();
         let gen = self.composer_gen;
-        let (reply_to, commit_id, path, side, line) = {
+        let (reply_to, commit_id, path, side, line, start_line) = {
             let composer = self.composer.as_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
@@ -6217,10 +6269,11 @@ impl ReviewApp {
                 composer.path.clone(),
                 composer.side,
                 composer.line,
+                composer.start_line,
             )
         };
         if let Source::Local(_) = source {
-            self.add_local_comment(item_id, reply_to, path, side, line, body, cx);
+            self.add_local_comment(item_id, reply_to, path, side, line, start_line, body, cx);
             if self.composer_gen == gen {
                 self.close_composer(window, cx);
             }
@@ -6242,6 +6295,7 @@ impl ReviewApp {
                             &path,
                             side.api_str(),
                             line,
+                            start_line,
                             &body,
                         ),
                     }
@@ -6277,6 +6331,7 @@ impl ReviewApp {
         path: String,
         side: CommentSide,
         line: u64,
+        start_line: Option<u64>,
         body: String,
         cx: &mut Context<Self>,
     ) {
@@ -6289,7 +6344,7 @@ impl ReviewApp {
         let Some(local) = &mut data.local_review else {
             return;
         };
-        local.add_comment(reply_to, path, side, line, body);
+        local.add_comment(reply_to, path, side, line, start_line, body);
         data.comments = Some(local.index());
         data.rebuild_rows_anchored();
         cx.notify();
@@ -7040,6 +7095,30 @@ impl ReviewApp {
             }
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
+        // A drag-selection (the same one cmd-c copies) whose near or far end
+        // is this row becomes a multi-line comment spanning the selection.
+        let other_end = data.selection.and_then(|sel| {
+            if sel.side != side {
+                return None;
+            }
+            let (lo, hi) = sel.ordered();
+            if lo.row == hi.row {
+                return None;
+            }
+            let other_row = if row_ix == lo.row {
+                Some(hi.row)
+            } else if row_ix == hi.row {
+                Some(lo.row)
+            } else {
+                None
+            }?;
+            let (other_side, other_line) = comment_anchor(&data.rows, other_row, side)?;
+            (other_side == anchor_side).then_some(other_line)
+        });
+        let (line, start_line) = match other_end {
+            Some(other) => (line.max(other), Some(line.min(other))),
+            None => (line, None),
+        };
         let file_ix = data
             .file_rows
             .iter()
@@ -7081,7 +7160,9 @@ impl ReviewApp {
                     cx.stop_propagation();
                     let path = path.clone();
                     entity.update(cx, |this, cx| {
-                        this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                        this.open_composer(
+                            None, path, anchor_side, line, start_line, row_ix, window, cx,
+                        );
                     });
                 })
                 .into_any_element(),
@@ -7116,6 +7197,10 @@ impl ReviewApp {
         } else {
             "Comment"
         };
+        let line_label = match composer.start_line {
+            Some(start) => format!("{start}-{}", composer.line),
+            None => composer.line.to_string(),
+        };
         let target = format!(
             "{}{}:{} ({})",
             if composer.reply_to.is_some() {
@@ -7124,7 +7209,7 @@ impl ReviewApp {
                 ""
             },
             composer.path,
-            composer.line,
+            line_label,
             composer.side.api_str()
         );
         div()
@@ -7494,23 +7579,29 @@ impl ReviewApp {
             let active = ix == self.active;
             let dot: Hsla = item.dot_color().into();
             let status: gpui::AnyElement = match &item.state {
-                ItemState::Ready(data) => div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .child(
-                        div()
-                            .text_color(theme::green())
-                            .child(SharedString::from(format!("+{}", data.additions))),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme::red())
-                            .child(SharedString::from(format!("−{}", data.deletions))),
-                    )
-                    .into_any_element(),
+                ItemState::Ready(data) => {
+                    let review_ci = data.pr_meta.as_ref().map(|meta| {
+                        review_ci_indicator(&meta.review_decision, &meta.status_check_rollup)
+                    });
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .child(
+                            div()
+                                .text_color(theme::green())
+                                .child(SharedString::from(format!("+{}", data.additions))),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme::red())
+                                .child(SharedString::from(format!("−{}", data.deletions))),
+                        )
+                        .children(review_ci)
+                        .into_any_element()
+                }
                 ItemState::Loading => div()
                     .flex_shrink_0()
                     .text_size(px(11.))
@@ -7683,7 +7774,11 @@ impl ReviewApp {
                                     .h(px(8.))
                                     .flex_shrink_0()
                                     .rounded_full()
-                                    .bg(theme::green()),
+                                    .bg(if pr.is_draft {
+                                        theme::overlay0()
+                                    } else {
+                                        theme::green()
+                                    }),
                             )
                             .child(
                                 div()
@@ -7698,7 +7793,11 @@ impl ReviewApp {
                                     .flex_shrink_0()
                                     .text_color(theme::subtext())
                                     .child(SharedString::from(pr.author.login.clone())),
-                            ),
+                            )
+                            .child(review_ci_indicator(
+                                &pr.review_decision,
+                                &pr.status_check_rollup,
+                            )),
                     )
                     .child(
                         div()
@@ -7790,6 +7889,8 @@ impl ReviewApp {
             self.items.len() + subscribed_feed_count + cached_count + section_count;
         let list = div()
             .relative()
+            .w_full()
+            .max_h(px(SIDEBAR_MAX_LIST_HEIGHT))
             .flex_shrink_0()
             .child(list)
             .when(sidebar_row_count > 5, |area| {
@@ -9410,6 +9511,8 @@ mod tests {
             is_draft: false,
             head_ref_name: branch.to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),
+            review_decision: String::new(),
+            status_check_rollup: Vec::new(),
         }
     }
 
@@ -10764,6 +10867,7 @@ mod tests {
                 login: "alice".into(),
             },
             state: "OPEN".into(),
+            is_draft: false,
             url: "https://github.com/o/r/pull/7".into(),
             body: "It was broken.\n".into(),
             base_ref_name: "main".into(),
@@ -10774,6 +10878,7 @@ mod tests {
             deletions: 2,
             changed_files: 3,
             review_decision: String::new(),
+            status_check_rollup: Vec::new(),
         };
         let header = pr_chat_header(&meta);
         assert!(header.contains("\"Fix the frobnicator\""));
@@ -10810,6 +10915,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             12,
+            None,
             "please simplify this".to_string(),
         );
         review.add_comment(
@@ -10817,6 +10923,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             12,
+            None,
             "also add a test".to_string(),
         );
 
@@ -10843,6 +10950,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             7,
+            None,
             "why remove this?\nplease explain".to_string(),
         );
         review.add_comment(
@@ -10850,6 +10958,7 @@ mod tests {
             "src/lib.rs".to_string(),
             CommentSide::Right,
             7,
+            None,
             "because this path handles nil".to_string(),
         );
         review.add_comment(
@@ -10857,6 +10966,7 @@ mod tests {
             "src/main.rs".to_string(),
             CommentSide::Left,
             12,
+            None,
             "second thread".to_string(),
         );
 

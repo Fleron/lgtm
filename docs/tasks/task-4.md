@@ -4,7 +4,7 @@ Status: Draft / not implementation-ready. The open product decisions below must 
 
 ## Goal
 
-Explore a first slice for showing a concise PR overview above or alongside the diff. Reuse metadata LGTM already fetches so a reviewer can understand the change without leaving the review, while using the state, check, and review-attention mapping proposed by [task 2](task-2.md).
+Explore a first slice for showing a concise PR overview above or alongside the diff. Reuse metadata LGTM already fetches so a reviewer can understand the change without leaving the review, while using the state, check, and review-attention mapping proposed by [review-required-ci-checks.md](review-required-ci-checks.md).
 
 ## Current support
 
@@ -21,7 +21,8 @@ Candidate overview content, placed above or alongside the diff after the placeme
 - Description/body.
 - Base and head branches.
 - Additions, deletions, and changed-file statistics.
-- The state, check-summary, and review-attention treatment from task 2.
+- The state, check-summary, and review-attention treatment from
+  `review-required-ci-checks.md`.
 
 The first slice should reuse the existing metadata response and avoid a second per-PR metadata request. Rendering, truncation, and placement remain intentionally undecided; this document is discovery material rather than an implementation contract.
 
@@ -31,7 +32,7 @@ Likely areas to inspect when this draft is promoted:
 
 - `crates/gh/src/lib.rs`: `PrMeta` and `fetch_meta`, including the existing `gh pr view --json` field selection and fixtures.
 - `crates/app/src/main.rs`: `Loaded`, `fetch_item`, `pr_titlebar_content`, the diff layout, and `pr_chat_header`/`chat_prompt`.
-- `docs/tasks/task-2.md`: proposed shared state/check/review mapping and its three display surfaces.
+- `docs/tasks/review-required-ci-checks.md`: proposed shared state/check/review mapping and its three display surfaces.
 
 These are pointers for the next planning pass, not settled ownership or API contracts.
 
@@ -44,7 +45,7 @@ These are pointers for the next planning pass, not settled ownership or API cont
 
 ## Dependencies
 
-- [Task 2: Show PR state, CI checks, and review attention](task-2.md) for the shared state/check/review mapping.
+- [PR state, CI checks, and review attention](review-required-ci-checks.md) for the shared state/check/review mapping.
 - Existing `PrMeta` fetching and the current PR review layout.
 
 ## Non-goals

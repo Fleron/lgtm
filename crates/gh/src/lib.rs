@@ -93,6 +93,7 @@ pub struct PrMeta {
     pub title: String,
     pub author: Author,
     pub state: String,
+    pub is_draft: bool,
     pub url: String,
     /// PR description (markdown); empty when the PR has none. Used as chat
     /// context, not rendered in the UI.
@@ -111,11 +112,32 @@ pub struct PrMeta {
     /// required reviews and none given).
     #[serde(default)]
     pub review_decision: String,
+    #[serde(default)]
+    pub status_check_rollup: Vec<CheckRun>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Author {
     pub login: String,
+}
+
+/// One entry of `statusCheckRollup`. GitHub mixes two shapes in this array:
+/// legacy commit statuses report `state`, GitHub Actions check runs report
+/// `status`/`conclusion`. Absent fields default to empty so either shape
+/// deserializes into the same struct.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CheckRun {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub conclusion: String,
+}
+
+impl CheckRun {
+    pub fn passed(&self) -> bool {
+        matches!(self.state.as_str(), "SUCCESS" | "EXPECTED")
+            || matches!(self.conclusion.as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")
+    }
 }
 
 pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
@@ -126,8 +148,8 @@ pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
         "--repo",
         &loc.repo_slug(),
         "--json",
-        "number,title,author,state,url,body,baseRefName,headRefName,baseRefOid,headRefOid,\
-         additions,deletions,changedFiles,reviewDecision",
+        "number,title,author,state,isDraft,url,body,baseRefName,headRefName,baseRefOid,\
+         headRefOid,additions,deletions,changedFiles,reviewDecision,statusCheckRollup",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr view JSON")
 }
@@ -143,6 +165,10 @@ pub struct PrSummary {
     pub is_draft: bool,
     pub head_ref_name: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub review_decision: String,
+    #[serde(default)]
+    pub status_check_rollup: Vec<CheckRun>,
 }
 
 /// Open PRs for a repo, most recently updated first (gh's default order).
@@ -157,7 +183,8 @@ pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
         "--limit",
         "200",
         "--json",
-        "number,title,author,state,isDraft,headRefName,updatedAt",
+        "number,title,author,state,isDraft,headRefName,updatedAt,reviewDecision,\
+         statusCheckRollup",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr list JSON")
 }
@@ -294,28 +321,38 @@ pub fn post_review_comment(
     path: &str,
     side: &str,
     line: u64,
+    start_line: Option<u64>,
     body: &str,
 ) -> Result<()> {
-    gh(&[
-        "api",
-        "-X",
-        "POST",
-        &format!(
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        format!(
             "repos/{}/{}/pulls/{}/comments",
             loc.owner, loc.repo, loc.number
         ),
-        "-f",
-        &format!("body={body}"),
-        "-f",
-        &format!("commit_id={commit_id}"),
-        "-f",
-        &format!("path={path}"),
-        "-f",
-        &format!("side={side}"),
+        "-f".to_string(),
+        format!("body={body}"),
+        "-f".to_string(),
+        format!("commit_id={commit_id}"),
+        "-f".to_string(),
+        format!("path={path}"),
+        "-f".to_string(),
+        format!("side={side}"),
         // -F, not -f: line must be a JSON integer, not a string.
-        "-F",
-        &format!("line={line}"),
-    ])?;
+        "-F".to_string(),
+        format!("line={line}"),
+    ];
+    // A multi-line comment additionally anchors its start on the same side
+    // (GitHub doesn't support a range spanning left and right).
+    if let Some(start_line) = start_line {
+        args.push("-F".to_string());
+        args.push(format!("start_line={start_line}"));
+        args.push("-f".to_string());
+        args.push(format!("start_side={side}"));
+    }
+    gh(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
 }
 
@@ -520,6 +557,35 @@ mod tests {
     }
 
     #[test]
+    fn check_run_passed_handles_both_status_shapes() {
+        // Legacy commit status: `state`.
+        let status_ctx = CheckRun {
+            state: "SUCCESS".into(),
+            conclusion: String::new(),
+        };
+        assert!(status_ctx.passed());
+
+        // GitHub Actions check run: `conclusion`.
+        let check_run = CheckRun {
+            state: String::new(),
+            conclusion: "NEUTRAL".into(),
+        };
+        assert!(check_run.passed());
+
+        let failing = CheckRun {
+            state: "FAILURE".into(),
+            conclusion: String::new(),
+        };
+        assert!(!failing.passed());
+
+        let pending = CheckRun {
+            state: String::new(),
+            conclusion: String::new(),
+        };
+        assert!(!pending.passed());
+    }
+
+    #[test]
     fn encodes_paths_per_segment_keeping_slashes() {
         assert_eq!(encode_path("src/main.rs"), "src/main.rs");
         assert_eq!(
@@ -553,6 +619,7 @@ mod tests {
     fn deserializes_pr_meta_with_oids() {
         let json = r#"{
             "number": 1, "title": "t", "author": {"login": "a"}, "state": "OPEN",
+            "isDraft": false,
             "url": "https://github.com/o/r/pull/1",
             "baseRefName": "main", "headRefName": "feat",
             "baseRefOid": "abc123", "headRefOid": "def456",
