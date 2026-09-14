@@ -50,14 +50,26 @@ impl ReviewApp {
             self.tracker_load(cx);
         }
         let milestones = milestone_summary(&self.tracker.items);
+        let filter = self.tracker_filter_text(cx);
         let ready_count = crate::tracker::queue_ready_rows(
             &self.tracker.items,
             &self.tracker.config,
             &self.tracker.selected_milestones,
-            "",
+            &filter,
         )
-        .len();
-        let other_groups = queue_other_groups(&self.tracker.items, &self.tracker.config);
+        .into_iter()
+        .filter(|it| self.tracker_assignee_matches(it))
+        .count();
+        let other_rows: Vec<&TrackerItem> = crate::tracker::queue_other_rows(
+            &self.tracker.items,
+            &self.tracker.config,
+            &self.tracker.selected_milestones,
+            &filter,
+        )
+        .into_iter()
+        .filter(|it| self.tracker_assignee_matches(it))
+        .collect();
+        let other_groups = queue_other_groups(&other_rows);
         let now = now_unix();
         let rows = self.tracker_queue_rows(cx);
         let selected_ix = self.tracker.queue_selected;
@@ -394,28 +406,34 @@ impl ReviewApp {
 impl ReviewApp {
     /// Titlebar content for the Tracker view: repo name and per-group
     /// counts (`4 doing · 2 in review · 11 ready · 20 later`).
-    pub(crate) fn render_tracker_titlebar_content(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_tracker_titlebar_content(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.tracker.owner.is_empty() {
             return crate::app_title(None);
         }
+        let filter = self.tracker_filter_text(cx);
         let flight_counts: Vec<String> = self
-            .tracker
-            .status_field
-            .as_ref()
-            .map(|f| f.options.iter().map(|o| o.name.clone()).collect::<Vec<String>>())
-            .unwrap_or_default()
+            .tracker_flight_groups(cx)
             .into_iter()
-            .filter(|name| self.tracker.config.column_for(Some(name)) == crate::urgency::Column::Flight)
-            .map(|name| {
-                let count = self.tracker.items.iter().filter(|it| it.status == name).count();
-                format!("{count} {}", name.to_lowercase())
-            })
+            .map(|(name, rows)| format!("{} {}", rows.len(), name.to_lowercase()))
             .collect();
-        let ready = crate::tracker::queue_ready_rows(&self.tracker.items, &self.tracker.config, &Default::default(), "").len();
-        let later: usize = queue_other_groups(&self.tracker.items, &self.tracker.config)
-            .iter()
-            .map(|(_, count)| count)
-            .sum();
+        let ready = crate::tracker::queue_ready_rows(
+            &self.tracker.items,
+            &self.tracker.config,
+            &self.tracker.selected_milestones,
+            &filter,
+        )
+        .into_iter()
+        .filter(|it| self.tracker_assignee_matches(it))
+        .count();
+        let later = crate::tracker::queue_other_rows(
+            &self.tracker.items,
+            &self.tracker.config,
+            &self.tracker.selected_milestones,
+            &filter,
+        )
+        .into_iter()
+        .filter(|it| self.tracker_assignee_matches(it))
+        .count();
         let mut parts = flight_counts;
         parts.push(format!("{ready} ready"));
         parts.push(format!("{later} later"));

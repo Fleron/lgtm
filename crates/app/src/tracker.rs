@@ -487,6 +487,9 @@ impl ReviewApp {
         self.tracker.panel_stack.push(number);
         self.tracker.status_menu_target = None;
         self.tracker.panel_child_selected = 0;
+        if self.tracker.focus == FocusedColumn::Panel && self.tracker_panel_children().is_empty() {
+            self.tracker.focus = FocusedColumn::Queue;
+        }
         cx.notify();
     }
 
@@ -710,12 +713,9 @@ pub(crate) fn queue_ready_rows<'a>(
 
 /// The collapsed "todo 8 · backlog 12" divider: Queue-column items whose
 /// status isn't `Ready`, grouped by status name with counts.
-pub(crate) fn queue_other_groups(items: &[TrackerItem], config: &TrackerConfig) -> Vec<(String, usize)> {
+pub(crate) fn queue_other_groups(rows: &[&TrackerItem]) -> Vec<(String, usize)> {
     let mut counts: Vec<(String, usize)> = Vec::new();
-    for item in items {
-        if item.column(config) != Column::Queue || item.status.is_empty() || item.status == "Ready" {
-            continue;
-        }
+    for item in rows {
         match counts.iter_mut().find(|(name, _)| *name == item.status) {
             Some((_, count)) => *count += 1,
             None => counts.push((item.status.clone(), 1)),
@@ -915,7 +915,7 @@ pub(crate) fn row_style(item: &TrackerItem, now: i64) -> RowStyle {
         },
         Some(DueState::Soon) => RowStyle {
             text: theme::text(),
-            due_urgency_text: theme::peach(),
+            due_urgency_text: theme::yellow(),
             italic: false,
         },
         _ => RowStyle {
@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn queue_other_groups_counts_by_status() {
         let items = vec![item(1, "Todo", 1.0), item(2, "Todo", 1.0), item(3, "Backlog", 1.0)];
-        let groups = queue_other_groups(&items, &config());
+        let groups = queue_other_groups(&queue_other_rows(&items, &config(), &BTreeSet::new(), ""));
         assert_eq!(groups, vec![("Todo".to_string(), 2), ("Backlog".to_string(), 1)]);
     }
 
