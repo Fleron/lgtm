@@ -23,8 +23,7 @@ pub(crate) enum AssigneeFilter {
     All,
 }
 
-/// Taskwarrior-style urgency coefficients, one per term. See
-/// `docs/tasks/tracker.md`'s urgency table for the mapping to GitHub data.
+/// Taskwarrior-style urgency coefficients, one per term, mapped to GitHub data.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct Coefficients {
     pub(crate) due: f64,

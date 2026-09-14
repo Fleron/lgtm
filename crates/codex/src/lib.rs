@@ -51,7 +51,7 @@ pub struct ChatOptions {
     pub system_prompt: Option<String>,
     /// Working directory for the thread. Advisory only: unlike claude's
     /// `explore_dir`, Codex's read-only sandbox is not confined to this
-    /// directory (accepted gap, see docs/tasks/codex-chat.md).
+    /// directory (accepted gap: Codex is read-only but not confined to that directory).
     pub explore_dir: Option<PathBuf>,
 }
 

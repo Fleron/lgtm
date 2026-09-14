@@ -1,11 +1,11 @@
 # Octicons for the tracker view
 
 The 22 SVGs in this directory are extracted verbatim from the inline
-`<symbol>` sprite in `docs/tasks/assets/tracker-mockup.html` (the accepted
+`<symbol>` sprite in `docs/tracker-mockup.html` (the accepted
 visual, sketch v9) — that file is self-contained and already carries real
 Primer Octicons path data, so these are not hand-guessed. Each file is
 `viewBox="0 0 16 16"`, `fill="currentColor"`, named after the Primer
-Octicons filename from `docs/tasks/tracker.md`'s Icons table.
+Octicons filename from the tracker design (`docs/tracker-mockup.html`).
 
 Covered here: `bug-16`, `calendar-16`, `comment-16`, `filter-16`,
 `flame-16`, `git-merge-16`, `git-pull-request-16`,
