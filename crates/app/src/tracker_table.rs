@@ -4,7 +4,7 @@
 
 use crate::comments::now_unix;
 use crate::tracker::{
-    assignee_chip_label, milestone_summary, oi, queue_other_groups, row_style, tint, type_icon,
+    assignee_chip_label, milestone_summary, oi, oi_sized, queue_other_groups, row_style, tint, type_icon,
     FocusedColumn, TrackerItem,
 };
 use crate::urgency::due_countdown;
@@ -13,14 +13,18 @@ use gpui::{div, prelude::*, px, Context, SharedString};
 use gpui_component::input::Input;
 use gpui_component::Sizable as _;
 
+/// Fixed cells are one text line tall and centre their content in it, so
+/// icons and values line up with the title line of a two-line row.
 fn cell(width: f32, grow: bool) -> gpui::Div {
     let cell = div().flex_shrink_0().overflow_hidden();
     if grow {
         cell.flex_1().min_w(px(40.))
     } else {
-        cell.w(px(width))
+        cell.w(px(width)).h(px(LINE_PX)).flex().items_center()
     }
 }
+
+const LINE_PX: f32 = 16.;
 
 fn header_row(cells: Vec<(f32, bool, gpui::AnyElement)>) -> impl IntoElement {
     div()
@@ -44,7 +48,7 @@ fn title_cell(title: &str, labels: &[gh::IssueLabel], color: gpui::Rgba) -> gpui
         .flex()
         .flex_col()
         .min_w_0()
-        .child(div().truncate().text_color(color).child(SharedString::from(title.to_string())))
+        .child(div().h(px(LINE_PX)).truncate().text_color(color).child(SharedString::from(title.to_string())))
         .when(!labels.is_empty(), |d| {
             d.child(
                 div()
@@ -54,7 +58,7 @@ fn title_cell(title: &str, labels: &[gh::IssueLabel], color: gpui::Rgba) -> gpui
                     .pl_2()
                     .text_size(px(10.))
                     .text_color(theme::subtext())
-                    .child(oi("tag-16", theme::subtext()))
+                    .child(oi_sized("tag-16", theme::subtext(), 10.))
                     .child(div().truncate().child(SharedString::from(tags))),
             )
         })
@@ -238,7 +242,7 @@ impl ReviewApp {
         div()
             .id(SharedString::from(format!("queue-row-{number}")))
             .flex()
-            .items_center()
+            .items_start()
             .gap_1()
             .px_2()
             .py_1()
@@ -392,7 +396,7 @@ impl ReviewApp {
         div()
             .id(SharedString::from(format!("flight-row-{number}")))
             .flex()
-            .items_center()
+            .items_start()
             .gap_1()
             .px_2()
             .py_1()

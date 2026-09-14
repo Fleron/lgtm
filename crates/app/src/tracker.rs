@@ -1001,9 +1001,13 @@ impl AssetSource for TrackerAssets {
 
 /// One octicon, sized and coloured like the mockup's `.oi` glyphs.
 pub(crate) fn oi(name: &str, color: gpui::Rgba) -> gpui::AnyElement {
+    oi_sized(name, color, 13.)
+}
+
+pub(crate) fn oi_sized(name: &str, color: gpui::Rgba, size: f32) -> gpui::AnyElement {
     gpui::svg()
         .path(format!("octicons/{name}.svg"))
-        .size(gpui::px(13.))
+        .size(gpui::px(size))
         .text_color(color)
         .into_any_element()
 }
