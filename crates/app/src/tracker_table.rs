@@ -140,9 +140,17 @@ impl ReviewApp {
             (30., false, oi("flame-16", theme::overlay0())),
         ]);
 
-        let table_rows = div().flex().flex_col().children(rows.iter().enumerate().map(|(ix, item)| {
-            self.render_queue_row(item, ix, ix == selected_ix && focused, now, cx)
-        }));
+        let table_rows = div()
+            .id("queue-table-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.tracker.queue_scroll)
+            .flex()
+            .flex_col()
+            .children(rows.iter().enumerate().map(|(ix, item)| {
+                self.render_queue_row(item, ix, ix == selected_ix && focused, now, cx)
+            }));
 
         let divider = div()
             .id("queue-divider")
@@ -210,7 +218,7 @@ impl ReviewApp {
             )
             .child(div().px_2().py_1().child(Input::new(&self.tracker.filter_input).small()))
             .child(table_header)
-            .child(div().id("queue-table-scroll").flex_1().min_h(px(0.)).overflow_y_scroll().child(table_rows))
+            .child(table_rows)
             .child(divider)
             .when_some(self.tracker.error.clone(), |d, err| {
                 d.child(div().px_2().py_1().text_color(theme::red()).child(err))
@@ -298,7 +306,14 @@ impl ReviewApp {
             (36., false, oi("flame-16", theme::overlay0())),
         ]);
 
-        let mut body = div().id("flight-table-scroll").flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col();
+        let mut body = div()
+            .id("flight-table-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&self.tracker.flight_scroll)
+            .flex()
+            .flex_col();
         for (group_ix, (name, rows)) in groups.iter().enumerate() {
             let color = colors[group_ix % colors.len()];
             body = body.child(

@@ -13,7 +13,7 @@ use crate::urgency::{
 use crate::ReviewApp;
 use anyhow::{Context as _, Result};
 use gh::{IssueDetail, ProjectBoard, ProjectField, ProjectItem};
-use gpui::{prelude::*, AssetSource, Context, Entity, SharedString, Subscription, Window};
+use gpui::{prelude::*, AssetSource, Context, Entity, ScrollHandle, SharedString, Subscription, Window};
 use gpui_component::input::{InputEvent, InputState};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -69,6 +69,8 @@ pub(crate) struct TrackerState {
     pub(crate) focus: FocusedColumn,
     pub(crate) queue_selected: usize,
     pub(crate) flight_selected: usize,
+    pub(crate) queue_scroll: ScrollHandle,
+    pub(crate) flight_scroll: ScrollHandle,
     pub(crate) todo_backlog_expanded: bool,
     pub(crate) selected_milestones: BTreeSet<String>,
     pub(crate) filter_input: Entity<InputState>,
@@ -153,6 +155,8 @@ impl TrackerState {
             focus: FocusedColumn::Queue,
             queue_selected: 0,
             flight_selected: 0,
+            queue_scroll: ScrollHandle::new(),
+            flight_scroll: ScrollHandle::new(),
             todo_backlog_expanded: false,
             selected_milestones: BTreeSet::new(),
             filter_input,
@@ -454,9 +458,30 @@ impl ReviewApp {
             FocusedColumn::Flight => &mut self.tracker.flight_selected,
             FocusedColumn::Panel => unreachable!(),
         };
-        let next = (*selected as i64 + delta).clamp(0, rows.len() as i64 - 1);
-        *selected = next as usize;
+        let next = ((*selected as i64 + delta).clamp(0, rows.len() as i64 - 1)) as usize;
+        *selected = next;
+        match self.tracker.focus {
+            FocusedColumn::Queue => self.tracker.queue_scroll.scroll_to_item(next),
+            FocusedColumn::Flight => {
+                let child_ix = self.flight_child_index(next, cx);
+                self.tracker.flight_scroll.scroll_to_item(child_ix);
+            }
+            FocusedColumn::Panel => unreachable!(),
+        }
         cx.notify();
+    }
+
+    /// The flight pane's scroll container holds a header child before each
+    /// group's rows, so a flat row index maps to a later child index.
+    fn flight_child_index(&self, flat: usize, cx: &Context<Self>) -> usize {
+        let mut seen = 0;
+        for (group_ix, (_, rows)) in self.tracker_flight_groups(cx).iter().enumerate() {
+            if flat < seen + rows.len() {
+                return flat + group_ix + 1;
+            }
+            seen += rows.len();
+        }
+        flat
     }
 
     pub(crate) fn tracker_next_column(&mut self, cx: &mut Context<Self>) {
