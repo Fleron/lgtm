@@ -49,7 +49,7 @@ impl Default for Coefficients {
             priority_low: 1.8,
             active: 4.0,
             age: 2.0,
-            milestone: 1.0,
+            milestone: 10.0,
             labels: 1.0,
             comments: 1.0,
             blocked: -5.0,
