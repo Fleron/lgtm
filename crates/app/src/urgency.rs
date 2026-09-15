@@ -90,6 +90,10 @@ pub(crate) struct TrackerConfig {
     pub(crate) assignee_filter: AssigneeFilter,
     #[serde(default)]
     pub(crate) type_colors: BTreeMap<String, String>,
+    /// Folder holding the checkouts a dispatched agent runs in; opt-in, so
+    /// it is never written back into a config that doesn't already set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dispatch_root: Option<PathBuf>,
 }
 
 impl TrackerConfig {
@@ -113,6 +117,7 @@ impl TrackerConfig {
             coefficients: Coefficients::default(),
             assignee_filter: AssigneeFilter::Me,
             type_colors: default_type_colors(),
+            dispatch_root: None,
         }
     }
 

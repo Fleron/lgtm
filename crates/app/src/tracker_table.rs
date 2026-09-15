@@ -4,13 +4,14 @@
 
 use crate::comments::now_unix;
 use crate::tracker::{
-    assignee_chip_label, milestone_summary, oi, oi_sized, queue_other_groups, row_style, tint, type_icon,
-    ComposerMode, FocusedColumn, TrackerItem,
+    assignee_chip_label, dispatch_icon, dispatch_menu, milestone_summary, oi, oi_sized, queue_other_groups,
+    row_style, tint, type_icon, ComposerMode, FocusedColumn, TrackerItem,
 };
 use crate::urgency::due_countdown;
 use crate::{centered_message, theme, ReviewApp};
 use gpui::{div, prelude::*, px, Context, SharedString};
 use gpui_component::input::Input;
+use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::Sizable as _;
 
 /// Fixed cells are one text line tall and centre their content in it, so
@@ -142,6 +143,7 @@ impl ReviewApp {
             (36., false, oi("milestone-16", theme::overlay0())),
             (36., false, oi("calendar-16", theme::overlay0())),
             (30., false, oi("flame-16", theme::overlay0())),
+            (16., false, div().into_any_element()),
         ]);
 
         let table_rows = div()
@@ -263,8 +265,10 @@ impl ReviewApp {
         let age = crate::comments::short_age(&item.detail.created_at, now);
         let age = age.trim_end_matches(" ago").to_string();
 
+        let group = SharedString::from(format!("queue-row-{number}"));
         div()
-            .id(SharedString::from(format!("queue-row-{number}")))
+            .id(group.clone())
+            .group(group.clone())
             .flex()
             .items_start()
             .gap_1()
@@ -285,12 +289,14 @@ impl ReviewApp {
             .child(cell(36., false).text_color(style.text).child(div().truncate().child(SharedString::from(milestone))))
             .child(cell(36., false).text_color(style.due_urgency_text).child(SharedString::from(due_text)))
             .child(cell(30., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
+            .child(cell(16., false).child(dispatch_icon(number, &group, selected, cx)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tracker.focus = FocusedColumn::Queue;
                 this.tracker.queue_selected = row_ix;
                 this.tracker.panel_stack = vec![number];
                 cx.notify();
             }))
+            .context_menu(dispatch_menu(number, cx))
     }
 
     pub(crate) fn render_tracker_pane(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -320,6 +326,7 @@ impl ReviewApp {
             (56., false, oi("git-pull-request-16", theme::overlay0())),
             (70., false, oi("person-16", theme::overlay0())),
             (36., false, oi("flame-16", theme::overlay0())),
+            (16., false, div().into_any_element()),
         ]);
 
         let mut body = div()
@@ -424,8 +431,10 @@ impl ReviewApp {
         };
         let assignee = item.detail.assignees.first().cloned().unwrap_or_else(|| "–".to_string());
 
+        let group = SharedString::from(format!("flight-row-{number}"));
         div()
-            .id(SharedString::from(format!("flight-row-{number}")))
+            .id(group.clone())
+            .group(group.clone())
             .flex()
             .items_start()
             .gap_1()
@@ -445,12 +454,14 @@ impl ReviewApp {
             .child(cell(56., false).text_color(style.text).child(pr))
             .child(cell(70., false).text_color(style.text).child(div().truncate().child(SharedString::from(assignee))))
             .child(cell(36., false).text_color(style.due_urgency_text).child(SharedString::from(format!("{:.1}", item.urgency))))
+            .child(cell(16., false).child(dispatch_icon(number, &group, selected, cx)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tracker.focus = FocusedColumn::Flight;
                 this.tracker.flight_selected = row_ix;
                 this.tracker.panel_stack = vec![number];
                 cx.notify();
             }))
+            .context_menu(dispatch_menu(number, cx))
     }
 }
 

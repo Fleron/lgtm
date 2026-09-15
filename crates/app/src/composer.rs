@@ -687,30 +687,40 @@ pub(crate) struct MentionProvider {
     pub(crate) users: Rc<RefCell<Vec<gh::Mention>>>,
 }
 
-/// If the cursor sits inside an `@mention` token, return the byte offset of the
-/// `@` and the (possibly empty) login text typed after it. The `@` must begin a
-/// word — preceded by whitespace or the start of the text — matching GitHub's
-/// own mention rules, so `foo@bar` never triggers.
-fn mention_prefix(text: &Rope, offset: usize) -> Option<(usize, String)> {
+/// If the cursor sits inside a `<sigil><word>` token, return the byte offset
+/// of the sigil and the (possibly empty) text typed after it. The sigil must
+/// begin a word — preceded by whitespace or the start of the text — matching
+/// GitHub's own mention rules, so `foo@bar` never triggers.
+pub(crate) fn sigil_prefix(
+    text: &Rope,
+    offset: usize,
+    sigil: u8,
+    is_word_char: fn(char) -> bool,
+) -> Option<(usize, String)> {
     let s = text.to_string();
     let offset = offset.min(s.len());
     let before = &s[..offset];
-    // GitHub logins are alphanumeric plus hyphen; walk back over that run.
     let start = before
         .char_indices()
         .rev()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '-')
+        .take_while(|(_, c)| is_word_char(*c))
         .last()
-        .map(|(i, _)| i)
-        .unwrap_or(offset);
-    if start == 0 || before.as_bytes()[start - 1] != b'@' {
+        .map_or(offset, |(i, _)| i);
+    if start == 0 || before.as_bytes()[start - 1] != sigil {
         return None;
     }
     let at = start - 1;
-    if at > 0 && !before[..at].chars().next_back().unwrap().is_whitespace() {
+    if at > 0 && !before[..at].chars().next_back()?.is_whitespace() {
         return None;
     }
     Some((at, before[start..offset].to_string()))
+}
+
+/// GitHub logins are alphanumeric plus hyphen.
+fn mention_prefix(text: &Rope, offset: usize) -> Option<(usize, String)> {
+    sigil_prefix(text, offset, b'@', |c| {
+        c.is_ascii_alphanumeric() || c == '-'
+    })
 }
 
 /// Rank of `user` against `query` (matched case-insensitively), lower = better;

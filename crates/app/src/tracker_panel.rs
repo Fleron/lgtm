@@ -3,14 +3,17 @@
 //! comment box. Sidebar/main-pane tables live in `tracker_table.rs`.
 
 use crate::comments::short_age;
-use crate::tracker::{oi, sub_issue_icon, tint, type_icon, ComposerMode, FocusedColumn};
+use crate::tracker::{
+    dispatch_icon, dispatch_menu, oi, sub_issue_icon, tint, type_icon, ComposerMode, FocusedColumn,
+};
 use crate::tracker_table::label_pill;
 use crate::urgency::{due_countdown, Priority};
 use crate::{centered_message, theme, ReviewApp};
 use gpui::{div, prelude::*, px, Context, MouseButton, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::Sizable as _;
+use gpui_component::menu::ContextMenuExt as _;
+use gpui_component::{Disableable as _, Sizable as _};
 
 impl ReviewApp {
     pub(crate) fn render_tracker_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -56,6 +59,15 @@ impl ReviewApp {
                     .truncate()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(SharedString::from(format!("#{number} {}", item.detail.title))),
+            )
+            .child(
+                div()
+                    .id("tracker-dispatch")
+                    .cursor_pointer()
+                    .child(oi("terminal-16", theme::overlay0()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.tracker_open_dispatch(number, window, cx);
+                    })),
             )
             .child(
                 div()
@@ -220,6 +232,125 @@ impl ReviewApp {
             .border_color(theme::surface0())
             .child(header)
             .child(body)
+            .into_any_element()
+    }
+
+    /// The card's top row: the terminal glyph, the agent chip and the issue
+    /// number.
+    fn render_dispatch_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(card) = &self.tracker.dispatch else {
+            return div().into_any_element();
+        };
+        let label = card.agent.label();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(oi("terminal-16", theme::overlay0()))
+            .child(
+                div()
+                    .id("dispatch-agent")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .cursor_pointer()
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tracker_toggle_dispatch_agent(cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(theme::overlay0())
+                    .truncate()
+                    .child(SharedString::from(format!("#{}", card.number))),
+            )
+            .into_any_element()
+    }
+
+    /// The floating "dispatch an agent" card, rendered at the window's
+    /// top-centre over an invisible backdrop that closes it on click.
+    pub(crate) fn render_dispatch_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(card) = &self.tracker.dispatch else {
+            return div().into_any_element();
+        };
+        let has_root = self.tracker.config.dispatch_root.is_some();
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(96.))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.tracker_close_dispatch(window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.tracker_close_dispatch(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .w(px(560.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .bg(theme::mantle())
+                    .shadow_lg()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .child(self.render_dispatch_header(cx))
+                    .child(Input::new(&card.input))
+                    .when(!has_root, |body| {
+                        body.child(
+                            div()
+                                .text_color(theme::overlay0())
+                                .child(SharedString::from(crate::dispatch::NO_ROOT_HINT)),
+                        )
+                    })
+                    .when_some(card.error.clone(), |body, err| {
+                        body.child(div().text_color(theme::red()).child(err))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.))
+                                    .text_color(theme::overlay0())
+                                    .child(SharedString::from("⌘⏎ to dispatch")),
+                            )
+                            .child(
+                                Button::new("dispatch-submit")
+                                    .label("Dispatch")
+                                    .primary()
+                                    .small()
+                                    .disabled(!has_root)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.tracker_submit_dispatch(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -413,8 +544,10 @@ impl ReviewApp {
             } else {
                 div().truncate().child(SharedString::from(sub.title.clone())).into_any_element()
             };
+            let group = SharedString::from(format!("sub-issue-{sub_number}"));
             let mut row = div()
-                .id(SharedString::from(format!("sub-issue-{sub_number}")))
+                .id(group.clone())
+                .group(group.clone())
                 .flex()
                 .items_center()
                 .gap_2()
@@ -425,7 +558,7 @@ impl ReviewApp {
                 })
                 .child(oi(icon, color))
                 .child(SharedString::from(format!("#{sub_number}")))
-                .child(title);
+                .child(div().flex_1().min_w_0().child(title));
             if self.tracker.status_menu_target == Some(sub_number) {
                 row = row.child(self.render_status_chip(
                     sub_number,
@@ -433,11 +566,12 @@ impl ReviewApp {
                     cx,
                 ));
             }
-            if editing_title {
-                row
-            } else {
-                row.on_click(cx.listener(move |this, _, _, cx| this.tracker_drill_into(sub_number, cx)))
+            row = row.child(dispatch_icon(sub_number, &group, selected, cx));
+            if !editing_title {
+                row = row
+                    .on_click(cx.listener(move |this, _, _, cx| this.tracker_drill_into(sub_number, cx)));
             }
+            row.context_menu(dispatch_menu(sub_number, cx))
         }));
 
         let adding = matches!(self.tracker.composer_mode, Some(ComposerMode::NewIssue { parent: Some(p) }) if p == number);

@@ -16,10 +16,10 @@ use crate::{
     GoToDefinition, GoToTop, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
     ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, TrackerBack,
-    TrackerClosePanel, TrackerCycleAssignee, TrackerDown, TrackerFocusFilter, TrackerNewIssue,
-    TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow, TrackerPanelEditTitle,
-    TrackerPanelSpace, TrackerSetFlight, TrackerSetHidden, TrackerSetReview, TrackerUp, ZoomIn,
-    ZoomOut, ZoomReset, MONO,
+    TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
+    TrackerNewIssue, TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow,
+    TrackerPanelEditTitle, TrackerPanelSpace, TrackerSetFlight, TrackerSetHidden,
+    TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
 };
 use gpui::{
     div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
@@ -265,6 +265,7 @@ impl ReviewApp {
             return;
         }
         self.top_view = view;
+        self.tracker.dispatch = None;
         if view == TopView::Tracker && !self.tracker.loaded && !self.tracker.loading {
             self.tracker_load(cx);
         }
@@ -544,6 +545,7 @@ impl ReviewApp {
                 .child(hint(&["/"], "filter"))
                 .child(hint(&["a"], "assignee"))
                 .child(hint(&["o"], "github"))
+                .child(hint(&["cmd-d"], "dispatch"))
                 .child(hint(&["cmd-k"], "palette")),
         }
     }
@@ -651,6 +653,9 @@ impl Render for ReviewApp {
             }))
             .on_action(cx.listener(|this, _: &TrackerPanelAddRow, window, cx| {
                 this.tracker_panel_add_row(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TrackerDispatch, window, cx| {
+                this.tracker_dispatch_selected(window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
             .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
@@ -768,6 +773,12 @@ impl Render for ReviewApp {
             // The open input propagates Escape when it has nothing of its own
             // to dismiss: hand focus back to the diff.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                // The card owns escape while it is open: neither the inline
+                // composer nor the panel closes on the same keypress.
+                if this.tracker.dispatch.is_some() {
+                    this.tracker_close_dispatch(window, cx);
+                    return;
+                }
                 if this.tracker.composer_mode.is_some() {
                     this.tracker_close_composer(cx);
                 }
@@ -817,6 +828,9 @@ impl Render for ReviewApp {
             })
             .when(self.palette.is_some(), |root| {
                 root.child(self.render_palette(cx))
+            })
+            .when(self.tracker.dispatch.is_some(), |root| {
+                root.child(self.render_dispatch_card(cx))
             })
     }
 }

@@ -4,6 +4,7 @@
 //! the actions that mutate it.
 
 use crate::comments::{now_unix, parse_iso_utc};
+use crate::dispatch::{claude_dirs, skill_names, Agent, SkillProvider};
 use crate::items::Source;
 use crate::theme;
 use crate::urgency::{
@@ -15,8 +16,10 @@ use anyhow::{Context as _, Result};
 use gh::{IssueDetail, ProjectBoard, ProjectField, ProjectItem};
 use gpui::{prelude::*, AssetSource, Context, Entity, ScrollHandle, SharedString, Subscription, Window};
 use gpui_component::input::{InputEvent, InputState};
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 /// One project-board item, enriched with the issue detail and the
 /// precomputed urgency score.
@@ -48,6 +51,16 @@ pub(crate) enum ComposerMode {
     NewIssue { parent: Option<u64> },
     EditDescription,
     EditChildTitle(u64),
+}
+
+/// The floating "dispatch an agent" card. One at a time; opening it for
+/// another issue replaces the previous one.
+pub(crate) struct DispatchCard {
+    pub(crate) number: u64,
+    pub(crate) agent: Agent,
+    pub(crate) input: Entity<InputState>,
+    pub(crate) error: Option<SharedString>,
+    pub(crate) _subscription: Subscription,
 }
 
 pub(crate) struct TrackerState {
@@ -88,6 +101,7 @@ pub(crate) struct TrackerState {
     pub(crate) composer_mode: Option<ComposerMode>,
     pub(crate) composer_input: Option<Entity<InputState>>,
     pub(crate) composer_subscription: Option<Subscription>,
+    pub(crate) dispatch: Option<DispatchCard>,
 }
 
 fn status_opt(status: &str) -> Option<&str> {
@@ -168,6 +182,7 @@ impl TrackerState {
             composer_mode: None,
             composer_input: None,
             composer_subscription: None,
+            dispatch: None,
         };
         (state, subscriptions)
     }
@@ -746,6 +761,121 @@ impl ReviewApp {
         cx.open_url(&url);
     }
 
+    /// Title of `number`, whether it is a board item or only a sub-issue of
+    /// one (children are not necessarily on the project board themselves).
+    fn tracker_issue_title(&self, number: u64) -> Option<String> {
+        if let Some(item) = self.tracker.item(number) {
+            return Some(item.detail.title.clone());
+        }
+        self.tracker
+            .items
+            .iter()
+            .flat_map(|item| &item.detail.sub_issues)
+            .find(|sub| sub.number == number)
+            .map(|sub| sub.title.clone())
+    }
+
+    /// `⌘d`: dispatch for the open issue, else the focused row.
+    pub(crate) fn tracker_dispatch_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let child = if self.tracker.focus == FocusedColumn::Panel {
+            self.tracker_panel_children()
+                .get(self.tracker.panel_child_selected)
+                .map(|sub| sub.number)
+        } else {
+            None
+        };
+        let number = child
+            .or_else(|| self.tracker.open_issue())
+            .or_else(|| self.tracker_selected_number(cx));
+        if let Some(number) = number {
+            self.tracker_open_dispatch(number, window, cx);
+        }
+    }
+
+    pub(crate) fn tracker_open_dispatch(
+        &mut self,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(title) = self.tracker_issue_title(number) else {
+            return;
+        };
+        let seed = format!("Issue #{number}: {title}\n");
+        self.tracker_close_composer(cx);
+        let checkout = self
+            .tracker
+            .config
+            .dispatch_root
+            .as_ref()
+            .map(|root| root.join(&self.tracker.repo));
+        let names = skill_names(&claude_dirs(checkout.as_deref()));
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).auto_grow(3, 12).default_value(seed);
+            state.lsp.completion_provider = Some(Rc::new(SkillProvider { names }));
+            state
+        });
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::PressEnter { secondary: true } => {
+                        this.tracker_submit_dispatch(window, cx);
+                    }
+                    InputEvent::Change => {
+                        if let Some(card) = &mut this.tracker.dispatch {
+                            card.error = None;
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        input.update(cx, |state, cx| {
+            state.set_cursor_position(lsp_types::Position::new(1, 0), window, cx);
+        });
+        self.tracker.dispatch = Some(DispatchCard {
+            number,
+            agent: Agent::Claude,
+            input,
+            error: None,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn tracker_close_dispatch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tracker.dispatch = None;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    pub(crate) fn tracker_toggle_dispatch_agent(&mut self, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            card.agent = card.agent.toggled();
+            card.error = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn tracker_submit_dispatch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = &self.tracker.dispatch else {
+            return;
+        };
+        let Some(root) = self.tracker.config.dispatch_root.clone() else {
+            return;
+        };
+        let (agent, prompt) = (card.agent, card.input.read(cx).value().trim().to_string());
+        match crate::dispatch::dispatch(&root, &self.tracker.repo, agent, &prompt) {
+            Ok(()) => self.tracker_close_dispatch(window, cx),
+            Err(err) => {
+                if let Some(card) = &mut self.tracker.dispatch {
+                    card.error = Some(err.into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn tracker_close_composer(&mut self, cx: &mut Context<Self>) {
         self.tracker.composer_mode = None;
         self.tracker.composer_input = None;
@@ -1042,6 +1172,7 @@ const OCTICONS: &[(&str, &str)] = &[
     octicon!("plus-16"),
     octicon!("screen-full-16"),
     octicon!("tag-16"),
+    octicon!("terminal-16"),
     octicon!("x-16"),
 ];
 
@@ -1067,6 +1198,41 @@ impl AssetSource for TrackerAssets {
 /// One octicon, sized and coloured like the mockup's `.oi` glyphs.
 pub(crate) fn oi(name: &str, color: gpui::Rgba) -> gpui::AnyElement {
     oi_sized(name, color, 13.)
+}
+
+/// The per-row dispatch affordance: the terminal octicon, shown while the
+/// row is `visible` (hovered via `group`, or selected) and inert otherwise.
+pub(crate) fn dispatch_icon(
+    number: u64,
+    group: &SharedString,
+    visible: bool,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
+    gpui::div()
+        .id(SharedString::from(format!("dispatch-{group}")))
+        .cursor_pointer()
+        .opacity(if visible { 1. } else { 0. })
+        .group_hover(group.clone(), |style| style.opacity(1.))
+        .child(oi("terminal-16", theme::overlay0()))
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.tracker_open_dispatch(number, window, cx);
+        }))
+        .into_any_element()
+}
+
+/// Builder for the one-item right-click menu that dispatches `number`.
+pub(crate) fn dispatch_menu(
+    number: u64,
+    cx: &Context<ReviewApp>,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    let app = cx.entity().downgrade();
+    move |menu, _, _| {
+        let app = app.clone();
+        menu.item(PopupMenuItem::new("Dispatch").on_click(move |_, window, cx| {
+            let _ = app.update(cx, |this, cx| this.tracker_open_dispatch(number, window, cx));
+        }))
+    }
 }
 
 pub(crate) fn oi_sized(name: &str, color: gpui::Rgba, size: f32) -> gpui::AnyElement {

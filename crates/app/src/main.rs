@@ -4,6 +4,7 @@ mod chat;
 mod comments;
 mod composer;
 mod diff;
+mod dispatch;
 mod items;
 mod lsp;
 mod lsp_client;
@@ -99,7 +100,8 @@ actions!(
         TrackerClosePanel,
         TrackerPanelSpace,
         TrackerPanelEditTitle,
-        TrackerPanelAddRow
+        TrackerPanelAddRow,
+        TrackerDispatch
     ]
 );
 
@@ -213,6 +215,7 @@ fn main() {
                 KeyBinding::new("space", TrackerPanelSpace, Some("Tracker")),
                 KeyBinding::new("e", TrackerPanelEditTitle, Some("Tracker")),
                 KeyBinding::new("+", TrackerPanelAddRow, Some("Tracker")),
+                KeyBinding::new("cmd-d", TrackerDispatch, Some("Tracker")),
                 // Palette navigation. The `Palette > Input` variants are bound
                 // after gpui_component::init, so at the input's dispatch depth
                 // they take precedence over the Input's own up/down (which a
