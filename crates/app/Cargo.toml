@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 brokk-bifrost = "0.8.0"
 claude = { path = "../claude" }
+codex = { path = "../codex" }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
 git = { path = "../git" }
@@ -21,5 +22,6 @@ gpui-component-assets = "0.5"
 # Must match gpui-component's lsp-types so its CompletionProvider signatures line up.
 lsp-types = "0.97"
 fuzzy-matcher = "0.3"
+serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"

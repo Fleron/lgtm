@@ -50,6 +50,7 @@ Coming: LSP, AI inline review annotations
 ## Keymap
 | Key | Action |
 |---|---|
+| `cmd-1` / `cmd-2` | switch view: review / tracker |
 | `cmd-k` | open palette (GitHub PR picker / folder) |
 | `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
 | `ctrl-tab` | cycle open items |

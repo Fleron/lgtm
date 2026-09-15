@@ -40,6 +40,9 @@ pub fn mauve() -> Rgba {
 pub fn peach() -> Rgba {
     rgb(0xfab387)
 }
+pub fn yellow() -> Rgba {
+    rgb(0xf9e2af)
+}
 
 /// Override gpui-component's theme (dark mode, default shadcn palette) with
 /// Catppuccin Mocha. Call after `gpui_component::init`.
