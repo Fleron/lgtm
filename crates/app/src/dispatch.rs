@@ -87,7 +87,7 @@ pub(crate) fn dispatch(root: &Path, repo: &str, agent: Agent, prompt: &str) -> R
 
 /// Every `.claude` folder worth scanning for skills and commands: the user's
 /// own, then the checkout's if it exists.
-pub(crate) fn claude_dirs(checkout: Option<&Path>) -> Vec<PathBuf> {
+fn claude_dirs(checkout: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         dirs.push(PathBuf::from(home).join(".claude"));
@@ -98,26 +98,94 @@ pub(crate) fn claude_dirs(checkout: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
+/// Everything the card's `/` list offers: the user's own and the checkout's
+/// `.claude` folders, plus every user-scoped plugin, whose entries are
+/// namespaced `<plugin>:<name>`.
+pub(crate) fn completion_names(checkout: Option<&Path>) -> Vec<String> {
+    let plugins = std::env::var_os("HOME")
+        .map(|home| {
+            plugin_roots(
+                &PathBuf::from(home)
+                    .join(".claude")
+                    .join("plugins")
+                    .join("installed_plugins.json"),
+            )
+        })
+        .unwrap_or_default();
+    skill_names(&claude_dirs(checkout), &plugins)
+}
+
 /// Skill folder names (`skills/<name>/SKILL.md`) and command file stems
-/// (`commands/**/*.md`) across `dirs`, sorted and deduplicated.
-pub(crate) fn skill_names(dirs: &[PathBuf]) -> Vec<String> {
+/// (`commands/**/*.md`) across `dirs`, then the same under each plugin root
+/// prefixed with its plugin name, sorted and deduplicated.
+fn skill_names(dirs: &[PathBuf], plugins: &[(String, PathBuf)]) -> Vec<String> {
     let mut names = Vec::new();
     for dir in dirs {
-        if let Ok(entries) = std::fs::read_dir(dir.join("skills")) {
-            for entry in entries.flatten() {
-                if !entry.path().join("SKILL.md").is_file() {
-                    continue;
-                }
-                if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_string());
-                }
-            }
-        }
-        collect_command_stems(&dir.join("commands"), &mut names);
+        collect_names(dir, None, &mut names);
+    }
+    for (plugin, root) in plugins {
+        collect_names(root, Some(plugin), &mut names);
     }
     names.sort();
     names.dedup();
     names
+}
+
+/// The `skills/` and `commands/` pair under `root`, each name optionally
+/// namespaced as `<prefix>:<name>`.
+fn collect_names(root: &Path, prefix: Option<&str>, names: &mut Vec<String>) {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("skills")) {
+        for entry in entries.flatten() {
+            if !entry.path().join("SKILL.md").is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                found.push(name.to_string());
+            }
+        }
+    }
+    collect_command_stems(&root.join("commands"), &mut found);
+    match prefix {
+        Some(prefix) => names.extend(found.iter().map(|name| format!("{prefix}:{name}"))),
+        None => names.append(&mut found),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct InstalledPlugins {
+    #[serde(default)]
+    plugins: std::collections::BTreeMap<String, Vec<PluginInstall>>,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginInstall {
+    scope: String,
+    #[serde(rename = "installPath")]
+    install_path: PathBuf,
+}
+
+/// User-scoped plugins from the installed-plugins manifest, as (plugin name,
+/// install path). A missing or unparsable manifest contributes nothing.
+fn plugin_roots(manifest: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(json) = std::fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<InstalledPlugins>(&json) else {
+        return Vec::new();
+    };
+    parsed
+        .plugins
+        .into_iter()
+        .flat_map(|(key, installs)| {
+            // Manifest keys are "<plugin>@<marketplace>".
+            let plugin = key.split('@').next().unwrap_or(&key).to_string();
+            installs
+                .into_iter()
+                .filter(|install| install.scope == "user")
+                .map(move |install| (plugin.clone(), install.install_path))
+        })
+        .collect()
 }
 
 fn collect_command_stems(dir: &Path, names: &mut Vec<String>) {
@@ -260,7 +328,7 @@ mod tests {
 
         let dirs = vec![tmp.0.join("home/.claude"), tmp.0.join("repo/.claude")];
         assert_eq!(
-            skill_names(&dirs),
+            skill_names(&dirs, &[]),
             vec!["deep-review", "deploy", "local-only", "ship"]
         );
     }
@@ -268,7 +336,41 @@ mod tests {
     #[test]
     fn skill_names_ignores_missing_dirs() {
         let tmp = TempDir::new("missing");
-        assert!(skill_names(&[tmp.0.join("nope/.claude")]).is_empty());
+        assert!(skill_names(&[tmp.0.join("nope/.claude")], &[]).is_empty());
+    }
+
+    #[test]
+    fn plugin_names_are_namespaced_and_skip_project_scope() {
+        let tmp = TempDir::new("plugins");
+        tmp.write("flow/skills/feature-planning/SKILL.md");
+        tmp.write("flow/commands/ship-it.md");
+        tmp.write("local/skills/not-yours/SKILL.md");
+        let manifest = tmp.0.join("installed_plugins.json");
+        let json = format!(
+            r#"{{"version":2,"plugins":{{
+                "development-flow@official":[{{"scope":"user","installPath":"{flow}","version":"1"}}],
+                "local-only@official":[{{"scope":"project","installPath":"{local}"}}]
+            }}}}"#,
+            flow = tmp.0.join("flow").display(),
+            local = tmp.0.join("local").display(),
+        );
+        std::fs::write(&manifest, json).unwrap();
+
+        let roots = plugin_roots(&manifest);
+        assert_eq!(roots, vec![("development-flow".to_string(), tmp.0.join("flow"))]);
+        assert_eq!(
+            skill_names(&[], &roots),
+            vec!["development-flow:feature-planning", "development-flow:ship-it"]
+        );
+    }
+
+    #[test]
+    fn plugin_roots_tolerates_a_missing_or_broken_manifest() {
+        let tmp = TempDir::new("manifest");
+        assert!(plugin_roots(&tmp.0.join("absent.json")).is_empty());
+        let broken = tmp.0.join("broken.json");
+        std::fs::write(&broken, "{not json").unwrap();
+        assert!(plugin_roots(&broken).is_empty());
     }
 
     #[test]

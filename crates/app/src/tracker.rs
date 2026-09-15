@@ -4,7 +4,7 @@
 //! the actions that mutate it.
 
 use crate::comments::{now_unix, parse_iso_utc};
-use crate::dispatch::{claude_dirs, skill_names, Agent, SkillProvider};
+use crate::dispatch::{completion_names, Agent, SkillProvider};
 use crate::items::Source;
 use crate::theme;
 use crate::urgency::{
@@ -809,7 +809,7 @@ impl ReviewApp {
             .dispatch_root
             .as_ref()
             .map(|root| root.join(&self.tracker.repo));
-        let names = skill_names(&claude_dirs(checkout.as_deref()));
+        let names = completion_names(checkout.as_deref());
         let input = cx.new(|cx| {
             let mut state = InputState::new(window, cx).auto_grow(3, 12).default_value(seed);
             state.lsp.completion_provider = Some(Rc::new(SkillProvider { names }));
