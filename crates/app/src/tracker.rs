@@ -4,7 +4,7 @@
 //! the actions that mutate it.
 
 use crate::comments::{now_unix, parse_iso_utc};
-use crate::dispatch::{completion_names, Agent, SkillProvider};
+use crate::dispatch::{completion_names, ssh_hosts, Agent, SkillProvider, Target};
 use crate::items::Source;
 use crate::theme;
 use crate::urgency::{
@@ -19,6 +19,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// One project-board item, enriched with the issue detail and the
@@ -58,6 +59,9 @@ pub(crate) enum ComposerMode {
 pub(crate) struct DispatchCard {
     pub(crate) number: u64,
     pub(crate) agent: Agent,
+    pub(crate) target: Target,
+    /// ssh hosts offered by the target chip, read once when the card opened.
+    pub(crate) hosts: Vec<String>,
     pub(crate) input: Entity<InputState>,
     pub(crate) error: Option<SharedString>,
     pub(crate) _subscription: Subscription,
@@ -833,9 +837,17 @@ impl ReviewApp {
         input.update(cx, |state, cx| {
             state.set_cursor_position(lsp_types::Position::new(1, 0), window, cx);
         });
+        let hosts = std::env::var_os("HOME")
+            .and_then(|home| {
+                std::fs::read_to_string(PathBuf::from(home).join(".ssh").join("config")).ok()
+            })
+            .map(|config| ssh_hosts(&config))
+            .unwrap_or_default();
         self.tracker.dispatch = Some(DispatchCard {
             number,
             agent: Agent::Claude,
+            target: Target::Local,
+            hosts,
             input,
             error: None,
             _subscription: subscription,
@@ -857,15 +869,47 @@ impl ReviewApp {
         }
     }
 
+    pub(crate) fn tracker_set_dispatch_target(&mut self, target: Target, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            card.target = target;
+            card.error = None;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn tracker_submit_dispatch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(card) = &self.tracker.dispatch else {
             return;
         };
-        let Some(root) = self.tracker.config.dispatch_root.clone() else {
-            return;
+        let (agent, number, target) = (card.agent, card.number, card.target.clone());
+        let prompt = card.input.read(cx).value().trim().to_string();
+        let repo = self.tracker.repo.clone();
+        let result = match &target {
+            Target::Local => {
+                let Some(root) = self.tracker.config.dispatch_root.clone() else {
+                    return;
+                };
+                crate::dispatch::dispatch(&root, &repo, agent, &prompt)
+            }
+            Target::Remote(host) => {
+                let root = self
+                    .tracker
+                    .config
+                    .dispatch_remote_roots
+                    .as_ref()
+                    .and_then(|roots| roots.get(host))
+                    .cloned();
+                crate::dispatch::dispatch_remote(
+                    host,
+                    root.as_deref(),
+                    &repo,
+                    number,
+                    agent,
+                    &prompt,
+                )
+            }
         };
-        let (agent, prompt) = (card.agent, card.input.read(cx).value().trim().to_string());
-        match crate::dispatch::dispatch(&root, &self.tracker.repo, agent, &prompt) {
+        match result {
             Ok(()) => self.tracker_close_dispatch(window, cx),
             Err(err) => {
                 if let Some(card) = &mut self.tracker.dispatch {

@@ -24,4 +24,5 @@ lsp-types = "0.97"
 fuzzy-matcher = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = "0.22.1"
 libc = "0.2"

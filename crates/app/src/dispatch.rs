@@ -44,6 +44,126 @@ impl Agent {
     }
 }
 
+/// Where a dispatch runs: this machine, or a tmux session on an ssh host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    Local,
+    Remote(String),
+}
+
+impl Target {
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Target::Local => "Local",
+            Target::Remote(host) => host,
+        }
+    }
+}
+
+/// Host names from an `~/.ssh/config`, in file order, skipping patterns and
+/// duplicates. `Include` directives are not followed.
+pub(crate) fn ssh_hosts(config: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for line in config.lines() {
+        let Some((key, rest)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("Host") {
+            continue;
+        }
+        for name in rest.split_whitespace() {
+            if name.contains(['*', '?', '!']) || hosts.iter().any(|h| h == name) {
+                continue;
+            }
+            hosts.push(name.to_string());
+        }
+    }
+    hosts
+}
+
+/// Rejects anything that could carry shell metacharacters into the remote
+/// script, which interpolates these two values unquoted in places.
+fn shell_safe(value: &str, what: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("empty {what}"));
+    }
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Ok(());
+    }
+    Err(format!("{what} {value:?} is not a plain name"))
+}
+
+/// Arguments to `ssh` that start `agent` in a tmux window on `host`, in the
+/// checkout for `repo`. A `root_override` is the only candidate tried, so a
+/// wrong one fails with the exit-3 message instead of silently searching
+/// elsewhere. The prompt travels base64-encoded and is decoded by the shell
+/// tmux spawns, so no quoting of it survives into the script.
+pub(crate) fn remote_args(
+    host: &str,
+    root_override: Option<&Path>,
+    repo: &str,
+    number: u64,
+    agent: Agent,
+    prompt: &str,
+) -> Result<Vec<String>, String> {
+    shell_safe(host, "host")?;
+    shell_safe(repo, "repo")?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, prompt);
+    let candidates = match root_override {
+        Some(root) => {
+            let root = root.display().to_string().replace('\'', r"'\''");
+            format!("'{root}/{repo}'")
+        }
+        None => format!("\"$HOME/{repo}\" \"$HOME\"/*/{repo}"),
+    };
+    let agent = agent.bin();
+    let script = format!(
+        "d=\"\"; for c in {candidates}; \
+         do [ -d \"$c\" ] && d=\"$c\" && break; done; \
+         [ -z \"$d\" ] && {{ echo \"no checkout for {repo} under ~ on {host}\" >&2; exit 3; }}; \
+         cmd=\"bash -lc '{agent} \\\"\\$(printf %s {b64} | base64 -d)\\\"'\"; \
+         tmux has-session -t {agent} 2>/dev/null \
+         && exec tmux new-window -t {agent}: -c \"$d\" -n '#{number}' \"$cmd\" \
+         || exec tmux new-session -d -s {agent} -c \"$d\" -n '#{number}' \"$cmd\""
+    );
+    Ok(vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        host.to_string(),
+        script,
+    ])
+}
+
+/// Run `agent` against `prompt` in a tmux window on `host`. Returns the
+/// remote stderr to show under the input when nothing started.
+pub(crate) fn dispatch_remote(
+    host: &str,
+    root_override: Option<&Path>,
+    repo: &str,
+    number: u64,
+    agent: Agent,
+    prompt: &str,
+) -> Result<(), String> {
+    let args = remote_args(host, root_override, repo, number, agent, prompt)?;
+    let out = std::process::Command::new("ssh")
+        .args(args)
+        .output()
+        .map_err(|err| format!("could not run ssh: {err}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.is_empty() {
+        return Err(format!("ssh failed ({})", out.status));
+    }
+    Err(stderr)
+}
+
 /// `<root>/<repo>`, or why it can't be used as a working directory.
 pub(crate) fn checkout_dir(root: &Path, repo: &str) -> Result<PathBuf, String> {
     let dir = root.join(repo);
@@ -418,6 +538,78 @@ mod tests {
         std::fs::create_dir_all(tmp.0.join("lgtm")).unwrap();
         assert_eq!(checkout_dir(&tmp.0, "lgtm"), Ok(tmp.0.join("lgtm")));
         assert!(checkout_dir(&tmp.0, "absent").is_err());
+    }
+
+    #[test]
+    fn ssh_hosts_reads_host_lines_only() {
+        let config = "\
+Host devbox
+  HostName 10.0.0.4
+  User efleron
+
+Host a b
+\tHost indented
+Host *
+Host bad?name !nope
+Host devbox
+";
+        assert_eq!(ssh_hosts(config), vec!["devbox", "a", "b", "indented"]);
+        assert!(ssh_hosts("").is_empty());
+    }
+
+    #[test]
+    fn remote_args_pin_the_exact_ssh_invocation() {
+        let prompt = "Issue #7: \"quote\" $HOME `tick`\n/deep-review";
+        let args = remote_args("devbox", None, "lgtm", 7, Agent::Claude, prompt).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "devbox",
+                concat!(
+                    r#"d=""; for c in "$HOME/lgtm" "$HOME"/*/lgtm; "#,
+                    r#"do [ -d "$c" ] && d="$c" && break; done; "#,
+                    r#"[ -z "$d" ] && { echo "no checkout for lgtm under ~ on devbox" >&2; exit 3; }; "#,
+                    r#"cmd="bash -lc 'claude \"\$(printf %s "#,
+                    "SXNzdWUgIzc6ICJxdW90ZSIgJEhPTUUgYHRpY2tgCi9kZWVwLXJldmlldw==",
+                    r#" | base64 -d)\"'"; "#,
+                    r#"tmux has-session -t claude 2>/dev/null "#,
+                    r#"&& exec tmux new-window -t claude: -c "$d" -n '#7' "$cmd" "#,
+                    r#"|| exec tmux new-session -d -s claude -c "$d" -n '#7' "$cmd""#,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_args_use_a_configured_root_and_reject_odd_names() {
+        let args =
+            remote_args("box", Some(Path::new("/home/me/leap")), "lgtm", 1, Agent::Codex, "hi")
+                .unwrap();
+        // A configured root replaces the `~` search entirely.
+        assert!(args[5].starts_with(r#"d=""; for c in '/home/me/leap/lgtm'; do"#));
+        assert!(!args[5].contains("$HOME"));
+        assert!(args[5].contains("bash -lc 'codex "));
+        // A configured root is the user's own, but it still must not be able
+        // to break out of the quoting.
+        let odd = remote_args(
+            "box",
+            Some(Path::new("/it's $HOME/`x`/\"q\"")),
+            "lgtm",
+            1,
+            Agent::Claude,
+            "x",
+        )
+        .unwrap();
+        assert!(odd[5].starts_with(
+            "d=\"\"; for c in '/it'\\''s $HOME/`x`/\"q\"/lgtm'; do [ -d \"$c\" ]"
+        ));
+        assert!(remote_args("box", None, "a;rm -rf /", 1, Agent::Claude, "x").is_err());
+        assert!(remote_args("a b", None, "lgtm", 1, Agent::Claude, "x").is_err());
+        assert!(remote_args("box", None, "", 1, Agent::Claude, "x").is_err());
     }
 
     #[test]

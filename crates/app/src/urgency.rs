@@ -94,6 +94,10 @@ pub(crate) struct TrackerConfig {
     /// it is never written back into a config that doesn't already set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) dispatch_root: Option<PathBuf>,
+    /// Per-host folder holding the remote checkouts; without an entry for a
+    /// host the remote script searches `~/<repo>` and `~/*/<repo>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dispatch_remote_roots: Option<BTreeMap<String, PathBuf>>,
 }
 
 impl TrackerConfig {
@@ -118,6 +122,7 @@ impl TrackerConfig {
             assignee_filter: AssigneeFilter::Me,
             type_colors: default_type_colors(),
             dispatch_root: None,
+            dispatch_remote_roots: None,
         }
     }
 

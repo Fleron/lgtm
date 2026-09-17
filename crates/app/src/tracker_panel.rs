@@ -3,16 +3,17 @@
 //! comment box. Sidebar/main-pane tables live in `tracker_table.rs`.
 
 use crate::comments::short_age;
+use crate::dispatch::Target;
 use crate::tracker::{
     dispatch_icon, dispatch_menu, oi, sub_issue_icon, tint, type_icon, ComposerMode, FocusedColumn,
 };
 use crate::tracker_table::label_pill;
 use crate::urgency::{due_countdown, Priority};
 use crate::{centered_message, theme, ReviewApp};
-use gpui::{div, prelude::*, px, Context, MouseButton, SharedString};
+use gpui::{div, prelude::*, px, Context, Focusable as _, MouseButton, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::ContextMenuExt as _;
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Disableable as _, Sizable as _};
 
 impl ReviewApp {
@@ -235,8 +236,8 @@ impl ReviewApp {
             .into_any_element()
     }
 
-    /// The card's top row: the terminal glyph, the agent chip and the issue
-    /// number.
+    /// The card's top row: the terminal glyph, the agent chip, the target
+    /// chip (hidden when no ssh hosts were found) and the issue number.
     fn render_dispatch_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(card) = &self.tracker.dispatch else {
             return div().into_any_element();
@@ -261,6 +262,45 @@ impl ReviewApp {
                         this.tracker_toggle_dispatch_agent(cx);
                     })),
             )
+            .when(!card.hosts.is_empty(), |row| {
+                let hosts = card.hosts.clone();
+                let app = cx.entity().downgrade();
+                // PopupMenu only restores focus on dismiss when it has an
+                // action context, and without it cmd-enter stops reaching
+                // the input after a pick.
+                let input = card.input.focus_handle(cx);
+                row.child(
+                    Button::new("dispatch-target")
+                        .label(SharedString::from(card.target.label().to_string()))
+                        .ghost()
+                        .px_2()
+                        .py_0p5()
+                        .h_auto()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme::surface0())
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .dropdown_menu(move |mut menu, _, _| {
+                            menu = menu.action_context(input.clone());
+                            for target in std::iter::once(Target::Local)
+                                .chain(hosts.iter().cloned().map(Target::Remote))
+                            {
+                                let app = app.clone();
+                                let label = target.label().to_string();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let target = target.clone();
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.tracker_set_dispatch_target(target, cx);
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -277,7 +317,8 @@ impl ReviewApp {
         let Some(card) = &self.tracker.dispatch else {
             return div().into_any_element();
         };
-        let has_root = self.tracker.config.dispatch_root.is_some();
+        let needs_root = card.target == Target::Local
+            && self.tracker.config.dispatch_root.is_none();
         div()
             .absolute()
             .inset_0()
@@ -317,7 +358,7 @@ impl ReviewApp {
                     .text_size(px(12.))
                     .child(self.render_dispatch_header(cx))
                     .child(Input::new(&card.input))
-                    .when(!has_root, |body| {
+                    .when(needs_root, |body| {
                         body.child(
                             div()
                                 .text_color(theme::overlay0())
@@ -344,7 +385,7 @@ impl ReviewApp {
                                     .label("Dispatch")
                                     .primary()
                                     .small()
-                                    .disabled(!has_root)
+                                    .disabled(needs_root)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.tracker_submit_dispatch(window, cx);
                                     })),
