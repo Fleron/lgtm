@@ -293,14 +293,7 @@ impl ReviewApp {
         self.tracker.error = None;
         self.tracker.gen += 1;
         let gen = self.tracker.gen;
-        let queue_pick = self
-            .tracker_queue_rows_flat(cx)
-            .get(self.tracker.queue_selected)
-            .copied();
-        let flight_pick = self
-            .tracker_flight_rows_flat(cx)
-            .get(self.tracker.flight_selected)
-            .copied();
+        let picks = self.tracker_selection_numbers(cx);
         let owner_bg = owner.clone();
         let repo_bg = repo.clone();
         cx.spawn(async move |this, cx| {
@@ -333,13 +326,10 @@ impl ReviewApp {
                         app.tracker.due_field_id = loaded.due_field_id;
                         app.tracker.items = loaded.items;
                         app.tracker.panel_fetch.clear();
+                        app.tracker.queue_selected = 0;
+                        app.tracker.flight_selected = 0;
                         app.recompute_tracker_urgency();
-                        app.tracker.queue_selected = queue_pick
-                            .and_then(|n| app.tracker_queue_rows_flat(cx).iter().position(|r| *r == n))
-                            .unwrap_or(0);
-                        app.tracker.flight_selected = flight_pick
-                            .and_then(|n| app.tracker_flight_rows_flat(cx).iter().position(|r| *r == n))
-                            .unwrap_or(0);
+                        app.tracker_restore_selection(picks, cx);
                         app.tracker_load_details(gen, cx);
                     }
                     Err(err) => {
@@ -351,6 +341,26 @@ impl ReviewApp {
             .ok();
         })
         .detach();
+    }
+
+    /// The issue numbers the two columns currently point at. Indices shift
+    /// whenever the rows are re-sorted, so a re-sort captures these first
+    /// and restores them afterwards.
+    fn tracker_selection_numbers(&self, cx: &Context<Self>) -> (Option<u64>, Option<u64>) {
+        (
+            self.tracker_queue_rows_flat(cx).get(self.tracker.queue_selected).copied(),
+            self.tracker_flight_rows_flat(cx).get(self.tracker.flight_selected).copied(),
+        )
+    }
+
+    fn tracker_restore_selection(&mut self, picks: (Option<u64>, Option<u64>), cx: &Context<Self>) {
+        let (queue, flight) = picks;
+        self.tracker.queue_selected = queue
+            .and_then(|n| self.tracker_queue_rows_flat(cx).iter().position(|r| *r == n))
+            .unwrap_or(self.tracker.queue_selected);
+        self.tracker.flight_selected = flight
+            .and_then(|n| self.tracker_flight_rows_flat(cx).iter().position(|r| *r == n))
+            .unwrap_or(self.tracker.flight_selected);
     }
 
     /// Phase two of a load: fetch issue details in batches and merge each
@@ -373,12 +383,14 @@ impl ReviewApp {
                         }
                         match result {
                             Ok(details) => {
+                                let picks = app.tracker_selection_numbers(cx);
                                 for (number, detail) in details {
                                     if let Some(item) = app.tracker.items.iter_mut().find(|it| it.number == number) {
                                         item.detail = detail;
                                     }
                                 }
                                 app.recompute_tracker_urgency();
+                                app.tracker_restore_selection(picks, cx);
                             }
                             Err(err) => {
                                 app.tracker.error = Some(format!("issue details failed: {err:#}").into());
@@ -816,6 +828,7 @@ impl ReviewApp {
                 .await;
             this.update(cx, |app, cx| {
                 if app.tracker.gen != gen {
+                    app.tracker.panel_fetch.remove(&number);
                     return;
                 }
                 match result {
@@ -953,8 +966,18 @@ impl ReviewApp {
     pub(crate) fn tracker_toggle_dispatch_agent(&mut self, cx: &mut Context<Self>) {
         if let Some(card) = &mut self.tracker.dispatch {
             card.agent = card.agent.toggled();
+            card.target_menu_open = false;
             card.error = None;
             cx.notify();
+        }
+    }
+
+    pub(crate) fn tracker_close_dispatch_target_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            if card.target_menu_open {
+                card.target_menu_open = false;
+                cx.notify();
+            }
         }
     }
 
@@ -1161,6 +1184,9 @@ pub(crate) fn milestone_summary(items: &[TrackerItem]) -> Vec<(String, u32, u32)
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::BTreeMap<String, (u32, u32)> = std::collections::BTreeMap::new();
     for item in items {
+        if item.project_item_id.is_empty() {
+            continue;
+        }
         let Some(milestone) = &item.detail.milestone else {
             continue;
         };
@@ -1229,7 +1255,10 @@ pub(crate) fn sub_issue_icon(
     if sub.state.eq_ignore_ascii_case("closed") {
         return ("issue-closed-16", theme::mauve());
     }
-    match items.iter().find(|it| it.number == sub.number) {
+    match items
+        .iter()
+        .find(|it| it.number == sub.number && !it.project_item_id.is_empty())
+    {
         Some(it) => match it.column(config) {
             Column::Queue if !it.status.is_empty() && it.status != "Ready" => {
                 ("issue-draft-16", theme::overlay0())
@@ -1421,6 +1450,26 @@ mod tests {
         let queue = queue_ready_rows(&items, &config(), &BTreeSet::new(), "");
         assert_eq!(queue.iter().map(|it| it.number).collect::<Vec<_>>(), vec![1]);
         assert!(flight_groups(&items, &config(), None, &BTreeSet::new(), "").is_empty());
+
+        // Hidden is the column of an off-board item, but its row must still
+        // read as open rather than borrowing Hidden's closed glyph.
+        let sub = gh::SubIssue {
+            number: 9,
+            title: "fetched".into(),
+            state: "OPEN".into(),
+        };
+        assert_eq!(sub_issue_icon(&sub, &items, &config()).0, "issue-opened-16");
+        let closed = gh::SubIssue { state: "CLOSED".into(), ..sub.clone() };
+        assert_eq!(sub_issue_icon(&closed, &items, &config()).0, "issue-closed-16");
+
+        // A milestone on an off-board item must not create a phantom row.
+        let mut with_milestone = item(9, "", 5.0);
+        with_milestone.project_item_id = String::new();
+        with_milestone.detail.milestone = Some(gh::IssueMilestone {
+            title: "v1".into(),
+            due_on: None,
+        });
+        assert!(milestone_summary(&[with_milestone]).is_empty());
     }
 
     #[test]

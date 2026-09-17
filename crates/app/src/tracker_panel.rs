@@ -372,7 +372,13 @@ impl ReviewApp {
             .child(
                 div()
                     .w(px(560.))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.tracker_close_dispatch_target_menu(cx);
+                        }),
+                    )
                     .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .rounded_lg()
                     .border_1()
