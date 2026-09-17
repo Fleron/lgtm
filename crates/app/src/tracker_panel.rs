@@ -21,8 +21,10 @@ impl ReviewApp {
         let Some(number) = self.tracker.open_issue() else {
             return div().into_any_element();
         };
+        self.tracker_ensure_item_loaded(number, cx);
         let Some(item) = self.tracker.item(number) else {
-            return centered_message(format!("#{number} not found").into(), theme::overlay0());
+            let (message, color) = self.tracker_panel_placeholder(number);
+            return centered_message(message, color);
         };
         let parent_crumb = item.detail.parent.clone();
         let is_sub_issue = self.tracker.panel_stack.len() > 1 || parent_crumb.is_some();
@@ -880,7 +882,8 @@ impl ReviewApp {
                 })
                 .await;
             this.update(cx, |app, cx| match result {
-                Ok(_) => {
+                Ok(number) => {
+                    app.tracker_ensure_item_loaded(number, cx);
                     app.tracker_refresh_issue(parent, cx);
                 }
                 Err(err) => {

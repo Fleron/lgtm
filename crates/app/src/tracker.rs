@@ -18,7 +18,7 @@ use gpui::{prelude::*, AssetSource, Context, Entity, ScrollHandle, SharedString,
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -107,6 +107,9 @@ pub(crate) struct TrackerState {
     pub(crate) composer_input: Option<Entity<InputState>>,
     pub(crate) composer_subscription: Option<Subscription>,
     pub(crate) dispatch: Option<DispatchCard>,
+    /// Issues the panel is fetching outside the board: `None` while in
+    /// flight, `Some(message)` once it failed. Cleared by a board load.
+    pub(crate) panel_fetch: BTreeMap<u64, Option<SharedString>>,
 }
 
 fn status_opt(status: &str) -> Option<&str> {
@@ -128,6 +131,11 @@ fn parse_priority(raw: &str) -> Option<Priority> {
 
 impl TrackerItem {
     pub(crate) fn column(&self, config: &TrackerConfig) -> Column {
+        // Fetched on demand for the panel rather than read off the board, so
+        // it has no project item and belongs in neither column.
+        if self.project_item_id.is_empty() {
+            return Column::Hidden;
+        }
         config.column_for(status_opt(&self.status))
     }
 
@@ -188,6 +196,7 @@ impl TrackerState {
             composer_input: None,
             composer_subscription: None,
             dispatch: None,
+            panel_fetch: BTreeMap::new(),
         };
         (state, subscriptions)
     }
@@ -323,6 +332,7 @@ impl ReviewApp {
                         app.tracker.priority_field_id = loaded.priority_field_id;
                         app.tracker.due_field_id = loaded.due_field_id;
                         app.tracker.items = loaded.items;
+                        app.tracker.panel_fetch.clear();
                         app.recompute_tracker_urgency();
                         app.tracker.queue_selected = queue_pick
                             .and_then(|n| app.tracker_queue_rows_flat(cx).iter().position(|r| *r == n))
@@ -733,6 +743,11 @@ impl ReviewApp {
         let Some(option) = status_field.options.iter().find(|o| o.name == new_status).cloned() else {
             return;
         };
+        if self.tracker.item(number).is_some_and(|it| it.project_item_id.is_empty()) {
+            self.tracker.error = Some(format!("#{number} is not on the project board").into());
+            cx.notify();
+            return;
+        }
         let Some(item) = self.tracker.items.iter_mut().find(|it| it.number == number) else {
             return;
         };
@@ -779,6 +794,63 @@ impl ReviewApp {
             None => return,
         };
         cx.open_url(&url);
+    }
+
+    /// Fetch `number`'s detail on demand when it isn't a board item, so the
+    /// panel can open a sub-issue that was never added to the project. Safe
+    /// to call on every render: it returns once the item exists, a fetch is
+    /// in flight, or one already failed.
+    pub(crate) fn tracker_ensure_item_loaded(&mut self, number: u64, cx: &mut Context<Self>) {
+        if self.tracker.item(number).is_some() || self.tracker.panel_fetch.contains_key(&number) {
+            return;
+        }
+        let (owner, repo) = (self.tracker.owner.clone(), self.tracker.repo.clone());
+        if owner.is_empty() || repo.is_empty() {
+            return;
+        }
+        self.tracker.panel_fetch.insert(number, None);
+        let gen = self.tracker.gen;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { gh::issue_detail(&owner, &repo, number) })
+                .await;
+            this.update(cx, |app, cx| {
+                if app.tracker.gen != gen {
+                    return;
+                }
+                match result {
+                    Ok(detail) => {
+                        app.tracker.panel_fetch.remove(&number);
+                        app.tracker.items.push(TrackerItem {
+                            project_item_id: String::new(),
+                            number,
+                            status: String::new(),
+                            due: None,
+                            priority: None,
+                            detail,
+                            urgency: 0.0,
+                        });
+                        app.recompute_tracker_urgency();
+                    }
+                    Err(err) => {
+                        app.tracker
+                            .panel_fetch
+                            .insert(number, Some(format!("#{number} not found: {err:#}").into()));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the panel should show while `number` has no item yet.
+    pub(crate) fn tracker_panel_placeholder(&self, number: u64) -> (SharedString, gpui::Rgba) {
+        match self.tracker.panel_fetch.get(&number) {
+            Some(Some(err)) => (err.clone(), theme::red()),
+            _ => (format!("loading #{number}…").into(), theme::overlay0()),
+        }
     }
 
     /// Title of `number`, whether it is a board item or only a sub-issue of
@@ -1334,6 +1406,21 @@ mod tests {
 
     fn config() -> TrackerConfig {
         TrackerConfig::seed(&["Backlog".into(), "Todo".into(), "Ready".into(), "Doing".into(), "Done".into()])
+    }
+
+    #[test]
+    fn an_off_board_item_lands_in_neither_column() {
+        let mut fetched = item(9, "", 5.0);
+        fetched.project_item_id = String::new();
+        assert_eq!(fetched.column(&config()), Column::Hidden);
+        // An empty status would otherwise put it in the queue.
+        let on_board = item(9, "", 5.0);
+        assert_eq!(on_board.column(&config()), Column::Queue);
+
+        let items = vec![fetched, item(1, "Ready", 1.0)];
+        let queue = queue_ready_rows(&items, &config(), &BTreeSet::new(), "");
+        assert_eq!(queue.iter().map(|it| it.number).collect::<Vec<_>>(), vec![1]);
+        assert!(flight_groups(&items, &config(), None, &BTreeSet::new(), "").is_empty());
     }
 
     #[test]
