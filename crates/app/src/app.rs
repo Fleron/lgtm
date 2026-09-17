@@ -17,6 +17,7 @@ use crate::{
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
     ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
+    TrackerRefresh,
     TrackerNewIssue, TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow,
     TrackerPanelEditTitle, TrackerPanelSpace, TrackerSetFlight, TrackerSetHidden,
     TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
@@ -546,6 +547,7 @@ impl ReviewApp {
                 .child(hint(&["a"], "assignee"))
                 .child(hint(&["o"], "github"))
                 .child(hint(&["cmd-d"], "dispatch"))
+                .child(hint(&["cmd-r"], "refresh"))
                 .child(hint(&["cmd-k"], "palette")),
         }
     }
@@ -657,6 +659,7 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &TrackerDispatch, window, cx| {
                 this.tracker_dispatch_selected(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &TrackerRefresh, _, cx| this.tracker_load(cx)))
             .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
             .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
             .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))

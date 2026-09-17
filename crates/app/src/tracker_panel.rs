@@ -10,10 +10,10 @@ use crate::tracker::{
 use crate::tracker_table::label_pill;
 use crate::urgency::{due_countdown, Priority};
 use crate::{centered_message, theme, ReviewApp};
-use gpui::{div, prelude::*, px, Context, Focusable as _, MouseButton, SharedString};
+use gpui::{div, prelude::*, px, Context, MouseButton, SharedString};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{Disableable as _, Sizable as _};
 
 impl ReviewApp {
@@ -263,43 +263,7 @@ impl ReviewApp {
                     })),
             )
             .when(!card.hosts.is_empty(), |row| {
-                let hosts = card.hosts.clone();
-                let app = cx.entity().downgrade();
-                // PopupMenu only restores focus on dismiss when it has an
-                // action context, and without it cmd-enter stops reaching
-                // the input after a pick.
-                let input = card.input.focus_handle(cx);
-                row.child(
-                    Button::new("dispatch-target")
-                        .label(SharedString::from(card.target.label().to_string()))
-                        .ghost()
-                        .px_2()
-                        .py_0p5()
-                        .h_auto()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme::surface0())
-                        .text_size(px(12.))
-                        .cursor_pointer()
-                        .dropdown_menu(move |mut menu, _, _| {
-                            menu = menu.action_context(input.clone());
-                            for target in std::iter::once(Target::Local)
-                                .chain(hosts.iter().cloned().map(Target::Remote))
-                            {
-                                let app = app.clone();
-                                let label = target.label().to_string();
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, _, cx| {
-                                        let target = target.clone();
-                                        let _ = app.update(cx, |this, cx| {
-                                            this.tracker_set_dispatch_target(target, cx);
-                                        });
-                                    },
-                                ));
-                            }
-                            menu
-                        }),
-                )
+                row.child(self.render_dispatch_target_chip(cx))
             })
             .child(
                 div()
@@ -308,6 +272,68 @@ impl ReviewApp {
                     .truncate()
                     .child(SharedString::from(format!("#{}", card.number))),
             )
+            .into_any_element()
+    }
+
+    /// The target chip: the agent chip's own markup, so the two match, over
+    /// a click-toggled list of "Local" plus every discovered ssh host. The
+    /// list is deferred so it paints above the input below it.
+    fn render_dispatch_target_chip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(card) = &self.tracker.dispatch else {
+            return div().into_any_element();
+        };
+        let chip = div()
+            .id("dispatch-target")
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme::surface0())
+            .cursor_pointer()
+            .child(SharedString::from(card.target.label().to_string()))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.tracker_toggle_dispatch_target_menu(cx);
+            }));
+        if !card.target_menu_open {
+            return div().child(chip).into_any_element();
+        }
+        let current = card.target.clone();
+        let targets: Vec<Target> = std::iter::once(Target::Local)
+            .chain(card.hosts.iter().cloned().map(Target::Remote))
+            .collect();
+        let menu = div()
+            .absolute()
+            .top_full()
+            .left_0()
+            .mt_1()
+            .flex()
+            .flex_col()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::surface0())
+            .bg(theme::mantle())
+            .occlude()
+            .children(targets.into_iter().map(|target| {
+                let on = target == current;
+                let label = target.label().to_string();
+                div()
+                    .id(SharedString::from(format!("dispatch-target-{label}")))
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(theme::surface0()).text_color(theme::text()))
+                    .when(!on, |d| d.text_color(theme::subtext()))
+                    .child(SharedString::from(label))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tracker_set_dispatch_target(target.clone(), cx);
+                    }))
+            }));
+        div()
+            .relative()
+            .child(chip)
+            .child(gpui::deferred(menu))
             .into_any_element()
     }
 

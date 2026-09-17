@@ -101,7 +101,8 @@ actions!(
         TrackerPanelSpace,
         TrackerPanelEditTitle,
         TrackerPanelAddRow,
-        TrackerDispatch
+        TrackerDispatch,
+        TrackerRefresh
     ]
 );
 
@@ -216,6 +217,7 @@ fn main() {
                 KeyBinding::new("e", TrackerPanelEditTitle, Some("Tracker")),
                 KeyBinding::new("+", TrackerPanelAddRow, Some("Tracker")),
                 KeyBinding::new("cmd-d", TrackerDispatch, Some("Tracker")),
+                KeyBinding::new("cmd-r", TrackerRefresh, Some("Tracker")),
                 // Palette navigation. The `Palette > Input` variants are bound
                 // after gpui_component::init, so at the input's dispatch depth
                 // they take precedence over the Input's own up/down (which a

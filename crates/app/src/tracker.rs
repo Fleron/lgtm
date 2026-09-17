@@ -62,6 +62,7 @@ pub(crate) struct DispatchCard {
     pub(crate) target: Target,
     /// ssh hosts offered by the target chip, read once when the card opened.
     pub(crate) hosts: Vec<String>,
+    pub(crate) target_menu_open: bool,
     pub(crate) input: Entity<InputState>,
     pub(crate) error: Option<SharedString>,
     pub(crate) _subscription: Subscription,
@@ -270,6 +271,9 @@ impl ReviewApp {
     }
 
     pub(crate) fn tracker_load(&mut self, cx: &mut Context<Self>) {
+        if self.tracker.loading {
+            return;
+        }
         let Some((owner, repo)) = self.tracker_repo() else {
             self.tracker.loaded = true;
             self.tracker.error =
@@ -280,6 +284,14 @@ impl ReviewApp {
         self.tracker.error = None;
         self.tracker.gen += 1;
         let gen = self.tracker.gen;
+        let queue_pick = self
+            .tracker_queue_rows_flat(cx)
+            .get(self.tracker.queue_selected)
+            .copied();
+        let flight_pick = self
+            .tracker_flight_rows_flat(cx)
+            .get(self.tracker.flight_selected)
+            .copied();
         let owner_bg = owner.clone();
         let repo_bg = repo.clone();
         cx.spawn(async move |this, cx| {
@@ -311,9 +323,13 @@ impl ReviewApp {
                         app.tracker.priority_field_id = loaded.priority_field_id;
                         app.tracker.due_field_id = loaded.due_field_id;
                         app.tracker.items = loaded.items;
-                        app.tracker.queue_selected = 0;
-                        app.tracker.flight_selected = 0;
                         app.recompute_tracker_urgency();
+                        app.tracker.queue_selected = queue_pick
+                            .and_then(|n| app.tracker_queue_rows_flat(cx).iter().position(|r| *r == n))
+                            .unwrap_or(0);
+                        app.tracker.flight_selected = flight_pick
+                            .and_then(|n| app.tracker_flight_rows_flat(cx).iter().position(|r| *r == n))
+                            .unwrap_or(0);
                         app.tracker_load_details(gen, cx);
                     }
                     Err(err) => {
@@ -848,6 +864,7 @@ impl ReviewApp {
             agent: Agent::Claude,
             target: Target::Local,
             hosts,
+            target_menu_open: false,
             input,
             error: None,
             _subscription: subscription,
@@ -869,9 +886,17 @@ impl ReviewApp {
         }
     }
 
+    pub(crate) fn tracker_toggle_dispatch_target_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            card.target_menu_open = !card.target_menu_open;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn tracker_set_dispatch_target(&mut self, target: Target, cx: &mut Context<Self>) {
         if let Some(card) = &mut self.tracker.dispatch {
             card.target = target;
+            card.target_menu_open = false;
             card.error = None;
             cx.notify();
         }
@@ -1215,6 +1240,7 @@ const OCTICONS: &[(&str, &str)] = &[
     octicon!("person-16"),
     octicon!("plus-16"),
     octicon!("screen-full-16"),
+    octicon!("sync-16"),
     octicon!("tag-16"),
     octicon!("terminal-16"),
     octicon!("x-16"),

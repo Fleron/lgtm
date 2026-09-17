@@ -222,7 +222,23 @@ impl ReviewApp {
                             .child(SharedString::from(format!("ready {ready_count}"))),
                     ),
             )
-            .child(div().px_2().py_1().child(Input::new(&self.tracker.filter_input).small()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.tracker.filter_input).small()))
+                    .child(
+                        div()
+                            .id("tracker-refresh")
+                            .cursor_pointer()
+                            .when(self.tracker.loading, |d| d.opacity(0.4))
+                            .child(oi("sync-16", theme::overlay0()))
+                            .on_click(cx.listener(|this, _, _, cx| this.tracker_load(cx))),
+                    ),
+            )
             .when_some(new_issue_input, |d, input| {
                 d.child(
                     div()
