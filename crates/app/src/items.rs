@@ -43,6 +43,11 @@ pub(crate) struct ItemData {
     /// The raw unified patch this diff was parsed from, kept for chat
     /// context (capped at [`MAX_CHAT_PATCH_BYTES`] when sent).
     pub(crate) patch: String,
+    /// Top-level PR conversation comments, oldest first; empty for local
+    /// items. Rendered by the `cmd-g` panel.
+    pub(crate) pr_comments: Vec<gh::IssueComment>,
+    /// Submitted PR reviews (verdict + summary body); empty for local items.
+    pub(crate) pr_reviews: Vec<gh::PrReview>,
     /// Per-item chat transcript + session; survives refresh, dies with the
     /// item.
     pub(crate) chat: ChatState,
@@ -254,6 +259,8 @@ impl ReviewItem {
             mut hunk_rows,
             mode,
             comments,
+            pr_comments,
+            pr_reviews,
         } = loaded;
         let (additions, deletions) = diff
             .files
@@ -295,6 +302,8 @@ impl ReviewItem {
                 }
                 data.diff = diff;
                 data.patch = patch;
+                data.pr_comments = pr_comments;
+                data.pr_reviews = pr_reviews;
                 data.set_rows((rows, file_rows, hunk_rows));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
@@ -314,6 +323,8 @@ impl ReviewItem {
                     pr_meta,
                     diff,
                     patch,
+                    pr_comments,
+                    pr_reviews,
                     chat: ChatState::new(),
                     mode,
                     rows,
@@ -379,19 +390,30 @@ pub(crate) struct Loaded {
     pub(crate) mode: ViewMode,
     /// Some (possibly empty) for PR items, None for local ones.
     pub(crate) comments: Option<CommentIndex>,
+    /// Empty for local items.
+    pub(crate) pr_comments: Vec<gh::IssueComment>,
+    /// Empty for local items.
+    pub(crate) pr_reviews: Vec<gh::PrReview>,
 }
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
-/// PR items fetch meta, patch, and review comments concurrently.
+/// PR items fetch meta, patch, review comments, and the conversation
+/// (top-level comments + reviews) concurrently.
 pub(crate) fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
-    let (meta, patch, comments) = match source {
+    let (meta, patch, comments, pr_comments, pr_reviews) = match source {
         Source::Pr(loc) => {
             let meta_loc = loc.clone();
             let meta_thread = std::thread::spawn(move || gh::fetch_meta(&meta_loc));
             let comments_loc = loc.clone();
             let comments_thread =
                 std::thread::spawn(move || gh::fetch_review_comments(&comments_loc));
+            let pr_comments_loc = loc.clone();
+            let pr_comments_thread =
+                std::thread::spawn(move || gh::fetch_pr_comments(&pr_comments_loc));
+            let pr_reviews_loc = loc.clone();
+            let pr_reviews_thread =
+                std::thread::spawn(move || gh::fetch_pr_reviews(&pr_reviews_loc));
             let patch = gh::fetch_patch(loc)?;
             let meta = meta_thread
                 .join()
@@ -399,12 +421,24 @@ pub(crate) fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Load
             let comments = comments_thread
                 .join()
                 .map_err(|_| anyhow!("gh comments fetch panicked"))??;
-            (LoadedMeta::Pr(meta), patch, Some(group_comments(comments)))
+            let pr_comments = pr_comments_thread
+                .join()
+                .map_err(|_| anyhow!("gh PR comments fetch panicked"))??;
+            let pr_reviews = pr_reviews_thread
+                .join()
+                .map_err(|_| anyhow!("gh PR reviews fetch panicked"))??;
+            (
+                LoadedMeta::Pr(meta),
+                patch,
+                Some(group_comments(comments)),
+                pr_comments,
+                pr_reviews,
+            )
         }
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None)
+            (LoadedMeta::Local(src), patch, None, Vec::new(), Vec::new())
         }
     };
     let diff = diff_core::parse_patch(&patch);
@@ -419,6 +453,8 @@ pub(crate) fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Load
         hunk_rows,
         mode,
         comments,
+        pr_comments,
+        pr_reviews,
     })
 }
 

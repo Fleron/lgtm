@@ -21,8 +21,9 @@ use std::time::Duration;
 
 // --- Chat with Claude -------------------------------------------------------
 
-/// Width of the right-side chat panel.
-const CHAT_WIDTH: f32 = 380.0;
+/// Width of the right-side chat panel; the PR conversation panel shares the
+/// slot and the width.
+pub(crate) const CHAT_WIDTH: f32 = 380.0;
 /// The unified patch included in a session's first message is capped here.
 pub(crate) const MAX_CHAT_PATCH_BYTES: usize = 200 * 1024;
 /// Files above this size are skipped when materializing an exploration dir.
@@ -334,6 +335,8 @@ impl ReviewApp {
         }
         self.chat_visible = !self.chat_visible;
         if self.chat_visible {
+            // Chat and the PR conversation share the slot right of the diff.
+            self.pr_conversation_visible = false;
             // The chat input can't take focus under the palette (same as the
             // cmd-t open input).
             self.palette = None;

@@ -10,6 +10,7 @@ mod lsp;
 mod lsp_client;
 mod minimap;
 mod palette;
+mod pr_conversation;
 mod selection;
 mod subscriptions;
 mod theme;
@@ -78,6 +79,7 @@ actions!(
         ToggleMinimap,
         ToggleComments,
         ToggleChat,
+        TogglePrConversation,
         SubmitReview,
         ZoomIn,
         ZoomOut,
@@ -194,6 +196,7 @@ fn main() {
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-j", ToggleChat, None),
+                KeyBinding::new("cmd-g", TogglePrConversation, None),
                 KeyBinding::new("cmd-t", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
                 KeyBinding::new("cmd-k", OpenPalette, None),
