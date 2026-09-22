@@ -15,7 +15,8 @@ use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom,
     GoToDefinition, GoToTop, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
-    ToggleChat, ToggleComments, ToggleMinimap, ToggleSidebar, ToggleView, TrackerBack,
+    ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar, ToggleView,
+    TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
     TrackerRefresh,
     TrackerNewIssue, TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow,
@@ -98,6 +99,9 @@ pub(crate) struct ReviewApp {
     pub(crate) minimap_visible: bool,
     /// `cmd-j` toggles the right-side chat panel (transcripts are per-item).
     pub(crate) chat_visible: bool,
+    /// `cmd-g` toggles the read-only PR conversation panel, which shares the
+    /// chat panel's slot (opening either closes the other).
+    pub(crate) pr_conversation_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
     pub(crate) minimap_scrub: bool,
     /// Advance width of one monospace cell at (MONO, text_size()), measured once.
@@ -204,6 +208,7 @@ impl ReviewApp {
             drag_anchor: None,
             minimap_visible: true,
             chat_visible: false,
+            pr_conversation_visible: false,
             minimap_scrub: false,
             char_width: None,
             hover_plus: None,
@@ -531,6 +536,7 @@ impl ReviewApp {
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-b"], "sidebar"))
                 .child(hint(&["cmd-j"], "chat"))
+                .child(hint(&["cmd-g"], "pr talk"))
                 .child(hint(&["r"], "refresh"))
                 .child(hint(&["cmd-enter"], "review")),
             TopView::Tracker => footer
@@ -629,6 +635,9 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &TogglePrConversation, window, cx| {
+                this.toggle_pr_conversation(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ShowReview, _, cx| this.show_view(TopView::Review, cx)))
             .on_action(cx.listener(|this, _: &ShowTracker, _, cx| {
                 this.show_view(TopView::Tracker, cx)
@@ -815,6 +824,13 @@ impl Render for ReviewApp {
                     .when(self.chat_visible && self.top_view == TopView::Review, |main| {
                         main.child(self.render_chat(window, cx))
                     })
+                    // Shares the chat slot; `render_pr_conversation` falls
+                    // back to a placeholder when the active item isn't a
+                    // loaded PR (switching items can't close the panel).
+                    .when(
+                        self.pr_conversation_visible && self.top_view == TopView::Review,
+                        |main| main.child(self.render_pr_conversation(window, cx)),
+                    )
                     .when(
                         self.top_view == TopView::Tracker && self.tracker.open_issue().is_some(),
                         |main| main.child(self.render_tracker_panel(cx)),

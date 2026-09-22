@@ -263,6 +263,72 @@ pub fn fetch_review_comments(loc: &PrLocator) -> Result<Vec<ReviewComment>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
+/// One top-level PR comment as the REST `issues/comments` endpoint returns
+/// it: `snake_case`, with the author under `user` (the GraphQL path used for
+/// issues calls the same field `author`). Mapped into [`IssueComment`].
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RawPrIssueComment {
+    user: Author,
+    body: String,
+    created_at: String,
+}
+
+/// The PR's top-level conversation comments, oldest first. PRs are issues in
+/// GitHub's API, so these come from the issues endpoint, not `pulls`; same
+/// `--paginate --slurp` shape as [`fetch_review_comments`].
+pub fn fetch_pr_comments(loc: &PrLocator) -> Result<Vec<IssueComment>> {
+    let json = gh(&[
+        "api",
+        "--paginate",
+        "--slurp",
+        &format!(
+            "repos/{}/{}/issues/{}/comments?per_page=100",
+            loc.owner, loc.repo, loc.number
+        ),
+    ])?;
+    let pages: Vec<Vec<RawPrIssueComment>> =
+        serde_json::from_str(&json).context("unexpected gh issues/comments JSON")?;
+    Ok(pages
+        .into_iter()
+        .flatten()
+        .map(|raw| IssueComment {
+            author: raw.user.login,
+            body: raw.body,
+            created_at: raw.created_at,
+        })
+        .collect())
+}
+
+/// One review on the PR: the verdict plus the summary body the reviewer left
+/// with it (empty when they only wrote inline comments).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PrReview {
+    pub id: u64,
+    pub user: Author,
+    pub body: String,
+    /// `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`, or
+    /// `PENDING` (the viewer's own review, not yet submitted).
+    pub state: String,
+    /// Absent on `PENDING` reviews, which were never submitted.
+    pub submitted_at: Option<String>,
+}
+
+/// Every review on the PR, in submission order.
+pub fn fetch_pr_reviews(loc: &PrLocator) -> Result<Vec<PrReview>> {
+    let json = gh(&[
+        "api",
+        "--paginate",
+        "--slurp",
+        &format!(
+            "repos/{}/{}/pulls/{}/reviews?per_page=100",
+            loc.owner, loc.repo, loc.number
+        ),
+    ])?;
+    let pages: Vec<Vec<PrReview>> =
+        serde_json::from_str(&json).context("unexpected gh pulls/reviews JSON")?;
+    Ok(pages.into_iter().flatten().collect())
+}
+
 /// A user who can be @-mentioned on this repo, for comment autocomplete.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Mention {
