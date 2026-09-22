@@ -511,7 +511,7 @@ impl ReviewApp {
                     })),
             );
             for (loc, pr) in subscribed_feed {
-                let label: SharedString = format!("{}#{}", loc.repo_slug(), pr.number).into();
+                let label: SharedString = format!("#{} {}", pr.number, loc.repo_slug()).into();
                 let title: SharedString = pr.title.clone().into();
                 let click_loc = loc.clone();
                 let entry = div()
@@ -587,7 +587,7 @@ impl ReviewApp {
                 let key = pr_key(&c.loc.owner, &c.loc.repo, c.loc.number);
                 !open_pr_keys.contains(&key) && !subscribed_pr_keys.contains(&key)
             })
-            .map(|(ix, c)| (ix, SharedString::from(format!("{}#{}", c.loc.repo_slug(), c.loc.number))))
+            .map(|(ix, c)| (ix, SharedString::from(format!("#{} {}", c.loc.number, c.loc.repo_slug()))))
             .collect();
         let cached_count = cached.len();
         if !cached.is_empty() {

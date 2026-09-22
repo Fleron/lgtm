@@ -201,7 +201,7 @@ pub(crate) struct ReviewItem {
 impl ReviewItem {
     pub(crate) fn primary(&self) -> SharedString {
         match &self.source {
-            Source::Pr(loc) => format!("{}#{}", loc.repo_slug(), loc.number).into(),
+            Source::Pr(loc) => format!("#{} {}", loc.number, loc.repo_slug()).into(),
             Source::Local(src) => src.branch.clone().into(),
         }
     }
