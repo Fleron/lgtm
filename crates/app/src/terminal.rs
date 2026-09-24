@@ -432,10 +432,10 @@ impl ReviewApp {
         self.focus_terminal(window, cx);
     }
 
-    /// The right-side terminal panel: header with the backend chip and
-    /// Restart, then the live terminal or a status message.
-    /// Bracketed paste, so the TUI takes multi-line text as one input.
-    fn paste_into_terminal(&mut self, cx: &mut Context<Self>) {
+    /// Bracketed paste, so the TUI takes multi-line text as one input. A
+    /// large paste can fill the PTY buffer and block, so it writes off the UI
+    /// thread; holding the lock for the whole write keeps keystrokes after it.
+    fn paste_into_terminal(&self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
@@ -445,12 +445,13 @@ impl ReviewApp {
         else {
             return;
         };
-        write_pty(
-            &session.writer,
-            format!("\x1b[200~{text}\x1b[201~").as_bytes(),
-        );
+        let writer = Arc::clone(&session.writer);
+        let bytes = format!("\x1b[200~{}\x1b[201~", text.replace("\x1b[201~", ""));
+        std::thread::spawn(move || write_pty(&writer, bytes.as_bytes()));
     }
 
+    /// The right-side terminal panel: header with the backend chip and
+    /// Restart, then the live terminal or a status message.
     pub(crate) fn render_terminal(
         &mut self,
         window: &mut Window,
