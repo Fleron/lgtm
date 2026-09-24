@@ -13,6 +13,7 @@ mod palette;
 mod pr_conversation;
 mod selection;
 mod subscriptions;
+mod terminal;
 mod theme;
 mod titlebar;
 mod sidebar;
@@ -24,7 +25,7 @@ mod urgency;
 
 use gpui::{
     actions, prelude::*, px, size, App,
-    Application, Bounds, KeyBinding,
+    Application, Bounds, KeyBinding, NoAction,
     TitlebarOptions,
     WindowBounds, WindowOptions,
 };
@@ -80,6 +81,7 @@ actions!(
         ToggleComments,
         ToggleChat,
         TogglePrConversation,
+        ToggleTerminal,
         SubmitReview,
         ZoomIn,
         ZoomOut,
@@ -197,6 +199,7 @@ fn main() {
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-j", ToggleChat, None),
                 KeyBinding::new("cmd-g", TogglePrConversation, None),
+                KeyBinding::new("cmd-e", ToggleTerminal, None),
                 KeyBinding::new("cmd-t", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
                 KeyBinding::new("cmd-k", OpenPalette, None),
@@ -230,6 +233,10 @@ fn main() {
                 KeyBinding::new("escape", PaletteBack, Some("Palette")),
                 KeyBinding::new("up", PaletteUp, Some("Palette > Input")),
                 KeyBinding::new("down", PaletteDown, Some("Palette > Input")),
+                // gpui-component binds tab/shift-tab to focus cycling in
+                // "Root"; masking them lets claude/codex receive them.
+                KeyBinding::new("tab", NoAction, Some("Terminal")),
+                KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.

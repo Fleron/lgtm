@@ -15,7 +15,8 @@ use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom,
     GoToDefinition, GoToTop, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
-    ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar, ToggleView,
+    ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar,
+    ToggleTerminal, ToggleView,
     TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
     TrackerRefresh,
@@ -102,6 +103,8 @@ pub(crate) struct ReviewApp {
     /// `cmd-g` toggles the read-only PR conversation panel, which shares the
     /// chat panel's slot (opening either closes the other).
     pub(crate) pr_conversation_visible: bool,
+    /// `cmd-e` toggles the terminal panel, the third panel in the chat slot.
+    pub(crate) terminal_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
     pub(crate) minimap_scrub: bool,
     /// Advance width of one monospace cell at (MONO, text_size()), measured once.
@@ -209,6 +212,7 @@ impl ReviewApp {
             minimap_visible: true,
             chat_visible: false,
             pr_conversation_visible: false,
+            terminal_visible: false,
             minimap_scrub: false,
             char_width: None,
             hover_plus: None,
@@ -638,6 +642,9 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &TogglePrConversation, window, cx| {
                 this.toggle_pr_conversation(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                this.toggle_terminal(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ShowReview, _, cx| this.show_view(TopView::Review, cx)))
             .on_action(cx.listener(|this, _: &ShowTracker, _, cx| {
                 this.show_view(TopView::Tracker, cx)
@@ -831,6 +838,9 @@ impl Render for ReviewApp {
                         self.pr_conversation_visible && self.top_view == TopView::Review,
                         |main| main.child(self.render_pr_conversation(window, cx)),
                     )
+                    .when(self.terminal_visible && self.top_view == TopView::Review, |main| {
+                        main.child(self.render_terminal(cx))
+                    })
                     .when(
                         self.top_view == TopView::Tracker && self.tracker.open_issue().is_some(),
                         |main| main.child(self.render_tracker_panel(cx)),
