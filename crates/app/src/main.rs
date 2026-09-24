@@ -238,8 +238,6 @@ fn main() {
                 // "Root"; masking them lets claude/codex receive them.
                 KeyBinding::new("tab", NoAction, Some("Terminal")),
                 KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
-                KeyBinding::new("alt-left", NoAction, Some("Terminal")),
-                KeyBinding::new("alt-right", NoAction, Some("Terminal")),
                 KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
