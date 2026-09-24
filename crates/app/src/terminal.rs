@@ -1,9 +1,8 @@
 use crate::chat::{backend_chip, local_chat_header, pr_chat_header, ChatBackend, CHAT_WIDTH};
-use crate::diff::text_size;
 use crate::items::{ItemState, Source};
 use crate::lsp::lsp_root_for_source;
 use crate::theme;
-use crate::{centered_message, ReviewApp, TerminalPaste, TopView, MONO};
+use crate::{centered_message, ReviewApp, TerminalPaste, TopView};
 use gpui::{div, prelude::*, px, Context, Entity, Rgba, SharedString, WeakEntity, Window};
 use gpui_component::{button::Button, Sizable as _};
 use gpui_terminal::{ColorPalette, ColorPaletteBuilder, TerminalConfig, TerminalView};
@@ -12,6 +11,9 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
+
+const TERMINAL_FONT: &str = "Iosevka Term";
+const TERMINAL_FONT_PX: f32 = 11.0;
 
 // --- Interactive claude/codex terminal ---------------------------------------
 
@@ -180,9 +182,9 @@ fn open_session(
     item_id: u64,
     cx: &mut Context<ReviewApp>,
 ) -> anyhow::Result<TerminalSession> {
-    // Menlo's advance is about 0.6em; the first paint measures the real cell
-    // and resizes the PTY to fit.
-    let cols = (CHAT_WIDTH / (text_size() * 0.6)) as u16;
+    // Iosevka's advance is 0.5em; the first paint measures the real cell and
+    // resizes the PTY to fit.
+    let cols = (CHAT_WIDTH / (TERMINAL_FONT_PX * 0.5)) as u16;
     let size = PtySize {
         rows: 40,
         cols,
@@ -205,8 +207,8 @@ fn open_session(
     let config = TerminalConfig {
         cols: size.cols.into(),
         rows: size.rows.into(),
-        font_family: MONO.into(),
-        font_size: px(text_size()),
+        font_family: TERMINAL_FONT.into(),
+        font_size: px(TERMINAL_FONT_PX),
         colors: palette(),
         ..TerminalConfig::default()
     };
