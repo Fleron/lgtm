@@ -3,14 +3,15 @@ use crate::diff::text_size;
 use crate::items::{ItemState, Source};
 use crate::lsp::lsp_root_for_source;
 use crate::theme;
-use crate::{centered_message, ReviewApp, TopView, MONO};
+use crate::{centered_message, ReviewApp, TerminalPaste, TopView, MONO};
 use gpui::{div, prelude::*, px, Context, Entity, Rgba, SharedString, WeakEntity, Window};
 use gpui_component::{button::Button, Sizable as _};
 use gpui_terminal::{ColorPalette, ColorPaletteBuilder, TerminalConfig, TerminalView};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtyPair, PtySize};
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 
 // --- Interactive claude/codex terminal ---------------------------------------
 
@@ -35,10 +36,42 @@ pub(crate) struct TerminalState {
     pub(crate) backend: ChatBackend,
     pub(crate) status: TerminalStatus,
     pub(crate) session: Option<TerminalSession>,
+    /// A delayed launch finished while its panel showed; the next render
+    /// focuses the terminal, since the launch itself had no Window.
+    focus_pending: bool,
+}
+
+type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+
+fn write_pty(writer: &SharedWriter, bytes: &[u8]) {
+    let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = writer.write_all(bytes);
+    let _ = writer.flush();
+}
+
+/// The PTY writer handed to `TerminalView`, sharing the session's handle so
+/// paste and option-key input write to the same stream.
+struct PtyWriter(SharedWriter);
+
+impl std::io::Write for PtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .flush()
+    }
 }
 
 pub(crate) struct TerminalSession {
     view: Entity<TerminalView>,
+    writer: SharedWriter,
     child: Option<Box<dyn Child + Send + Sync>>,
 }
 
@@ -51,10 +84,12 @@ impl Drop for TerminalSession {
             return;
         }
         // portable-pty's `kill` sends SIGHUP, which the agent may handle and
-        // outlive; SIGKILL can't be caught. The blocking reap runs off the UI
-        // thread so closing an item never stalls a frame.
+        // outlive; SIGKILL can't be caught. portable-pty spawns the child
+        // with setsid, so its pid is also the group id and the negative pid
+        // takes the agent's own subprocesses with it. The blocking reap runs
+        // off the UI thread so closing an item never stalls a frame.
         if let Some(pid) = child.process_id() {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -164,7 +199,8 @@ fn open_session(
     // open would stop the exit callback from ever firing.
     drop(slave);
     let reader = master.try_clone_reader()?;
-    let writer = master.take_writer()?;
+    let writer: SharedWriter = Arc::new(Mutex::new(master.take_writer()?));
+    let key_writer = Arc::clone(&writer);
     let master = Mutex::new(master);
     let config = TerminalConfig {
         cols: size.cols.into(),
@@ -175,7 +211,7 @@ fn open_session(
         ..TerminalConfig::default()
     };
     let view = cx.new(|cx| {
-        TerminalView::new(writer, reader, config, cx)
+        TerminalView::new(PtyWriter(Arc::clone(&writer)), reader, config, cx)
             .with_resize_callback(move |cols, rows| {
                 if let Ok(master) = master.lock() {
                     let _ = master.resize(PtySize {
@@ -186,9 +222,23 @@ fn open_session(
                     });
                 }
             })
-            // gpui-terminal types the bare letter for cmd-<key>; unbound cmd
-            // chords must not reach the agent as text.
-            .with_key_handler(|event| event.keystroke.modifiers.platform)
+            // gpui-terminal types the bare letter for cmd-<key>, so unbound
+            // cmd chords are dropped. It also sends ESC+key for option chords,
+            // which loses the characters Nordic and German macOS layouts type
+            // with option (@ $ [ ] { } | \ ~); those go out as typed.
+            .with_key_handler(move |event| {
+                let modifiers = event.keystroke.modifiers;
+                if modifiers.platform {
+                    return true;
+                }
+                match &event.keystroke.key_char {
+                    Some(typed) if modifiers.alt && !modifiers.control => {
+                        write_pty(&key_writer, typed.as_bytes());
+                        true
+                    }
+                    _ => false,
+                }
+            })
             .with_exit_callback(move |_, cx| {
                 let app = app.clone();
                 cx.defer(move |cx| {
@@ -199,6 +249,7 @@ fn open_session(
     });
     Ok(TerminalSession {
         view,
+        writer,
         child: Some(child),
     })
 }
@@ -306,6 +357,8 @@ impl ReviewApp {
 
     fn spawn_terminal(&mut self, item_id: u64, cwd: &Path, cx: &mut Context<Self>) {
         let app = cx.weak_entity();
+        let shown =
+            self.terminal_visible && self.active_item().is_some_and(|item| item.id == item_id);
         let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
             return;
         };
@@ -320,6 +373,11 @@ impl ReviewApp {
         let argv = terminal_argv(data.terminal.backend, &context);
         match open_session(&argv, cwd, app, item_id, cx) {
             Ok(session) => {
+                data.terminal.focus_pending = shown
+                    && matches!(
+                        data.terminal.status,
+                        TerminalStatus::WaitingForCheckout | TerminalStatus::Preparing
+                    );
                 data.terminal.session = Some(session);
                 data.terminal.status = TerminalStatus::Running;
             }
@@ -376,7 +434,44 @@ impl ReviewApp {
 
     /// The right-side terminal panel: header with the backend chip and
     /// Restart, then the live terminal or a status message.
-    pub(crate) fn render_terminal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Bracketed paste, so the TUI takes multi-line text as one input.
+    fn paste_into_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let Some(session) = self
+            .active_data()
+            .and_then(|data| data.terminal.session.as_ref())
+        else {
+            return;
+        };
+        write_pty(
+            &session.writer,
+            format!("\x1b[200~{text}\x1b[201~").as_bytes(),
+        );
+    }
+
+    pub(crate) fn render_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let pending = self.active_data_mut().and_then(|data| {
+            let terminal = &mut data.terminal;
+            std::mem::take(&mut terminal.focus_pending)
+                .then(|| {
+                    terminal
+                        .session
+                        .as_ref()
+                        .map(|session| session.view.clone())
+                })
+                .flatten()
+        });
+        if let Some(view) = pending {
+            window.defer(cx, move |window, cx| {
+                window.focus(view.read(cx).focus_handle());
+            });
+        }
         let panel = div()
             .id("terminal")
             .w(px(CHAT_WIDTH))
@@ -433,13 +528,15 @@ impl ReviewApp {
                 cx.listener(|this, _, window, cx| this.toggle_terminal_backend(window, cx)),
             ))
             .child(div().flex_1());
-        if matches!(
-            terminal.status,
-            TerminalStatus::Idle | TerminalStatus::Exited(_) | TerminalStatus::Failed(_)
-        ) {
+        let action = match terminal.status {
+            TerminalStatus::Idle => Some("Start"),
+            TerminalStatus::Exited(_) | TerminalStatus::Failed(_) => Some("Restart"),
+            _ => None,
+        };
+        if let Some(label) = action {
             header = header.child(
                 Button::new("terminal-restart")
-                    .label("Restart")
+                    .label(label)
                     .small()
                     .on_click(cx.listener(|this, _, window, cx| this.restart_terminal(window, cx))),
             );
@@ -471,6 +568,9 @@ impl ReviewApp {
             .child(
                 div()
                     .key_context("Terminal")
+                    .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| {
+                        this.paste_into_terminal(cx);
+                    }))
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()

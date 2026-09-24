@@ -839,7 +839,7 @@ impl Render for ReviewApp {
                         |main| main.child(self.render_pr_conversation(window, cx)),
                     )
                     .when(self.terminal_visible && self.top_view == TopView::Review, |main| {
-                        main.child(self.render_terminal(cx))
+                        main.child(self.render_terminal(window, cx))
                     })
                     .when(
                         self.top_view == TopView::Tracker && self.tracker.open_issue().is_some(),
