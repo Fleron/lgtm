@@ -6,6 +6,7 @@ use crate::diff::{
 use crate::lsp_client::{LspBackend, LspProgress};
 use crate::minimap::{minimap_rows, minimap_runs, MinimapLayout, MinimapRow};
 use crate::selection::Selection;
+use crate::terminal::TerminalState;
 use crate::theme;
 use crate::tree::{build_tree, TreeEntry, TreeEntryKind};
 use crate::{
@@ -51,6 +52,9 @@ pub(crate) struct ItemData {
     /// Per-item chat transcript + session; survives refresh, dies with the
     /// item.
     pub(crate) chat: ChatState,
+    /// Per-item `cmd-e` terminal session; survives refresh, killed with the
+    /// item.
+    pub(crate) terminal: TerminalState,
     pub(crate) mode: ViewMode,
     pub(crate) rows: Vec<Row>,
     pub(crate) file_rows: Vec<usize>,
@@ -326,6 +330,7 @@ impl ReviewItem {
                     pr_comments,
                     pr_reviews,
                     chat: ChatState::new(),
+                    terminal: TerminalState::default(),
                     mode,
                     rows,
                     file_rows,

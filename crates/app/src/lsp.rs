@@ -3,6 +3,7 @@ use crate::comments::comment_anchor;
 use crate::items::{ItemData, ItemState, Source};
 use crate::lsp_client::{trace as lsp_trace, DefinitionTarget, HoverResult, LspPosition, LspProgress, LspSession};
 use crate::selection::{RowCol, SelSide};
+use crate::terminal::TerminalStatus;
 use crate::theme;
 use crate::{
     line_content, row_height, text_size, NavBack, NavForward, Row, ReviewApp,
@@ -297,6 +298,9 @@ impl ReviewApp {
                         data.lsp = None;
                         data.lsp_error = Some(format!("{err:#}").into());
                     }
+                }
+                if data.terminal.status == TerminalStatus::WaitingForCheckout {
+                    app.launch_terminal(id, cx);
                 }
                 cx.notify();
             })

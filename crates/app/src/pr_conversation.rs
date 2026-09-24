@@ -162,8 +162,10 @@ impl ReviewApp {
         }
         self.pr_conversation_visible = !self.pr_conversation_visible;
         if self.pr_conversation_visible {
-            // Chat and this panel share the slot right of the diff.
+            // Chat, the terminal and this panel share the slot right of the
+            // diff.
             self.chat_visible = false;
+            self.terminal_visible = false;
             // cmd-g is global, so it also fires while the palette has focus.
             // Drop the palette instead of leaving it rendered but dead.
             self.palette = None;

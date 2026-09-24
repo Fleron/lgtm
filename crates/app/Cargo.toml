@@ -26,3 +26,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22.1"
 libc = "0.2"
+gpui-terminal = "0.1"
+portable-pty = "0.9"

@@ -16,6 +16,12 @@ pub fn crust() -> Rgba {
 pub fn surface0() -> Rgba {
     rgb(0x313244)
 }
+pub fn surface1() -> Rgba {
+    rgb(0x45475a)
+}
+pub fn surface2() -> Rgba {
+    rgb(0x585b70)
+}
 pub fn text() -> Rgba {
     rgb(0xcdd6f4)
 }
@@ -42,6 +48,15 @@ pub fn peach() -> Rgba {
 }
 pub fn yellow() -> Rgba {
     rgb(0xf9e2af)
+}
+pub fn teal() -> Rgba {
+    rgb(0x94e2d5)
+}
+pub fn sky() -> Rgba {
+    rgb(0x89dceb)
+}
+pub fn pink() -> Rgba {
+    rgb(0xf5c2e7)
 }
 
 /// Override gpui-component's theme (dark mode, default shadcn palette) with

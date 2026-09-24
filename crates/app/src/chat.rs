@@ -21,8 +21,8 @@ use std::time::Duration;
 
 // --- Chat with Claude -------------------------------------------------------
 
-/// Width of the right-side chat panel; the PR conversation panel shares the
-/// slot and the width.
+/// Width of the right-side chat panel; the PR conversation and terminal
+/// panels share the slot and the width.
 pub(crate) const CHAT_WIDTH: f32 = 380.0;
 /// The unified patch included in a session's first message is capped here.
 pub(crate) const MAX_CHAT_PATCH_BYTES: usize = 200 * 1024;
@@ -64,6 +64,50 @@ impl ChatBackend {
             ChatBackend::Codex => ChatBackend::Claude,
         }
     }
+
+    /// Executable name, for launching the interactive TUI.
+    pub(crate) fn bin(self) -> &'static str {
+        match self {
+            ChatBackend::Claude => "claude",
+            ChatBackend::Codex => "codex",
+        }
+    }
+}
+
+/// Status-chip-style backend toggle, matching `render_lsp_status`'s visual
+/// treatment. Shared by the chat and terminal panel headers.
+pub(crate) fn backend_chip(
+    id: &'static str,
+    backend: ChatBackend,
+    tooltip: SharedString,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    let color = theme::overlay0();
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .pl_2()
+        .pr_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(Hsla::from(color).opacity(0.45))
+        .bg(Hsla::from(color).opacity(0.1))
+        .text_size(px(11.))
+        .text_color(color)
+        .cursor_pointer()
+        .hover(|style| {
+            style
+                .bg(Hsla::from(color).opacity(0.2))
+                .border_color(Hsla::from(color).opacity(0.8))
+        })
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .on_click(on_click)
+        .child(SharedString::from(backend.label()))
+        .child(Icon::new(IconName::ChevronDown).xsmall())
+        .into_any_element()
 }
 
 pub(crate) struct ChatMessage {
@@ -335,8 +379,10 @@ impl ReviewApp {
         }
         self.chat_visible = !self.chat_visible;
         if self.chat_visible {
-            // Chat and the PR conversation share the slot right of the diff.
+            // Chat, the PR conversation and the terminal share the slot right
+            // of the diff.
             self.pr_conversation_visible = false;
+            self.terminal_visible = false;
             // The chat input can't take focus under the palette (same as the
             // cmd-t open input).
             self.palette = None;
@@ -702,44 +748,19 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// Status-chip-style backend toggle for the chat panel header, matching
-    /// `render_lsp_status`'s visual treatment. Clicking it stops any
-    /// in-flight run, clears the transcript, and switches backend.
+    /// The chat panel's backend chip. Clicking it stops any in-flight run,
+    /// clears the transcript, and switches backend.
     pub(crate) fn render_chat_backend(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let backend = self
             .active_data()
             .map(|data| data.chat.backend)
             .unwrap_or_default();
-        let color = theme::overlay0();
-        let text = SharedString::from(backend.label());
-        let other = backend.toggled().label();
-        div()
-            .id("chat-backend-toggle")
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap_1()
-            .pl_2()
-            .pr_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(Hsla::from(color).opacity(0.45))
-            .bg(Hsla::from(color).opacity(0.1))
-            .text_size(px(11.))
-            .text_color(color)
-            .cursor_pointer()
-            .hover(|style| {
-                style
-                    .bg(Hsla::from(color).opacity(0.2))
-                    .border_color(Hsla::from(color).opacity(0.8))
-            })
-            .tooltip(move |window, cx| {
-                Tooltip::new(format!("Switch chat to {other}")).build(window, cx)
-            })
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_chat_backend(cx)))
-            .child(text)
-            .child(Icon::new(IconName::ChevronDown).xsmall())
-            .into_any_element()
+        backend_chip(
+            "chat-backend-toggle",
+            backend,
+            format!("Switch chat to {}", backend.toggled().label()).into(),
+            cx.listener(|this, _, _, cx| this.toggle_chat_backend(cx)),
+        )
     }
 
     /// The right-side chat panel: header (+ Stop while streaming), the
