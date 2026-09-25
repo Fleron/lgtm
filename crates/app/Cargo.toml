@@ -26,5 +26,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22.1"
 libc = "0.2"
-gpui-terminal = { git = "https://github.com/Fleron/gpui-terminal", rev = "cdbb75692886c39db18ea7e3365c0b60ab0e3090" }
+gpui-terminal = { git = "https://github.com/Fleron/gpui-terminal", rev = "74ce33b6f973e4b4ac18012be6bb600603893c4d" }
 portable-pty = "0.9"
