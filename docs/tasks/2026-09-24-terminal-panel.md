@@ -60,7 +60,7 @@ Palette: build a `ColorPalette` from `theme.rs`, adding the missing Catppuccin M
 - No changes to or removal of the headless chat (`cmd-j`), its crates, or the selection-rides-along feature.
 - No permission flags: no `--allowed-tools`, `--permission-mode`, or codex sandbox flags. The user's own config decides.
 - No auto-run skill or initial prompt.
-- No mouse selection, copy, or scrollback beyond what gpui-terminal 0.1 gives.
+- No mouse selection or copy. Scrollback comes from the Fleron/gpui-terminal fork (pinned rev).
 - No persistence of sessions across lgtm restarts, no `claude --resume` wiring.
 - No terminal in the Tracker view.
 - No external-terminal (Ghostty) fallback.
@@ -68,7 +68,7 @@ Palette: build a `ColorPalette` from `theme.rs`, adding the missing Catppuccin M
 - A PR refresh that moves the head to a new commit does not move a running session; it keeps its old checkout dir until restarted.
 
 ## Decisions
-D1. gpui-terminal 0.1 over gpui_xterm (needs the gpui-kit 0.6 upgrade, Chinese-only docs) — no mouse selection and no scrollback navigation; output that scrolls off screen is gone unless the TUI itself pages it.
+D1. gpui-terminal 0.1 over gpui_xterm (needs the gpui-kit 0.6 upgrade, Chinese-only docs) — no mouse selection. Scrollback and mouse-wheel scrolling come from the Fleron/gpui-terminal fork (`scrollback` branch, pinned by rev in `crates/app/Cargo.toml`).
 D2. 380px width, same as chat — about 45 columns at Menlo 13; claude/codex TUIs wrap heavily and some layouts may look cramped.
 D3. User's default permissions — a review session can edit files or run commands the user approves (or pre-approved in their settings) inside the checkout; for PRs that is the cache clone, for local items it is the user's real working tree.
 D4. Reuse the LSP PR checkout as cwd and wait for the LSP when it is mid-start — on a fresh PR the terminal starts only after the language server is up, not just after the clone; the terminal and the LSP share one dir, so an agent that edits or checks out other refs there changes what the LSP sees, and deleting the cached PR from the sidebar pulls the dir out from under a live session.
