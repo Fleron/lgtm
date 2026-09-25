@@ -413,11 +413,9 @@ impl ReviewApp {
             if data.cursor > gap_row {
                 data.cursor += inserted;
             }
-            let scroll = data.scroll.0.borrow();
-            let offset = scroll.base_handle.offset();
-            // offset.y is negative when scrolled down.
-            let top_row = (f32::from(-offset.y) / row_height()).floor() as usize;
-            if gap_row < top_row {
+            if gap_row < data.top_row() {
+                let scroll = data.scroll.0.borrow();
+                let offset = scroll.base_handle.offset();
                 scroll
                     .base_handle
                     .set_offset(point(offset.x, offset.y - px(inserted as f32 * row_height())));

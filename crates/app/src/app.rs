@@ -12,8 +12,8 @@ use crate::palette::PaletteStep;
 use crate::selection::{selection_text, RowCol, SelSide};
 use crate::subscriptions::{load_subscribed_repos, SubscribedRepo};
 use crate::{
-    theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom,
-    GoToDefinition, GoToTop, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
+    theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom, GoToDefinition,
+    GoToTop, LineDown, LineUp, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
     ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar,
     ToggleTerminal, ToggleView,
@@ -531,6 +531,7 @@ impl ReviewApp {
             TopView::Review => footer
                 .child(hint(&["]", "["], "files"))
                 .child(hint(&["n", "p"], "hunks"))
+                .child(hint(&["j", "k"], "scroll"))
                 .child(hint(&["v"], "unified/split"))
                 .child(hint(&["m"], "minimap"))
                 .child(hint(&["c"], "comments"))
@@ -616,6 +617,19 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &GoToBottom, _, cx| {
                 if let Some(last) = this.active_data().map(|d| d.rows.len().saturating_sub(1)) {
                     this.jump(last, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &LineDown, _, cx| {
+                if let Some(next) = this
+                    .active_data()
+                    .map(|d| (d.top_row() + 1).min(d.rows.len().saturating_sub(1)))
+                {
+                    this.jump(next, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &LineUp, _, cx| {
+                if let Some(prev) = this.active_data().map(|d| d.top_row().saturating_sub(1)) {
+                    this.jump(prev, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
