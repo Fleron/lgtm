@@ -2947,7 +2947,7 @@ dependencies = [
 [[package]]
 name = "gpui-terminal"
 version = "0.1.0"
-source = "git+https://github.com/Fleron/gpui-terminal?rev=4c7c056fd1fc8e893dc07c97b99bbb346cbd27bc#4c7c056fd1fc8e893dc07c97b99bbb346cbd27bc"
+source = "git+https://github.com/Fleron/gpui-terminal?rev=74ce33b6f973e4b4ac18012be6bb600603893c4d#74ce33b6f973e4b4ac18012be6bb600603893c4d"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

@@ -23,7 +23,7 @@ Each sidebar item keeps its own session. Switch items and the other session keep
 
 Terms:
 - **PTY** (pseudo-terminal): the OS device pair that lets a program like `claude` believe it runs in a real terminal. `portable-pty` opens one and spawns the child on it.
-- **gpui-terminal**: crate `gpui-terminal = "0.1"` (github.com/zortax/gpui-terminal, MIT/Apache, depends on `gpui ^0.2.2` like lgtm, `alacritty_terminal ^0.25.1`). Per its README, `TerminalView::new(writer, reader, config, cx)` renders a terminal fed by any `Read`/`Write`, with `with_resize_callback(|cols, rows|)` and `with_exit_callback`. Known gaps: no mouse selection, no scrollback navigation. Not yet built locally; step 1 verifies the API.
+- **gpui-terminal**: crate `gpui-terminal = "0.1"` (github.com/zortax/gpui-terminal, MIT/Apache, depends on `gpui ^0.2.2` like lgtm, `alacritty_terminal ^0.25.1`). Per its README, `TerminalView::new(writer, reader, config, cx)` renders a terminal fed by any `Read`/`Write`, with `with_resize_callback(|cols, rows|)` and `with_exit_callback`. Known gaps in 0.1: no mouse selection, no scrollback navigation. lgtm uses the Fleron/gpui-terminal fork, pinned by rev, which adds scrollback, mouse selection and `cmd-c` copy. When the TUI turns on mouse reporting, a plain drag goes to the TUI and shift-drag still selects.
 - **TUI**: the full-screen interactive UI `claude` and `codex` draw when run without `-p`/`exec`.
 
 ## Approach
@@ -60,7 +60,6 @@ Palette: build a `ColorPalette` from `theme.rs`, adding the missing Catppuccin M
 - No changes to or removal of the headless chat (`cmd-j`), its crates, or the selection-rides-along feature.
 - No permission flags: no `--allowed-tools`, `--permission-mode`, or codex sandbox flags. The user's own config decides.
 - No auto-run skill or initial prompt.
-- No mouse selection or copy. Scrollback comes from the Fleron/gpui-terminal fork (pinned rev).
 - No persistence of sessions across lgtm restarts, no `claude --resume` wiring.
 - No terminal in the Tracker view.
 - No external-terminal (Ghostty) fallback.

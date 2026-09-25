@@ -2,8 +2,10 @@ use crate::chat::{backend_chip, local_chat_header, pr_chat_header, ChatBackend, 
 use crate::items::{ItemState, Source};
 use crate::lsp::lsp_root_for_source;
 use crate::theme;
-use crate::{centered_message, ReviewApp, TerminalPaste, TopView};
-use gpui::{div, prelude::*, px, Context, Entity, Rgba, SharedString, WeakEntity, Window};
+use crate::{centered_message, ReviewApp, TerminalCopy, TerminalPaste, TopView};
+use gpui::{
+    div, prelude::*, px, ClipboardItem, Context, Entity, Rgba, SharedString, WeakEntity, Window,
+};
 use gpui_component::{button::Button, Sizable as _};
 use gpui_terminal::{ColorPalette, ColorPaletteBuilder, TerminalConfig, TerminalView};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtyPair, PtySize};
@@ -448,8 +450,22 @@ impl ReviewApp {
             return;
         };
         let writer = Arc::clone(&session.writer);
+        session
+            .view
+            .update(cx, |view, cx| view.scroll_to_bottom_and_clear_selection(cx));
         let bytes = format!("\x1b[200~{}\x1b[201~", text.replace("\x1b[201~", ""));
         std::thread::spawn(move || write_pty(&writer, bytes.as_bytes()));
+    }
+
+    fn copy_from_terminal(&self, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .active_data()
+            .and_then(|data| data.terminal.session.as_ref())
+            .and_then(|session| session.view.read(cx).selection_text())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     /// The right-side terminal panel: header with the backend chip and
@@ -573,6 +589,9 @@ impl ReviewApp {
                     .key_context("Terminal")
                     .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| {
                         this.paste_into_terminal(cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &TerminalCopy, _, cx| {
+                        this.copy_from_terminal(cx);
                     }))
                     .flex_1()
                     .min_h_0()
