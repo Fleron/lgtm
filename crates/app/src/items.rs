@@ -124,6 +124,14 @@ impl ItemData {
         self.hunk_rows = hunk_rows;
     }
 
+    /// The topmost visible row, read from the live scroll offset. Unlike
+    /// `cursor`, this reflects mouse-wheel and minimap-scrub scrolling.
+    pub(crate) fn top_row(&self) -> usize {
+        let offset = self.scroll.0.borrow().base_handle.offset();
+        // offset.y is negative when scrolled down.
+        (f32::from(-offset.y) / row_height()).floor() as usize
+    }
+
     /// Rebuild the display rows after only the comment rows changed
     /// (visibility toggle, comment refetch), keeping the viewport anchored:
     /// the first visible non-comment row stays put even though comment rows
