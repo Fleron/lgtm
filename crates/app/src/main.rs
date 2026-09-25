@@ -85,6 +85,7 @@ actions!(
         TogglePrConversation,
         ToggleTerminal,
         TerminalPaste,
+        TerminalCopy,
         SubmitReview,
         ZoomIn,
         ZoomOut,
@@ -245,6 +246,7 @@ fn main() {
                 KeyBinding::new("tab", NoAction, Some("Terminal")),
                 KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
                 KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
+                KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.
