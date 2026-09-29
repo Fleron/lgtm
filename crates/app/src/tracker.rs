@@ -4,7 +4,7 @@
 //! the actions that mutate it.
 
 use crate::comments::{now_unix, parse_iso_utc};
-use crate::dispatch::{completion_names, ssh_hosts, Agent, SkillProvider, Target};
+use crate::dispatch::{completion_names, ssh_hosts, Agent, Model, SkillProvider, Target};
 use crate::items::Source;
 use crate::theme;
 use crate::urgency::{
@@ -63,6 +63,9 @@ pub(crate) struct DispatchCard {
     /// ssh hosts offered by the target chip, read once when the card opened.
     pub(crate) hosts: Vec<String>,
     pub(crate) target_menu_open: bool,
+    /// `None` leaves the choice to the agent's own default.
+    pub(crate) model: Option<&'static Model>,
+    pub(crate) model_menu_open: bool,
     pub(crate) input: Entity<InputState>,
     pub(crate) error: Option<SharedString>,
     pub(crate) _subscription: Subscription,
@@ -795,6 +798,41 @@ impl ReviewApp {
         .detach();
     }
 
+    /// Add the current user as an assignee of `number`, optimistically,
+    /// reverting with an inline error if the write fails.
+    fn tracker_assign_me(&mut self, number: u64, cx: &mut Context<Self>) {
+        let Some(me) = self.tracker.me.clone() else {
+            return;
+        };
+        let Some(item) = self.tracker.items.iter_mut().find(|it| it.number == number) else {
+            return;
+        };
+        if item.detail.assignees.contains(&me) {
+            return;
+        }
+        item.detail.assignees.push(me.clone());
+        let owner = self.tracker.owner.clone();
+        let repo = self.tracker.repo.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let login = me.clone();
+            let result = cx
+                .background_spawn(async move { gh::add_assignee(&owner, &repo, number, &login) })
+                .await;
+            this.update(cx, |app, cx| {
+                if let Err(err) = result {
+                    if let Some(item) = app.tracker.items.iter_mut().find(|it| it.number == number) {
+                        item.detail.assignees.retain(|a| *a != me);
+                    }
+                    app.tracker.error = Some(format!("assign failed: {err:#}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn tracker_open_selected_on_github(&mut self, cx: &mut Context<Self>) {
         let number = self.tracker.open_issue().or_else(|| self.tracker_selected_number(cx));
         let Some(number) = number else {
@@ -950,6 +988,8 @@ impl ReviewApp {
             target: Target::Local,
             hosts,
             target_menu_open: false,
+            model: None,
+            model_menu_open: false,
             input,
             error: None,
             _subscription: subscription,
@@ -966,7 +1006,9 @@ impl ReviewApp {
     pub(crate) fn tracker_toggle_dispatch_agent(&mut self, cx: &mut Context<Self>) {
         if let Some(card) = &mut self.tracker.dispatch {
             card.agent = card.agent.toggled();
+            card.model = None;
             card.target_menu_open = false;
+            card.model_menu_open = false;
             card.error = None;
             cx.notify();
         }
@@ -984,6 +1026,36 @@ impl ReviewApp {
     pub(crate) fn tracker_toggle_dispatch_target_menu(&mut self, cx: &mut Context<Self>) {
         if let Some(card) = &mut self.tracker.dispatch {
             card.target_menu_open = !card.target_menu_open;
+            card.model_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn tracker_close_dispatch_model_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            if card.model_menu_open {
+                card.model_menu_open = false;
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn tracker_toggle_dispatch_model_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            card.model_menu_open = !card.model_menu_open;
+            card.target_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn tracker_set_dispatch_model(
+        &mut self,
+        model: Option<&'static Model>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(card) = &mut self.tracker.dispatch {
+            card.model = model;
+            card.model_menu_open = false;
             cx.notify();
         }
     }
@@ -1001,7 +1073,8 @@ impl ReviewApp {
         let Some(card) = &self.tracker.dispatch else {
             return;
         };
-        let (agent, number, target) = (card.agent, card.number, card.target.clone());
+        let (agent, number, target, model) =
+            (card.agent, card.number, card.target.clone(), card.model);
         let prompt = card.input.read(cx).value().trim().to_string();
         let repo = self.tracker.repo.clone();
         let result = match &target {
@@ -1009,7 +1082,7 @@ impl ReviewApp {
                 let Some(root) = self.tracker.config.dispatch_root.clone() else {
                     return;
                 };
-                crate::dispatch::dispatch(&root, &repo, agent, &prompt)
+                crate::dispatch::dispatch(&root, &repo, agent, model, &prompt)
             }
             Target::Remote(host) => {
                 let root = self
@@ -1025,12 +1098,19 @@ impl ReviewApp {
                     &repo,
                     number,
                     agent,
+                    model,
                     &prompt,
                 )
             }
         };
         match result {
-            Ok(()) => self.tracker_close_dispatch(window, cx),
+            Ok(()) => {
+                if let Some(status) = self.tracker_first_status_in(Column::Flight) {
+                    self.tracker_set_status(number, status, cx);
+                }
+                self.tracker_assign_me(number, cx);
+                self.tracker_close_dispatch(window, cx);
+            }
             Err(err) => {
                 if let Some(card) = &mut self.tracker.dispatch {
                     card.error = Some(err.into());

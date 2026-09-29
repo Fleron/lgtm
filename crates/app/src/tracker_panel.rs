@@ -3,7 +3,7 @@
 //! comment box. Sidebar/main-pane tables live in `tracker_table.rs`.
 
 use crate::comments::short_age;
-use crate::dispatch::Target;
+use crate::dispatch::{Model, Target};
 use crate::tracker::{
     dispatch_icon, dispatch_menu, oi, sub_issue_icon, tint, type_icon, ComposerMode, FocusedColumn,
 };
@@ -267,6 +267,7 @@ impl ReviewApp {
             .when(!card.hosts.is_empty(), |row| {
                 row.child(self.render_dispatch_target_chip(cx))
             })
+            .child(self.render_dispatch_model_chip(cx))
             .child(
                 div()
                     .flex_1()
@@ -339,6 +340,67 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    /// The model chip: the target chip's markup over "Default" plus the
+    /// current agent's models.
+    fn render_dispatch_model_chip(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(card) = &self.tracker.dispatch else {
+            return div().into_any_element();
+        };
+        let chip = div()
+            .id("dispatch-model")
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(theme::surface0())
+            .cursor_pointer()
+            .child(SharedString::from(card.model.map_or("Default", |m| m.label)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.tracker_toggle_dispatch_model_menu(cx);
+            }));
+        if !card.model_menu_open {
+            return div().child(chip).into_any_element();
+        }
+        let current = card.model;
+        let options: Vec<Option<&'static Model>> = std::iter::once(None)
+            .chain(card.agent.models().iter().map(Some))
+            .collect();
+        let menu = div()
+            .absolute()
+            .top_full()
+            .left_0()
+            .mt_1()
+            .flex()
+            .flex_col()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::surface0())
+            .bg(theme::mantle())
+            .occlude()
+            .children(options.into_iter().map(|model| {
+                let on = model == current;
+                let label = model.map_or("Default", |m| m.label);
+                div()
+                    .id(SharedString::from(format!("dispatch-model-{label}")))
+                    .px_2()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(theme::surface0()).text_color(theme::text()))
+                    .when(!on, |d| d.text_color(theme::subtext()))
+                    .child(SharedString::from(label))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tracker_set_dispatch_model(model, cx);
+                    }))
+            }));
+        div()
+            .relative()
+            .child(chip)
+            .child(gpui::deferred(menu))
+            .into_any_element()
+    }
+
     /// The floating "dispatch an agent" card, rendered at the window's
     /// top-centre over an invisible backdrop that closes it on click.
     pub(crate) fn render_dispatch_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -377,6 +439,7 @@ impl ReviewApp {
                         cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.tracker_close_dispatch_target_menu(cx);
+                            this.tracker_close_dispatch_model_menu(cx);
                         }),
                     )
                     .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())

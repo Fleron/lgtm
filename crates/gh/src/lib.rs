@@ -1119,6 +1119,19 @@ pub fn update_issue_title(owner: &str, repo: &str, number: u64, title: &str) -> 
     Ok(())
 }
 
+pub fn add_assignee(owner: &str, repo: &str, number: u64, login: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        &format!("{owner}/{repo}"),
+        "--add-assignee",
+        login,
+    ])?;
+    Ok(())
+}
+
 /// The authenticated `gh` user's login, for the tracker's assignee filter.
 pub fn current_user_login() -> Result<String> {
     let login = gh(&["api", "user", "--jq", ".login"])?;

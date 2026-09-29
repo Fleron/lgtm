@@ -42,6 +42,35 @@ impl Agent {
             Agent::Codex => Agent::Claude,
         }
     }
+
+    pub(crate) fn models(self) -> &'static [Model] {
+        match self {
+            Agent::Claude => &[
+                Model { label: "sonnet", id: "sonnet" },
+                Model { label: "opus", id: "opus" },
+            ],
+            Agent::Codex => &[
+                Model { label: "sol", id: "gpt-6-sol" },
+                Model { label: "astra", id: "gpt-6-astra" },
+            ],
+        }
+    }
+
+    /// The shell command that starts the agent, pinned to `model` when set.
+    fn launch(self, model: Option<&Model>) -> String {
+        match model {
+            Some(model) => format!("{} --model {}", self.bin(), model.id),
+            None => self.bin().to_string(),
+        }
+    }
+}
+
+/// A model the dispatch card can pin: `label` is shown on the chip, `id` is
+/// what the agent's `--model` flag takes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Model {
+    pub(crate) label: &'static str,
+    id: &'static str,
 }
 
 /// Where a dispatch runs: this machine, or a tmux session on an ssh host.
@@ -107,6 +136,7 @@ pub(crate) fn remote_args(
     repo: &str,
     number: u64,
     agent: Agent,
+    model: Option<&Model>,
     prompt: &str,
 ) -> Result<Vec<String>, String> {
     shell_safe(host, "host")?;
@@ -119,12 +149,13 @@ pub(crate) fn remote_args(
         }
         None => format!("\"$HOME/{repo}\" \"$HOME\"/*/{repo}"),
     };
+    let launch = agent.launch(model);
     let agent = agent.bin();
     let script = format!(
         "d=\"\"; for c in {candidates}; \
          do [ -d \"$c\" ] && d=\"$c\" && break; done; \
          [ -z \"$d\" ] && {{ echo \"no checkout for {repo} under ~ on {host}\" >&2; exit 3; }}; \
-         cmd=\"bash -lc '{agent} \\\"\\$(printf %s {b64} | base64 -d)\\\"'\"; \
+         cmd=\"bash -lc '{launch} \\\"\\$(printf %s {b64} | base64 -d)\\\"'\"; \
          tmux has-session -t {agent} 2>/dev/null \
          && exec tmux new-window -t {agent}: -c \"$d\" -n '#{number}' \"$cmd\" \
          || exec tmux new-session -d -s {agent} -c \"$d\" -n '#{number}' \"$cmd\""
@@ -147,9 +178,10 @@ pub(crate) fn dispatch_remote(
     repo: &str,
     number: u64,
     agent: Agent,
+    model: Option<&Model>,
     prompt: &str,
 ) -> Result<(), String> {
-    let args = remote_args(host, root_override, repo, number, agent, prompt)?;
+    let args = remote_args(host, root_override, repo, number, agent, model, prompt)?;
     let out = std::process::Command::new("ssh")
         .args(args)
         .output()
@@ -177,7 +209,12 @@ pub(crate) fn checkout_dir(root: &Path, repo: &str) -> Result<PathBuf, String> {
 /// `-n` forces a new process rather than reusing a running Ghostty, and the
 /// prompt rides as a separate argv element so `$0` receives it verbatim
 /// without any shell quoting of our own.
-pub(crate) fn open_args(dir: &Path, agent: Agent, prompt: &str) -> Vec<String> {
+pub(crate) fn open_args(
+    dir: &Path,
+    agent: Agent,
+    model: Option<&Model>,
+    prompt: &str,
+) -> Vec<String> {
     vec![
         "-na".to_string(),
         "Ghostty.app".to_string(),
@@ -186,17 +223,23 @@ pub(crate) fn open_args(dir: &Path, agent: Agent, prompt: &str) -> Vec<String> {
         "-e".to_string(),
         "/bin/zsh".to_string(),
         "-lic".to_string(),
-        format!("{} \"$0\"", agent.bin()),
+        format!("{} \"$0\"", agent.launch(model)),
         prompt.to_string(),
     ]
 }
 
 /// Launch `agent` against `prompt` in `<root>/<repo>`. Returns the reason to
 /// show under the input when nothing was started.
-pub(crate) fn dispatch(root: &Path, repo: &str, agent: Agent, prompt: &str) -> Result<(), String> {
+pub(crate) fn dispatch(
+    root: &Path,
+    repo: &str,
+    agent: Agent,
+    model: Option<&Model>,
+    prompt: &str,
+) -> Result<(), String> {
     let dir = checkout_dir(root, repo)?;
     let status = std::process::Command::new("open")
-        .args(open_args(&dir, agent, prompt))
+        .args(open_args(&dir, agent, model, prompt))
         .status()
         .map_err(|err| format!("could not run open: {err}"))?;
     if status.success() {
@@ -514,7 +557,7 @@ mod tests {
 
     #[test]
     fn open_args_passes_prompt_as_its_own_argument() {
-        let args = open_args(Path::new("/checkouts/lgtm"), Agent::Codex, "do /it \"now\"");
+        let args = open_args(Path::new("/checkouts/lgtm"), Agent::Codex, None, "do /it \"now\"");
         assert_eq!(
             args,
             vec![
@@ -529,7 +572,17 @@ mod tests {
                 "do /it \"now\"",
             ]
         );
-        assert!(open_args(Path::new("/x"), Agent::Claude, "p")[7].starts_with("claude "));
+        assert!(open_args(Path::new("/x"), Agent::Claude, None, "p")[7].starts_with("claude "));
+        let opus = &Agent::Claude.models()[1];
+        assert_eq!(
+            open_args(Path::new("/x"), Agent::Claude, Some(opus), "p")[7],
+            "claude --model opus \"$0\""
+        );
+        let sol = &Agent::Codex.models()[0];
+        assert_eq!(
+            open_args(Path::new("/x"), Agent::Codex, Some(sol), "p")[7],
+            "codex --model gpt-6-sol \"$0\""
+        );
     }
 
     #[test]
@@ -558,9 +611,18 @@ Host devbox
     }
 
     #[test]
+    fn remote_args_pin_the_model_inside_the_tmux_command() {
+        let astra = &Agent::Codex.models()[1];
+        let args = remote_args("devbox", None, "lgtm", 7, Agent::Codex, Some(astra), "p").unwrap();
+        let script = args.last().unwrap();
+        assert!(script.contains(r#"bash -lc 'codex --model gpt-6-astra \"\$(printf %s"#));
+        assert!(script.contains("tmux has-session -t codex "));
+    }
+
+    #[test]
     fn remote_args_pin_the_exact_ssh_invocation() {
         let prompt = "Issue #7: \"quote\" $HOME `tick`\n/deep-review";
-        let args = remote_args("devbox", None, "lgtm", 7, Agent::Claude, prompt).unwrap();
+        let args = remote_args("devbox", None, "lgtm", 7, Agent::Claude, None, prompt).unwrap();
         assert_eq!(
             args,
             vec![
@@ -587,7 +649,7 @@ Host devbox
     #[test]
     fn remote_args_use_a_configured_root_and_reject_odd_names() {
         let args =
-            remote_args("box", Some(Path::new("/home/me/leap")), "lgtm", 1, Agent::Codex, "hi")
+            remote_args("box", Some(Path::new("/home/me/leap")), "lgtm", 1, Agent::Codex, None, "hi")
                 .unwrap();
         // A configured root replaces the `~` search entirely.
         assert!(args[5].starts_with(r#"d=""; for c in '/home/me/leap/lgtm'; do"#));
@@ -601,15 +663,16 @@ Host devbox
             "lgtm",
             1,
             Agent::Claude,
+            None,
             "x",
         )
         .unwrap();
         assert!(odd[5].starts_with(
             "d=\"\"; for c in '/it'\\''s $HOME/`x`/\"q\"/lgtm'; do [ -d \"$c\" ]"
         ));
-        assert!(remote_args("box", None, "a;rm -rf /", 1, Agent::Claude, "x").is_err());
-        assert!(remote_args("a b", None, "lgtm", 1, Agent::Claude, "x").is_err());
-        assert!(remote_args("box", None, "", 1, Agent::Claude, "x").is_err());
+        assert!(remote_args("box", None, "a;rm -rf /", 1, Agent::Claude, None, "x").is_err());
+        assert!(remote_args("a b", None, "lgtm", 1, Agent::Claude, None, "x").is_err());
+        assert!(remote_args("box", None, "", 1, Agent::Claude, None, "x").is_err());
     }
 
     #[test]
