@@ -1,4 +1,4 @@
-use crate::cached_prs::scan_cached_prs;
+use crate::cached_prs::{scan_cached_prs, stage_worktree_dir, CachedPr};
 use crate::diff::row_height;
 use crate::items::{ItemData, ItemState, Source};
 use crate::subscriptions::{pr_key, save_subscribed_repos, SubscribedRepo};
@@ -9,7 +9,8 @@ use crate::tree::{
 use crate::{theme, ReviewApp, SIDEBAR_MAX_LIST_HEIGHT};
 use diff_core::FileDiff;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Hsla, ScrollStrategy, SharedString, Window,
+    div, prelude::*, px, uniform_list, Context, Hsla, PromptButton, PromptLevel, ScrollStrategy,
+    SharedString, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -19,6 +20,35 @@ use gpui_component::{
 };
 use std::collections::HashSet;
 use std::time::Duration;
+
+type PrKey = (String, String, u64);
+
+fn cached_pr_is_visible(
+    cached: &CachedPr,
+    open_pr_keys: &HashSet<PrKey>,
+    subscribed_pr_keys: &HashSet<PrKey>,
+) -> bool {
+    let key = pr_key(&cached.loc.owner, &cached.loc.repo, cached.loc.number);
+    !open_pr_keys.contains(&key) && !subscribed_pr_keys.contains(&key)
+}
+
+fn cached_pr_indices_to_clear(
+    cached_prs: &[CachedPr],
+    displayed_pr_keys: &HashSet<PrKey>,
+    open_pr_keys: &HashSet<PrKey>,
+    subscribed_pr_keys: &HashSet<PrKey>,
+) -> Vec<usize> {
+    cached_prs
+        .iter()
+        .enumerate()
+        .filter(|(_, cached)| {
+            let key = pr_key(&cached.loc.owner, &cached.loc.repo, cached.loc.number);
+            displayed_pr_keys.contains(&key)
+                && cached_pr_is_visible(cached, open_pr_keys, subscribed_pr_keys)
+        })
+        .map(|(ix, _)| ix)
+        .collect()
+}
 
 fn render_tree_row(
     row: TreeListRow,
@@ -130,9 +160,17 @@ impl ReviewApp {
     /// sidebar's cached-PR list.
     pub(crate) fn refresh_cached_prs(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let cached = cx.background_spawn(async move { scan_cached_prs() }).await;
+            let scan = cx.background_spawn(async move { scan_cached_prs() }).await;
             this.update(cx, |app, cx| {
-                app.cached_prs = cached;
+                app.cached_prs = scan.cached_prs;
+                if !scan.staged_clear_dirs.is_empty() {
+                    cx.background_spawn(async move {
+                        for dir in scan.staged_clear_dirs {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
+                    })
+                    .detach();
+                }
                 cx.notify();
             })
             .ok();
@@ -281,6 +319,89 @@ impl ReviewApp {
         }
         self.cached_prs.remove(ix);
         cx.notify();
+    }
+
+    fn confirm_clear_cached_prs(
+        &mut self,
+        displayed_pr_keys: HashSet<PrKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if displayed_pr_keys.is_empty() {
+            return;
+        }
+
+        let displayed_count = displayed_pr_keys.len();
+        let detail = format!(
+            "Remove the cached worktrees for {displayed_count} PR{} listed in Cached PRs.",
+            if displayed_count == 1 { "" } else { "s" }
+        );
+
+        // GPUI focuses the native Cancel button while Return selects the first answer.
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            "Clear all cached PRs?",
+            Some(&detail),
+            &[
+                PromptButton::ok("Clear all"),
+                PromptButton::cancel("Cancel"),
+            ],
+            cx,
+        );
+
+        cx.spawn(async move |this, cx| {
+            if matches!(receiver.await, Ok(0)) {
+                this.update(cx, |this, cx| {
+                    let open_pr_keys: HashSet<PrKey> = this
+                        .items
+                        .iter()
+                        .filter_map(|item| match &item.source {
+                            Source::Pr(loc) => Some(pr_key(&loc.owner, &loc.repo, loc.number)),
+                            Source::Local(_) => None,
+                        })
+                        .collect();
+                    let subscribed_pr_keys: HashSet<PrKey> = this
+                        .subscribed_repos
+                        .iter()
+                        .flat_map(|subscription| {
+                            subscription.prs.iter().map(|pr| {
+                                pr_key(&subscription.owner, &subscription.repo, pr.number)
+                            })
+                        })
+                        .collect();
+                    let indexes = cached_pr_indices_to_clear(
+                        &this.cached_prs,
+                        &displayed_pr_keys,
+                        &open_pr_keys,
+                        &subscribed_pr_keys,
+                    );
+                    let mut staged_dirs = Vec::new();
+                    for ix in indexes.into_iter().rev() {
+                        let dirs = std::mem::take(&mut this.cached_prs[ix].dirs);
+                        for dir in dirs {
+                            match stage_worktree_dir(&dir) {
+                                Ok(staged) => staged_dirs.push(staged),
+                                Err(_) => this.cached_prs[ix].dirs.push(dir),
+                            }
+                        }
+                        if this.cached_prs[ix].dirs.is_empty() {
+                            this.cached_prs.remove(ix);
+                        }
+                    }
+                    if !staged_dirs.is_empty() {
+                        cx.notify();
+                        cx.background_spawn(async move {
+                            for dir in staged_dirs {
+                                let _ = std::fs::remove_dir_all(dir);
+                            }
+                        })
+                        .detach();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Jump the diff to `file_ix`'s header row and hand focus to the diff
@@ -449,7 +570,7 @@ impl ReviewApp {
         // --- subscribed GitHub PRs ---
         // Feed rows remain lightweight: only the list summary is retained,
         // and opening one goes through the normal review-item path.
-        let open_pr_keys: HashSet<(String, String, u64)> = self
+        let open_pr_keys: HashSet<PrKey> = self
             .items
             .iter()
             .filter_map(|item| match &item.source {
@@ -476,7 +597,7 @@ impl ReviewApp {
                 })
             })
             .collect();
-        let subscribed_pr_keys: HashSet<(String, String, u64)> = self
+        let subscribed_pr_keys: HashSet<PrKey> = self
             .subscribed_repos
             .iter()
             .flat_map(|subscription| {
@@ -579,29 +700,55 @@ impl ReviewApp {
 
         // --- cached PRs (past reviews with an on-disk worktree) ---
         // Skip any that are already open above, so each PR shows once.
-        let cached: Vec<(usize, SharedString)> = self
+        let cached: Vec<(usize, PrKey, SharedString)> = self
             .cached_prs
             .iter()
             .enumerate()
-            .filter(|(_, c)| {
-                let key = pr_key(&c.loc.owner, &c.loc.repo, c.loc.number);
-                !open_pr_keys.contains(&key) && !subscribed_pr_keys.contains(&key)
+            .filter(|(_, c)| cached_pr_is_visible(c, &open_pr_keys, &subscribed_pr_keys))
+            .map(|(ix, c)| {
+                (
+                    ix,
+                    pr_key(&c.loc.owner, &c.loc.repo, c.loc.number),
+                    SharedString::from(format!("#{} {}", c.loc.number, c.loc.repo_slug())),
+                )
             })
-            .map(|(ix, c)| (ix, SharedString::from(format!("#{} {}", c.loc.number, c.loc.repo_slug()))))
             .collect();
         let cached_count = cached.len();
         if !cached.is_empty() {
+            let displayed_pr_keys: HashSet<PrKey> =
+                cached.iter().map(|(_, key, _)| key.clone()).collect();
             list = list.child(
                 div()
                     .mx_1()
                     .mt_2()
+                    .w_full()
                     .px_2()
                     .pb_1()
-                    .text_size(px(10.))
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("CACHED PRS")),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from("CACHED PRS")),
+                    )
+                    .child(
+                        Button::new("clear-cached-prs")
+                            .label("Clear all")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.confirm_clear_cached_prs(
+                                    displayed_pr_keys.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
             );
-            for (ix, label) in cached {
+            for (ix, _, label) in cached {
                 let entry = div()
                     .id(("cached-pr", ix))
                     .group("cached-pr")
@@ -792,5 +939,39 @@ impl ReviewApp {
                     )
                     .child(div().flex_1().min_h_0().child(tree_list)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn cached_pr(number: u64) -> CachedPr {
+        CachedPr {
+            loc: gh::PrLocator {
+                owner: "owner".into(),
+                repo: "repo".into(),
+                number,
+            },
+            dirs: vec![PathBuf::from(format!("/worktrees/{number}"))],
+        }
+    }
+
+    fn key(number: u64) -> PrKey {
+        pr_key("owner", "repo", number)
+    }
+
+    #[test]
+    fn clear_rechecks_visibility_and_only_uses_displayed_pr_identities() {
+        let cached = vec![cached_pr(1), cached_pr(2), cached_pr(3), cached_pr(4)];
+        let displayed = [key(1), key(2), key(4)].into_iter().collect();
+        let open = [key(1)].into_iter().collect();
+        let subscribed = [key(2)].into_iter().collect();
+
+        assert_eq!(
+            cached_pr_indices_to_clear(&cached, &displayed, &open, &subscribed),
+            vec![3]
+        );
     }
 }

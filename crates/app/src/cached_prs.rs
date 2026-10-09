@@ -1,6 +1,10 @@
 use anyhow::{anyhow, bail};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_STAGED_WORKTREE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Environment that makes every `git` we (or anything below us) run use the
 /// token from `gh auth login` and never block on a prompt.
@@ -49,17 +53,44 @@ pub(crate) struct CachedPr {
     pub(crate) dirs: Vec<PathBuf>,
 }
 
+#[derive(Default)]
+pub(crate) struct CachedPrScan {
+    pub(crate) cached_prs: Vec<CachedPr>,
+    pub(crate) staged_clear_dirs: Vec<PathBuf>,
+}
+
+pub(crate) fn stage_worktree_dir(path: &Path) -> std::io::Result<PathBuf> {
+    let staged_path = loop {
+        let id = NEXT_STAGED_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut name = path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("worktree"))
+            .to_os_string();
+        name.push(format!(".tmp-clear-{}-{id}", std::process::id()));
+        let staged_path = path.with_file_name(name);
+        if !staged_path.exists() {
+            break staged_path;
+        }
+    };
+    std::fs::rename(path, &staged_path).map(|()| staged_path)
+}
+
 /// Scan the worktree cache for reviewable PRs, grouped by PR and most-recently
 /// used first. Blocking (a `git` call per dir) — run off the UI thread.
-pub(crate) fn scan_cached_prs() -> Vec<CachedPr> {
+pub(crate) fn scan_cached_prs() -> CachedPrScan {
     let Some(root) = worktrees_root() else {
-        return Vec::new();
+        return CachedPrScan::default();
     };
+    scan_cached_prs_at(&root)
+}
+
+fn scan_cached_prs_at(root: &Path) -> CachedPrScan {
     let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
+        return CachedPrScan::default();
     };
     // (locator, dirs, latest mtime) — one entry per distinct PR.
     let mut grouped: Vec<(gh::PrLocator, Vec<PathBuf>, std::time::SystemTime)> = Vec::new();
+    let mut staged_clear_dirs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -67,6 +98,10 @@ pub(crate) fn scan_cached_prs() -> Vec<CachedPr> {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        if is_staged_clear_dir(&name) {
+            staged_clear_dirs.push(path);
+            continue;
+        }
         // Skip half-written clones from an in-progress materialize.
         if name.contains(".tmp-") {
             continue;
@@ -103,10 +138,31 @@ pub(crate) fn scan_cached_prs() -> Vec<CachedPr> {
         }
     }
     grouped.sort_by(|a, b| b.2.cmp(&a.2));
-    grouped
+    let cached_prs = grouped
         .into_iter()
         .map(|(loc, dirs, _)| CachedPr { loc, dirs })
-        .collect()
+        .collect();
+    CachedPrScan {
+        cached_prs,
+        staged_clear_dirs,
+    }
+}
+
+fn is_staged_clear_dir(name: &str) -> bool {
+    let Some((original_name, suffix)) = name.rsplit_once(".tmp-clear-") else {
+        return false;
+    };
+    let Some((pid, id)) = suffix.split_once('-') else {
+        return false;
+    };
+    !original_name.is_empty()
+        && cached_pr_number(original_name).is_some()
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.parse::<u32>().is_ok()
+        && !id.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<u64>().is_ok()
 }
 
 /// PR number from a `{owner}__{repo}__pr{N}__{oid}` worktree dir name.
@@ -198,6 +254,33 @@ mod tests {
         // Repos/owners with underscores don't confuse the `__pr` split.
         assert_eq!(cached_pr_number("a_b__c_d__pr7__deadbeef"), Some(7));
         assert_eq!(cached_pr_number("no-number-here"), None);
+    }
+
+    #[test]
+    fn staged_clear_dirs_are_recovered_without_deleting_recreated_worktrees() {
+        let id = NEXT_STAGED_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("lgtm-cached-pr-scan-{}-{id}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let original = root.join("owner__repo__pr17__head");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(root.join("owner__repo__pr18__head.tmp-42")).unwrap();
+        std::fs::create_dir(root.join("owner__repo__pr19__head.tmp-clear-42-invalid")).unwrap();
+        std::fs::create_dir(root.join("other.tmp-clear-42-7")).unwrap();
+
+        let staged = stage_worktree_dir(&original).unwrap();
+        let scan = scan_cached_prs_at(&root);
+
+        assert!(scan.cached_prs.is_empty());
+        assert_eq!(scan.staged_clear_dirs, vec![staged.clone()]);
+
+        std::fs::create_dir(&original).unwrap();
+        let active_marker = original.join("active");
+        std::fs::write(&active_marker, b"reopened").unwrap();
+        std::fs::remove_dir_all(&staged).unwrap();
+
+        assert_eq!(std::fs::read(&active_marker).unwrap(), b"reopened");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
