@@ -493,7 +493,9 @@ impl ReviewApp {
         }
         let panel = div()
             .id("terminal")
-            .w(px(CHAT_WIDTH))
+            .w(px(
+                (f32::from(window.bounds().size.width) * 0.25).clamp(CHAT_WIDTH, 600.)
+            ))
             .flex_shrink_0()
             .h_full()
             .flex()
