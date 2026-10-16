@@ -882,7 +882,7 @@ impl Render for ReviewApp {
                     .min_h_0()
                     .flex()
                     .when(self.sidebar_visible, |main| match self.top_view {
-                        TopView::Review => main.child(self.render_sidebar(cx)),
+                        TopView::Review => main.child(self.render_sidebar(window, cx)),
                         TopView::Tracker => main.child(self.render_tracker_sidebar(cx)),
                     })
                     .child(

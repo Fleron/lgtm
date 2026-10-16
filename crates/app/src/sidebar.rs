@@ -456,7 +456,11 @@ impl ReviewApp {
         }
     }
 
-    pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Five normal two-line entries fit before this area scrolls, leaving
         // the rest of the sidebar for the active item's file tree.
         let mut list = div()
@@ -899,7 +903,9 @@ impl ReviewApp {
         };
 
         div()
-            .w(px(260.))
+            .w(px(
+                (f32::from(window.bounds().size.width) * 0.25).clamp(260., 600.)
+            ))
             .flex_shrink_0()
             .h_full()
             .flex()
