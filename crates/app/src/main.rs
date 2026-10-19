@@ -12,6 +12,8 @@ mod minimap;
 mod palette;
 mod pr_conversation;
 mod review_checkouts;
+#[cfg(test)]
+mod review_checkouts_live_tests;
 mod selection;
 mod subscriptions;
 mod terminal;
@@ -249,7 +251,6 @@ fn main() {
                 KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
                 KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
             ]);
-            cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
@@ -270,6 +271,12 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(|cx| ReviewApp::new(sources, errors, window, cx));
+                    let weak_view = view.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        weak_view
+                            .update(cx, |view, cx| view.request_close(window.window_handle(), cx))
+                            .unwrap_or(true)
+                    });
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },

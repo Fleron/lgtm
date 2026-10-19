@@ -1,4 +1,4 @@
-use crate::cached_prs::{scan_cached_prs, stage_worktree_dir, CachedPr};
+use crate::cached_prs::{scan_cached_prs_with, CachedPr};
 use crate::diff::row_height;
 use crate::items::{ItemData, ItemState, Source};
 use crate::subscriptions::{pr_key, save_subscribed_repos, SubscribedRepo};
@@ -159,18 +159,16 @@ impl ReviewApp {
     /// Rescan the worktree cache (off the UI thread) and repopulate the
     /// sidebar's cached-PR list.
     pub(crate) fn refresh_cached_prs(&mut self, cx: &mut Context<Self>) {
+        let manager = self.checkouts.clone();
         cx.spawn(async move |this, cx| {
-            let scan = cx.background_spawn(async move { scan_cached_prs() }).await;
+            let scan = cx
+                .background_spawn(async move {
+                    manager.startup().ok();
+                    scan_cached_prs_with(&manager)
+                })
+                .await;
             this.update(cx, |app, cx| {
                 app.cached_prs = scan.cached_prs;
-                if !scan.staged_clear_dirs.is_empty() {
-                    cx.background_spawn(async move {
-                        for dir in scan.staged_clear_dirs {
-                            let _ = std::fs::remove_dir_all(dir);
-                        }
-                    })
-                    .detach();
-                }
                 cx.notify();
             })
             .ok();
@@ -311,13 +309,25 @@ impl ReviewApp {
 
     /// Delete a cached PR's worktree(s) from disk and drop it from the list.
     pub(crate) fn delete_cached_pr(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         if ix >= self.cached_prs.len() {
             return;
         }
-        for dir in &self.cached_prs[ix].dirs {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        let dirs = self.cached_prs[ix].dirs.clone();
         self.cached_prs.remove(ix);
+        let manager = self.checkouts.clone();
+        let pending_task = self.pending_checkout_tasks.begin_cleanup(u64::MAX);
+        cx.background_spawn(async move {
+            for dir in dirs {
+                if let Err(err) = manager.destroy_cached_path(&dir) {
+                    eprintln!("lgtm: cached checkout cleanup deferred: {err:#}");
+                }
+            }
+            drop(pending_task);
+        })
+        .detach();
         cx.notify();
     }
 
@@ -327,7 +337,7 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if displayed_pr_keys.is_empty() {
+        if self.closing || displayed_pr_keys.is_empty() {
             return;
         }
 
@@ -352,6 +362,9 @@ impl ReviewApp {
         cx.spawn(async move |this, cx| {
             if matches!(receiver.await, Ok(0)) {
                 this.update(cx, |this, cx| {
+                    if this.closing {
+                        return;
+                    }
                     let open_pr_keys: HashSet<PrKey> = this
                         .items
                         .iter()
@@ -375,25 +388,22 @@ impl ReviewApp {
                         &open_pr_keys,
                         &subscribed_pr_keys,
                     );
-                    let mut staged_dirs = Vec::new();
+                    let mut dirs = Vec::new();
                     for ix in indexes.into_iter().rev() {
-                        let dirs = std::mem::take(&mut this.cached_prs[ix].dirs);
-                        for dir in dirs {
-                            match stage_worktree_dir(&dir) {
-                                Ok(staged) => staged_dirs.push(staged),
-                                Err(_) => this.cached_prs[ix].dirs.push(dir),
-                            }
-                        }
-                        if this.cached_prs[ix].dirs.is_empty() {
-                            this.cached_prs.remove(ix);
-                        }
+                        dirs.extend(std::mem::take(&mut this.cached_prs[ix].dirs));
+                        this.cached_prs.remove(ix);
                     }
-                    if !staged_dirs.is_empty() {
+                    if !dirs.is_empty() {
+                        let manager = this.checkouts.clone();
+                        let pending_task = this.pending_checkout_tasks.begin_cleanup(u64::MAX);
                         cx.notify();
                         cx.background_spawn(async move {
-                            for dir in staged_dirs {
-                                let _ = std::fs::remove_dir_all(dir);
+                            for dir in dirs {
+                                if let Err(err) = manager.destroy_cached_path(&dir) {
+                                    eprintln!("lgtm: cached checkout cleanup deferred: {err:#}");
+                                }
                             }
+                            drop(pending_task);
                         })
                         .detach();
                     }

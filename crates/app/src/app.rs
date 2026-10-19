@@ -366,6 +366,9 @@ pub(crate) struct ReviewApp {
     /// next scheduled refresh.
     pub(crate) subscribed_refreshing: bool,
     pub(crate) subscribed_scroll: ScrollHandle,
+    pub(crate) checkouts: ReviewCheckoutManager,
+    pub(crate) pending_checkout_tasks: Arc<PendingCheckoutTasks>,
+    pub(crate) closing: bool,
     pub(crate) tracker: crate::tracker::TrackerState,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
@@ -428,6 +431,7 @@ impl ReviewApp {
         ];
         _subscriptions.extend(tracker_subscriptions);
         let subscribed_repos = load_subscribed_repos();
+        let checkouts = ReviewCheckoutManager::new();
         let mut this = Self {
             top_view: TopView::default(),
             items: Vec::new(),
@@ -460,6 +464,9 @@ impl ReviewApp {
             subscribed_repos,
             subscribed_refreshing: false,
             subscribed_scroll: ScrollHandle::new(),
+            checkouts,
+            pending_checkout_tasks: Arc::new(PendingCheckoutTasks::default()),
+            closing: false,
             tracker,
             _subscriptions,
         };
@@ -470,6 +477,78 @@ impl ReviewApp {
         }
         this.active = 0;
         this
+    }
+
+    pub(crate) fn request_close(
+        &mut self,
+        window_handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.closing {
+            return false;
+        }
+        self.closing = true;
+        let pending_checkout_tasks = Arc::clone(&self.pending_checkout_tasks);
+        let checkouts = self.checkouts.clone();
+        let mut cleanup_jobs = Vec::new();
+        let mut scratch_dirs = Vec::new();
+        for item in self.items.drain(..) {
+            scratch_dirs.push(chat_scratch_root(item.id));
+            let mut lsp = None;
+            let mut terminal = None;
+            if let ItemState::Ready(mut data) = item.state {
+                data.chat.cancel.store(true, Ordering::Relaxed);
+                if let Some(session) = data.lsp.take() {
+                    lsp = Some(session);
+                }
+                if let Some(session) = data.terminal.session.take() {
+                    terminal = Some(session);
+                }
+            }
+            let lease = item.checkout;
+            if let Some(lease) = lease.as_ref() {
+                lease.mark_closing();
+            }
+            if lsp.is_some() || terminal.is_some() || lease.is_some() {
+                cleanup_jobs.push(CloseCleanup {
+                    lsp,
+                    terminal,
+                    lease,
+                    task: pending_checkout_tasks.begin_cleanup(item.id),
+                });
+            }
+        }
+        pending_checkout_tasks.begin_close();
+        cx.spawn(async move |_this, cx| {
+            cx.background_spawn(async move {
+                if let Err(err) = checkouts.startup() {
+                    eprintln!("lgtm: review checkout startup failed during close: {err:#}");
+                }
+                for cleanup in cleanup_jobs {
+                    if let Some(lsp) = cleanup.lsp {
+                        lsp.session.shutdown_blocking();
+                        drop(lsp);
+                    }
+                    if let Some(terminal) = cleanup.terminal {
+                        terminal.stop_blocking();
+                    }
+                    if let Some(lease) = cleanup.lease {
+                        if let Err(err) = lease.teardown() {
+                            eprintln!("lgtm: review checkout cleanup deferred: {err:#}");
+                        }
+                    }
+                    drop(cleanup.task);
+                }
+                pending_checkout_tasks.wait_for_close();
+                for dir in scratch_dirs {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            })
+            .await;
+            let _ = window_handle.update(cx, |_, window, _| window.remove_window());
+        })
+        .detach();
+        false
     }
 
     /// Step the diff font size (cmd-+ / cmd-- / cmd-0). Row height follows the
@@ -683,7 +762,10 @@ impl ReviewApp {
             } else {
                 None
             }?;
-            let other_file_ix = data.file_rows.iter().rposition(|&header| header <= other_row)?;
+            let other_file_ix = data
+                .file_rows
+                .iter()
+                .rposition(|&header| header <= other_row)?;
             if other_file_ix != file_ix {
                 return None;
             }
@@ -732,7 +814,14 @@ impl ReviewApp {
                     let path = path.clone();
                     entity.update(cx, |this, cx| {
                         this.open_composer(
-                            None, path, anchor_side, line, start_line, row_ix, window, cx,
+                            None,
+                            path,
+                            anchor_side,
+                            line,
+                            start_line,
+                            row_ix,
+                            window,
+                            cx,
                         );
                     });
                 })
@@ -814,6 +903,9 @@ impl Render for ReviewApp {
             .flex_col()
             .bg(theme::base())
             .text_color(theme::text())
+            .on_action(cx.listener(|this, _: &Quit, window, cx| {
+                this.request_close(window.window_handle(), cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 if this.palette.is_some() {
                     this.close_palette(window, cx);
@@ -895,27 +987,51 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 this.toggle_terminal(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ShowReview, _, cx| this.show_view(TopView::Review, cx)))
-            .on_action(cx.listener(|this, _: &ShowTracker, _, cx| {
-                this.show_view(TopView::Tracker, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &ShowReview, _, cx| this.show_view(TopView::Review, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowTracker, _, cx| this.show_view(TopView::Tracker, cx)),
+            )
             .on_action(cx.listener(|this, _: &TrackerDown, _, cx| this.tracker_move(1, cx)))
             .on_action(cx.listener(|this, _: &TrackerUp, _, cx| this.tracker_move(-1, cx)))
-            .on_action(cx.listener(|this, _: &TrackerNextColumn, _, cx| this.tracker_next_column(cx)))
-            .on_action(cx.listener(|this, _: &TrackerOpen, window, cx| this.tracker_open(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &TrackerNextColumn, _, cx| this.tracker_next_column(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &TrackerOpen, window, cx| this.tracker_open(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &TrackerBack, _, cx| this.tracker_back(cx)))
-            .on_action(cx.listener(|this, _: &TrackerSetFlight, _, cx| this.tracker_set_first_flight(cx)))
-            .on_action(cx.listener(|this, _: &TrackerSetReview, _, cx| this.tracker_set_named_status("In review", cx)))
-            .on_action(cx.listener(|this, _: &TrackerSetHidden, _, cx| this.tracker_set_first_hidden(cx)))
-            .on_action(cx.listener(|this, _: &TrackerNewIssue, window, cx| this.tracker_open_new_issue_composer(None, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &TrackerSetFlight, _, cx| this.tracker_set_first_flight(cx)),
+            )
+            .on_action(cx.listener(|this, _: &TrackerSetReview, _, cx| {
+                this.tracker_set_named_status("In review", cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &TrackerSetHidden, _, cx| this.tracker_set_first_hidden(cx)),
+            )
+            .on_action(cx.listener(|this, _: &TrackerNewIssue, window, cx| {
+                this.tracker_open_new_issue_composer(None, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &TrackerFocusFilter, window, cx| {
                 let input = this.tracker.filter_input.clone();
                 input.update(cx, |state, cx| state.focus(window, cx));
             }))
-            .on_action(cx.listener(|this, _: &TrackerCycleAssignee, _, cx| this.tracker_cycle_assignee(cx)))
-            .on_action(cx.listener(|this, _: &TrackerOpenGithub, _, cx| this.tracker_open_selected_on_github(cx)))
-            .on_action(cx.listener(|this, _: &TrackerClosePanel, _, cx| this.tracker_close_panel(cx)))
-            .on_action(cx.listener(|this, _: &TrackerPanelSpace, _, cx| this.tracker_panel_space(cx)))
+            .on_action(
+                cx.listener(|this, _: &TrackerCycleAssignee, _, cx| {
+                    this.tracker_cycle_assignee(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &TrackerOpenGithub, _, cx| {
+                this.tracker_open_selected_on_github(cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &TrackerClosePanel, _, cx| this.tracker_close_panel(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &TrackerPanelSpace, _, cx| this.tracker_panel_space(cx)),
+            )
             .on_action(cx.listener(|this, _: &TrackerPanelEditTitle, window, cx| {
                 this.tracker_panel_edit_title(window, cx)
             }))
@@ -1078,9 +1194,10 @@ impl Render for ReviewApp {
                     // triggers diff keys — the same isolation the palette
                     // and composer inputs rely on. Review-only: it never
                     // renders in Tracker even if it was left open.
-                    .when(self.chat_visible && self.top_view == TopView::Review, |main| {
-                        main.child(self.render_chat(window, cx))
-                    })
+                    .when(
+                        self.chat_visible && self.top_view == TopView::Review,
+                        |main| main.child(self.render_chat(window, cx)),
+                    )
                     // Shares the chat slot; `render_pr_conversation` falls
                     // back to a placeholder when the active item isn't a
                     // loaded PR (switching items can't close the panel).
@@ -1088,9 +1205,10 @@ impl Render for ReviewApp {
                         self.pr_conversation_visible && self.top_view == TopView::Review,
                         |main| main.child(self.render_pr_conversation(window, cx)),
                     )
-                    .when(self.terminal_visible && self.top_view == TopView::Review, |main| {
-                        main.child(self.render_terminal(window, cx))
-                    })
+                    .when(
+                        self.terminal_visible && self.top_view == TopView::Review,
+                        |main| main.child(self.render_terminal(window, cx)),
+                    )
                     .when(
                         self.top_view == TopView::Tracker && self.tracker.open_issue().is_some(),
                         |main| main.child(self.render_tracker_panel(cx)),
@@ -1113,4 +1231,3 @@ impl Render for ReviewApp {
             })
     }
 }
-

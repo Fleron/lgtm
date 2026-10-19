@@ -1,10 +1,5 @@
-use anyhow::{anyhow, bail};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_STAGED_WORKTREE_ID: AtomicU64 = AtomicU64::new(0);
+use crate::review_checkouts::ReviewCheckoutManager;
+use std::path::PathBuf;
 
 /// Environment that makes every `git` we (or anything below us) run use the
 /// token from `gh auth login` and never block on a prompt.
@@ -33,17 +28,6 @@ pub(crate) fn git_env() -> [(&'static str, &'static str); 6] {
     ]
 }
 
-/// `~/.cache/lgtm/worktrees` — the parent of the per-PR LSP checkouts.
-pub(crate) fn worktrees_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".cache")
-            .join("lgtm")
-            .join("worktrees"),
-    )
-}
-
 /// A PR whose LSP worktree(s) are cached on disk, surfaced in the sidebar so a
 /// past review can be reopened or its cache cleaned up.
 #[derive(Clone)]
@@ -56,135 +40,33 @@ pub(crate) struct CachedPr {
 #[derive(Default)]
 pub(crate) struct CachedPrScan {
     pub(crate) cached_prs: Vec<CachedPr>,
-    pub(crate) staged_clear_dirs: Vec<PathBuf>,
 }
 
-pub(crate) fn stage_worktree_dir(path: &Path) -> std::io::Result<PathBuf> {
-    let staged_path = loop {
-        let id = NEXT_STAGED_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
-        let mut name = path
-            .file_name()
-            .unwrap_or_else(|| OsStr::new("worktree"))
-            .to_os_string();
-        name.push(format!(".tmp-clear-{}-{id}", std::process::id()));
-        let staged_path = path.with_file_name(name);
-        if !staged_path.exists() {
-            break staged_path;
-        }
-    };
-    std::fs::rename(path, &staged_path).map(|()| staged_path)
-}
-
-/// Scan the worktree cache for reviewable PRs, grouped by PR and most-recently
-/// used first. Blocking (a `git` call per dir) — run off the UI thread.
-pub(crate) fn scan_cached_prs() -> CachedPrScan {
-    let Some(root) = worktrees_root() else {
-        return CachedPrScan::default();
-    };
-    scan_cached_prs_at(&root)
-}
-
-fn scan_cached_prs_at(root: &Path) -> CachedPrScan {
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return CachedPrScan::default();
-    };
-    // (locator, dirs, latest mtime) — one entry per distinct PR.
-    let mut grouped: Vec<(gh::PrLocator, Vec<PathBuf>, std::time::SystemTime)> = Vec::new();
-    let mut staged_clear_dirs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if is_staged_clear_dir(&name) {
-            staged_clear_dirs.push(path);
-            continue;
-        }
-        // Skip half-written clones from an in-progress materialize.
-        if name.contains(".tmp-") {
-            continue;
-        }
-        let Some(number) = cached_pr_number(&name) else {
-            continue;
+pub(crate) fn scan_cached_prs_with(manager: &ReviewCheckoutManager) -> CachedPrScan {
+    let mut grouped: Vec<(gh::PrLocator, Vec<PathBuf>)> = Vec::new();
+    for record in manager.scan_cached() {
+        let loc = gh::PrLocator {
+            owner: record.owner,
+            repo: record.repo,
+            number: record.number,
         };
-        // The dir name sanitizes owner/repo lossily, so recover the real slug
-        // from the clone's origin remote.
-        let Some((owner, repo)) = worktree_remote(&path) else {
-            continue;
-        };
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        match grouped
-            .iter_mut()
-            .find(|(l, ..)| l.owner == owner && l.repo == repo && l.number == number)
-        {
-            Some((_, dirs, latest)) => {
-                dirs.push(path);
-                *latest = (*latest).max(mtime);
-            }
-            None => grouped.push((
-                gh::PrLocator {
-                    owner,
-                    repo,
-                    number,
-                },
-                vec![path],
-                mtime,
-            )),
+        let path = PathBuf::from(record.path);
+        if let Some((_, dirs)) = grouped.iter_mut().find(|(existing, _)| {
+            existing.owner == loc.owner
+                && existing.repo == loc.repo
+                && existing.number == loc.number
+        }) {
+            dirs.push(path);
+        } else {
+            grouped.push((loc, vec![path]));
         }
     }
-    grouped.sort_by(|a, b| b.2.cmp(&a.2));
-    let cached_prs = grouped
-        .into_iter()
-        .map(|(loc, dirs, _)| CachedPr { loc, dirs })
-        .collect();
     CachedPrScan {
-        cached_prs,
-        staged_clear_dirs,
+        cached_prs: grouped
+            .into_iter()
+            .map(|(loc, dirs)| CachedPr { loc, dirs })
+            .collect(),
     }
-}
-
-fn is_staged_clear_dir(name: &str) -> bool {
-    let Some((original_name, suffix)) = name.rsplit_once(".tmp-clear-") else {
-        return false;
-    };
-    let Some((pid, id)) = suffix.split_once('-') else {
-        return false;
-    };
-    !original_name.is_empty()
-        && cached_pr_number(original_name).is_some()
-        && !pid.is_empty()
-        && pid.bytes().all(|byte| byte.is_ascii_digit())
-        && pid.parse::<u32>().is_ok()
-        && !id.is_empty()
-        && id.bytes().all(|byte| byte.is_ascii_digit())
-        && id.parse::<u64>().is_ok()
-}
-
-/// PR number from a `{owner}__{repo}__pr{N}__{oid}` worktree dir name.
-pub(crate) fn cached_pr_number(dir_name: &str) -> Option<u64> {
-    let after = dir_name.rsplit_once("__pr")?.1;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-/// Owner/repo from a cached clone's `origin` remote URL.
-fn worktree_remote(dir: &Path) -> Option<(String, String)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(output.stdout).ok()?;
-    parse_github_owner_repo(url.trim())
 }
 
 /// Owner/repo from a GitHub remote URL (https, ssh, or scp-style).
@@ -198,90 +80,10 @@ pub(crate) fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
     (!owner.is_empty() && !repo.is_empty()).then(|| (owner.to_string(), repo.to_string()))
 }
 
-pub(crate) fn sanitize_path_part(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// `git` in `dir`. Auth and prompt suppression come from the process
-/// environment (see `git_env`), which children inherit, so nothing extra is
-/// needed here — and the same settings reach git processes we never spawn
-/// ourselves.
-pub(crate) fn git_command(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir);
-    cmd
-}
-
-pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let output = git_command(dir)
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to run git: {err}"))?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-
-    #[test]
-    fn cached_pr_dir_names_parse() {
-        assert_eq!(
-            cached_pr_number("atuinsh__atuin__pr3592__5467566b7eb4"),
-            Some(3592)
-        );
-        assert_eq!(
-            cached_pr_number("oxidecomputer__propolis__pr966__cb6365959879"),
-            Some(966)
-        );
-        // Repos/owners with underscores don't confuse the `__pr` split.
-        assert_eq!(cached_pr_number("a_b__c_d__pr7__deadbeef"), Some(7));
-        assert_eq!(cached_pr_number("no-number-here"), None);
-    }
-
-    #[test]
-    fn staged_clear_dirs_are_recovered_without_deleting_recreated_worktrees() {
-        let id = NEXT_STAGED_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("lgtm-cached-pr-scan-{}-{id}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
-        let original = root.join("owner__repo__pr17__head");
-        std::fs::create_dir(&original).unwrap();
-        std::fs::create_dir(root.join("owner__repo__pr18__head.tmp-42")).unwrap();
-        std::fs::create_dir(root.join("owner__repo__pr19__head.tmp-clear-42-invalid")).unwrap();
-        std::fs::create_dir(root.join("other.tmp-clear-42-7")).unwrap();
-
-        let staged = stage_worktree_dir(&original).unwrap();
-        let scan = scan_cached_prs_at(&root);
-
-        assert!(scan.cached_prs.is_empty());
-        assert_eq!(scan.staged_clear_dirs, vec![staged.clone()]);
-
-        std::fs::create_dir(&original).unwrap();
-        let active_marker = original.join("active");
-        std::fs::write(&active_marker, b"reopened").unwrap();
-        std::fs::remove_dir_all(&staged).unwrap();
-
-        assert_eq!(std::fs::read(&active_marker).unwrap(), b"reopened");
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn github_remote_urls_parse_to_owner_repo() {
@@ -329,5 +131,4 @@ mod tests {
             Some(&"!gh auth git-credential")
         );
     }
-
 }

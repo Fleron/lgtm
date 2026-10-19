@@ -3,9 +3,12 @@ use crate::diff::{
     build_rows, is_comment_row, nth_noncomment_row, row_height, run_upgrade, FileUpgrade,
     UpgradeJob, UpgradeSource,
 };
+use crate::lsp::{release_checkout, release_checkout_after_sessions, stop_lsp};
 use crate::lsp_client::{LspBackend, LspProgress};
 use crate::minimap::{minimap_rows, minimap_runs, MinimapLayout, MinimapRow};
+use crate::review_checkouts::ReviewCheckoutLease;
 use crate::selection::Selection;
+use crate::terminal::stop_terminal;
 use crate::terminal::TerminalState;
 use crate::theme;
 use crate::tree::{build_tree, TreeEntry, TreeEntryKind};
@@ -125,7 +128,10 @@ pub(crate) struct ItemData {
 impl ItemData {
     /// Install freshly built display rows, keeping the minimap model in sync
     /// (every row rebuild goes through here).
-    pub(crate) fn set_rows(&mut self, (rows, file_rows, hunk_rows): (Vec<Row>, Vec<usize>, Vec<usize>)) {
+    pub(crate) fn set_rows(
+        &mut self,
+        (rows, file_rows, hunk_rows): (Vec<Row>, Vec<usize>, Vec<usize>),
+    ) {
         self.minimap = minimap_rows(&rows);
         self.minimap_cache.replace(None);
         self.rows = rows;
@@ -213,6 +219,7 @@ pub(crate) struct ReviewItem {
     pub(crate) upgrade_gen: u64,
     /// Bumped whenever LSP root/session startup is restarted.
     pub(crate) lsp_gen: u64,
+    pub(crate) checkout: Option<ReviewCheckoutLease>,
 }
 
 impl ReviewItem {
@@ -325,8 +332,8 @@ impl ReviewItem {
             }
             _ => {
                 let minimap = minimap_rows(&rows);
-                let local_review = matches!(&self.source, Source::Local(_))
-                    .then(LocalReview::default);
+                let local_review =
+                    matches!(&self.source, Source::Local(_)).then(LocalReview::default);
                 let comments = match &local_review {
                     Some(local) => Some(local.index()),
                     None => comments,
@@ -455,8 +462,14 @@ pub(crate) fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Load
         }
     };
     let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) =
-        build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true, COMMENT_WRAP_CHARS);
+    let (rows, file_rows, hunk_rows) = build_rows(
+        &diff,
+        mode,
+        &HashMap::new(),
+        comments.as_ref(),
+        true,
+        COMMENT_WRAP_CHARS,
+    );
     Ok(Loaded {
         meta,
         diff,
@@ -473,6 +486,9 @@ pub(crate) fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Load
 
 impl ReviewApp {
     pub(crate) fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(ReviewItem {
@@ -483,6 +499,7 @@ impl ReviewApp {
             refresh_error: None,
             upgrade_gen: 0,
             lsp_gen: 0,
+            checkout: None,
         });
         self.active = self.items.len() - 1;
         Self::spawn_fetch(id, source, ViewMode::Split, cx);
@@ -666,15 +683,37 @@ impl ReviewApp {
         if ix >= self.items.len() {
             return;
         }
-        // Stop any in-flight chat run and drop its scratch dir (best-effort;
-        // the path is ours and never the local repo root).
-        let item = &self.items[ix];
-        if let ItemState::Ready(data) = &item.state {
+        let item_id = self.items[ix].id;
+        self.pending_checkout_tasks.cancel_item(item_id);
+        let item = self.items.remove(ix);
+        let was_pr = matches!(item.source, Source::Pr(_));
+        let mut lsp = None;
+        let mut terminal = None;
+        if let ItemState::Ready(mut data) = item.state {
             data.chat.cancel.store(true, Ordering::Relaxed);
+            lsp = data.lsp.take();
+            terminal = data.terminal.session.take();
+        }
+        if let Some(lease) = item.checkout {
+            let pending_task = self.pending_checkout_tasks.begin_cleanup(item_id);
+            if lsp.is_some() || terminal.is_some() {
+                release_checkout_after_sessions(lease, lsp, terminal, pending_task, cx);
+            } else {
+                release_checkout(lease, pending_task, cx);
+            }
+        } else {
+            if let Some(lsp) = lsp {
+                stop_lsp(lsp, self.pending_checkout_tasks.begin_cleanup(item_id), cx);
+            }
+            if let Some(terminal) = terminal {
+                stop_terminal(
+                    terminal,
+                    self.pending_checkout_tasks.begin_cleanup(item_id),
+                    cx,
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
-        let was_pr = matches!(item.source, Source::Pr(_));
-        self.items.remove(ix);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
         }
@@ -719,7 +758,12 @@ impl ReviewApp {
     /// Refetch only the review comments (not meta/patch), regroup, and
     /// rebuild the rows with the viewport anchored — the counterpart of a
     /// full refresh for the post-comment path.
-    pub(crate) fn refetch_comments(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+    pub(crate) fn refetch_comments(
+        &mut self,
+        item_id: u64,
+        loc: gh::PrLocator,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let fetched = cx
                 .background_spawn(async move { gh::fetch_review_comments(&loc) })
@@ -751,7 +795,12 @@ impl ReviewApp {
     /// Refetch only the PR meta — the post-review counterpart of
     /// `refetch_comments`, so the titlebar reflects the new review decision
     /// without reloading the whole diff.
-    pub(crate) fn refetch_meta(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+    pub(crate) fn refetch_meta(
+        &mut self,
+        item_id: u64,
+        loc: gh::PrLocator,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let fetched = cx
                 .background_spawn(async move { gh::fetch_meta(&loc) })
@@ -775,5 +824,4 @@ impl ReviewApp {
         })
         .detach();
     }
-
 }
