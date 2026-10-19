@@ -11,6 +11,7 @@ mod lsp_client;
 mod minimap;
 mod palette;
 mod pr_conversation;
+mod review_checkouts;
 mod selection;
 mod subscriptions;
 mod terminal;
