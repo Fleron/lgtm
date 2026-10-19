@@ -22,6 +22,17 @@ const SUPPRESSION_TIMEOUT: Duration = Duration::from_secs(2);
 /// project (or an unresolvable warmup symbol) can't hang session startup.
 const RA_WARMUP_DEADLINE: Duration = Duration::from_secs(90);
 
+#[derive(Debug)]
+struct LspReadTimeout;
+
+impl std::fmt::Display for LspReadTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("no LSP message received before the read deadline")
+    }
+}
+
+impl std::error::Error for LspReadTimeout {}
+
 /// Which language server backs hover / go-to-definition. Bifrost (embedded,
 /// tree-sitter, build-free) is the default and works on any repo, including
 /// unbuilt PR worktrees, but only resolves symbols lexically. rust-analyzer
@@ -76,7 +87,7 @@ pub struct HoverResult {
 pub struct LspClient {
     root: PathBuf,
     backend: LspBackend,
-    child: Child,
+    child: Arc<LspChildControl>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -89,9 +100,56 @@ pub struct LspClient {
     ra_quiescent: bool,
 }
 
+struct LspChildControl {
+    child: Mutex<Option<Child>>,
+    stopping: AtomicBool,
+}
+
+impl LspChildControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            child: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+        })
+    }
+
+    fn install(&self, mut child: Child) -> Result<()> {
+        if self.stopping.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("LSP startup canceled")
+        }
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopping.load(Ordering::Acquire) {
+            drop(slot);
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("LSP startup canceled")
+        }
+        *slot = Some(child);
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut child) = child.take() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
 #[derive(Clone)]
 pub struct LspSession {
-    commands: mpsc::Sender<LspCommand>,
+    commands: Arc<Mutex<Option<mpsc::Sender<LspCommand>>>>,
+    worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    child: Arc<LspChildControl>,
+    watcher_stop: Arc<AtomicBool>,
+    watcher: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 enum LspCommand {
@@ -128,6 +186,24 @@ impl LspClient {
         progress: Arc<Mutex<LspProgress>>,
         warmup: Option<LspPosition>,
     ) -> Result<Self> {
+        Self::start_with_control(
+            root,
+            backend,
+            progress,
+            warmup,
+            LspChildControl::new(),
+            RA_WARMUP_DEADLINE,
+        )
+    }
+
+    fn start_with_control(
+        root: PathBuf,
+        backend: LspBackend,
+        progress: Arc<Mutex<LspProgress>>,
+        warmup: Option<LspPosition>,
+        child_control: Arc<LspChildControl>,
+        warmup_deadline: Duration,
+    ) -> Result<Self> {
         // Canonicalize up front so `self.root` matches the form the server
         // sees: request URIs go through `file_uri` (which canonicalizes) and
         // response URIs are mapped back by stripping `self.root`. A symlinked
@@ -135,7 +211,10 @@ impl LspClient {
         // fail to strip and silently drop every definition.
         let root = root.canonicalize().unwrap_or(root);
         let (bin, args) = server_command(backend, &root)?;
-        let mut child = Command::new(&bin)
+        if child_control.stopping.load(Ordering::Acquire) {
+            bail!("LSP startup canceled")
+        }
+        let child = Command::new(&bin)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -144,18 +223,40 @@ impl LspClient {
             .with_context(|| {
                 format!("failed to start {} LSP: {}", backend.label(), bin.display())
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .with_context(|| format!("{} LSP stdin unavailable", backend.label()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .with_context(|| format!("{} LSP stdout unavailable", backend.label()))?;
+        child_control.install(child)?;
+        let mut child = child_control
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let child_ref = match child.as_mut() {
+            Some(child) => child,
+            None => {
+                drop(child);
+                child_control.stop();
+                bail!("LSP child disappeared during startup")
+            }
+        };
+        let stdin = match child_ref.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                drop(child);
+                child_control.stop();
+                bail!("{} LSP stdin unavailable", backend.label())
+            }
+        };
+        let stdout = match child_ref.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                drop(child);
+                child_control.stop();
+                bail!("{} LSP stdout unavailable", backend.label())
+            }
+        };
+        drop(child);
         let mut this = Self {
             root,
             backend,
-            child,
+            child: Arc::clone(&child_control),
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
@@ -163,9 +264,15 @@ impl LspClient {
             open_docs: std::collections::HashSet::new(),
             ra_quiescent: false,
         };
-        this.initialize()?;
-        this.warm_up(warmup.as_ref())?;
-        Ok(this)
+        let result = (|| {
+            this.initialize()?;
+            this.warm_up(warmup.as_ref(), warmup_deadline)?;
+            Ok(this)
+        })();
+        if result.is_err() {
+            child_control.stop();
+        }
+        result
     }
 
     pub fn hover(&mut self, pos: &LspPosition) -> Result<Option<HoverResult>> {
@@ -272,7 +379,7 @@ impl LspClient {
             .collect())
     }
 
-    fn warm_up(&mut self, pos: Option<&LspPosition>) -> Result<()> {
+    fn warm_up(&mut self, pos: Option<&LspPosition>, deadline: Duration) -> Result<()> {
         {
             let mut progress = self.progress.lock().unwrap();
             progress.message = Some("Warming LSP queries".to_string());
@@ -286,15 +393,14 @@ impl LspClient {
             // (or the deadline) so "ready" means hovers actually resolve — and
             // the status shows "Analyzing" meanwhile, not a stuck "100%".
             (LspBackend::RustAnalyzer, _) => {
-                let deadline = std::time::Instant::now() + RA_WARMUP_DEADLINE;
+                let deadline = std::time::Instant::now() + deadline;
                 while !self.ra_quiescent && std::time::Instant::now() < deadline {
                     match self.read_message_timeout(Duration::from_millis(500)) {
                         Ok(msg) => {
                             self.handle_server_message(&msg)?;
                         }
-                        // No message this tick (or a read hiccup): loop and
-                        // re-check `ra_quiescent`/deadline.
-                        Err(_) => {}
+                        Err(err) if err.is::<LspReadTimeout>() => {}
+                        Err(err) => return Err(err),
                     }
                 }
             }
@@ -562,7 +668,7 @@ impl LspClient {
             return Err(std::io::Error::last_os_error()).context("polling LSP stdout");
         }
         if n == 0 {
-            bail!("no message received");
+            return Err(LspReadTimeout.into());
         }
         Ok(())
     }
@@ -658,9 +764,58 @@ impl LspSession {
         progress: Arc<Mutex<LspProgress>>,
         warmup: Option<LspPosition>,
     ) -> Result<Self> {
-        let mut client = LspClient::start(root, backend, progress, warmup)?;
+        Self::start_cancellable(root, backend, progress, warmup, None)
+    }
+
+    pub fn start_cancellable(
+        root: PathBuf,
+        backend: LspBackend,
+        progress: Arc<Mutex<LspProgress>>,
+        warmup: Option<LspPosition>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Self> {
+        let child = LspChildControl::new();
+        let watcher_stop = Arc::new(AtomicBool::new(false));
+        let watcher = if let Some(cancel) = cancel {
+            let child = Arc::clone(&child);
+            let watcher_stop = Arc::clone(&watcher_stop);
+            Some(
+                std::thread::Builder::new()
+                    .name("lsp-startup-cancel".to_string())
+                    .spawn(move || {
+                        while !watcher_stop.load(Ordering::Acquire) {
+                            if cancel.load(Ordering::Acquire) {
+                                child.stop();
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    })
+                    .context("starting LSP startup cancellation watcher")?,
+            )
+        } else {
+            None
+        };
+        let watcher = Arc::new(Mutex::new(watcher));
+        let mut client = match LspClient::start_with_control(
+            root,
+            backend,
+            progress,
+            warmup,
+            Arc::clone(&child),
+            RA_WARMUP_DEADLINE,
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                watcher_stop.store(true, Ordering::Release);
+                if let Some(watcher) = watcher.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = watcher.join();
+                }
+                return Err(err);
+            }
+        };
         let (commands, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("bifrost-lsp".to_string())
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
@@ -708,8 +863,47 @@ impl LspSession {
                     }
                 }
             })
-            .context("starting Bifrost LSP worker")?;
-        Ok(Self { commands })
+            .context("starting Bifrost LSP worker");
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(err) => {
+                child.stop();
+                watcher_stop.store(true, Ordering::Release);
+                if let Some(watcher) = watcher.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = watcher.join();
+                }
+                return Err(err);
+            }
+        };
+        Ok(Self {
+            commands: Arc::new(Mutex::new(Some(commands))),
+            worker: Arc::new(Mutex::new(Some(worker))),
+            child,
+            watcher_stop,
+            watcher,
+        })
+    }
+
+    pub fn shutdown_blocking(&self) {
+        self.child.stop();
+        let sender = self
+            .commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(sender);
+        if let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = worker.join();
+        }
+        self.watcher_stop.store(true, Ordering::Release);
+        if let Some(watcher) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = watcher.join();
+        }
     }
 
     pub fn hover(
@@ -724,7 +918,13 @@ impl LspSession {
             position.line + 1,
             position.character + 1
         ));
-        self.commands
+        let commands = self
+            .commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("Bifrost LSP worker stopped")?;
+        commands
             .send(LspCommand::Hover {
                 position,
                 canceled,
@@ -742,24 +942,35 @@ impl LspSession {
             position.line + 1,
             position.character + 1
         ));
-        self.commands
+        let commands = self
+            .commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("Bifrost LSP worker stopped")?;
+        commands
             .send(LspCommand::Definition { position, reply })
             .context("Bifrost LSP worker stopped")?;
         response.recv().context("Bifrost LSP worker stopped")?
     }
 }
 
-impl Drop for LspClient {
+impl Drop for LspSession {
     fn drop(&mut self) {
-        let _ = self.notify("exit", json!({}));
-        let _ = self.child.kill();
+        if Arc::strong_count(&self.worker) == 1 {
+            self.shutdown_blocking();
+        }
     }
 }
 
-fn server_command(
-    backend: LspBackend,
-    root: &Path,
-) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        let _ = self.notify("exit", json!({}));
+        self.child.stop();
+    }
+}
+
+fn server_command(backend: LspBackend, root: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
     match backend {
         LspBackend::Bifrost => {
             if let Some(bin) = std::env::var_os("LGTM_BIFROST") {
@@ -880,6 +1091,9 @@ fn target_contains_position(target: &DefinitionTarget, pos: &LspPosition) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    static LSP_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn position_of(root: &Path, rel: &str, needle: &str) -> LspPosition {
         let text = std::fs::read_to_string(root.join(rel)).expect("read smoke-test source file");
@@ -1222,5 +1436,220 @@ mod tests {
             ext.path
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canceled_lsp_startup_kills_and_reaps_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = LSP_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("lgtm-lsp-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("blocked-lsp.sh");
+        std::fs::write(&server, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+
+        let previous = std::env::var_os("LGTM_RUST_ANALYZER");
+        std::env::set_var("LGTM_RUST_ANALYZER", &server);
+        let canceled = Arc::new(AtomicBool::new(false));
+        let cancel_after_start = Arc::clone(&canceled);
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancel_after_start.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let result = LspSession::start_cancellable(
+            dir.clone(),
+            LspBackend::RustAnalyzer,
+            Arc::new(Mutex::new(LspProgress::default())),
+            None,
+            Some(canceled),
+        );
+        cancel_thread.join().unwrap();
+        if let Some(previous) = previous {
+            std::env::set_var("LGTM_RUST_ANALYZER", previous);
+        } else {
+            std::env::remove_var("LGTM_RUST_ANALYZER");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(result.is_err(), "canceled startup should fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "startup cancellation hung"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rust_analyzer_startup_returns_when_server_exits_before_quiescence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = LSP_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "lgtm-lsp-ra-eof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("rust-analyzer.sh");
+        std::fs::write(
+            &server,
+            r###"#!/bin/sh
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | tr -d '\r')
+  case "$line" in
+    Content-Length:*) length=${line#Content-Length: } ;;
+    '')
+      dd bs=1 count="$length" >/dev/null 2>&1
+      response='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+      printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+      exit 0
+      ;;
+  esac
+done
+"###,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+
+        let previous = std::env::var_os("LGTM_RUST_ANALYZER");
+        std::env::set_var("LGTM_RUST_ANALYZER", &server);
+        let started = std::time::Instant::now();
+        let result = LspClient::start_with_control(
+            dir.clone(),
+            LspBackend::RustAnalyzer,
+            Arc::new(Mutex::new(LspProgress::default())),
+            None,
+            LspChildControl::new(),
+            Duration::from_millis(250),
+        );
+        if let Some(previous) = previous {
+            std::env::set_var("LGTM_RUST_ANALYZER", previous);
+        } else {
+            std::env::remove_var("LGTM_RUST_ANALYZER");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            result.is_err(),
+            "startup should fail when rust-analyzer exits"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "EOF during rust-analyzer warmup was swallowed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lsp_request_unblocks_when_session_shutdown_kills_child() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+
+        let _guard = LSP_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("lgtm-lsp-request-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("hover-requested");
+        let server = dir.join("blocking-lsp.sh");
+        std::fs::write(
+            &server,
+            r###"#!/bin/sh
+request=0
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | tr -d '\r')
+  case "$line" in
+    Content-Length:*) length=${line#Content-Length: } ;;
+    '')
+      body=$(dd bs=1 count="$length" 2>/dev/null)
+      case "$request" in
+        0)
+          response='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+          printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+          progress='{"jsonrpc":"2.0","method":"$/progress","params":{"value":{"kind":"end"}}}'
+          printf 'Content-Length: %s\r\n\r\n%s' "${#progress}" "$progress"
+          status='{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"quiescent":true}}'
+          printf 'Content-Length: %s\r\n\r\n%s' "${#status}" "$status"
+          ;;
+        2)
+          : > "$LGTM_FAKE_LSP_MARKER"
+          while IFS= read -r ignored; do :; done
+          ;;
+      esac
+      request=$((request + 1))
+      ;;
+  esac
+done
+"###,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&server).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&server, permissions).unwrap();
+
+        let previous_server = std::env::var_os("LGTM_RUST_ANALYZER");
+        let previous_marker = std::env::var_os("LGTM_FAKE_LSP_MARKER");
+        std::env::set_var("LGTM_RUST_ANALYZER", &server);
+        std::env::set_var("LGTM_FAKE_LSP_MARKER", &marker);
+        let session = LspSession::start(
+            dir.clone(),
+            LspBackend::RustAnalyzer,
+            Arc::new(Mutex::new(LspProgress::default())),
+            None,
+        )
+        .expect("fake LSP should initialize");
+        let request_session = session.clone();
+        let (reply, response) = mpsc::channel();
+        let request_thread = std::thread::spawn(move || {
+            let result = request_session.hover(
+                LspPosition {
+                    path: "src/lib.rs".to_string(),
+                    line: 0,
+                    character: 0,
+                },
+                Arc::new(AtomicBool::new(false)),
+            );
+            reply.send(result).unwrap();
+        });
+        for _ in 0..200 {
+            if marker.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.is_file(), "fake LSP did not receive hover request");
+        session.shutdown_blocking();
+        let result = response
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hover request should unblock after shutdown");
+        request_thread.join().unwrap();
+        if let Some(previous_server) = previous_server {
+            std::env::set_var("LGTM_RUST_ANALYZER", previous_server);
+        } else {
+            std::env::remove_var("LGTM_RUST_ANALYZER");
+        }
+        if let Some(previous_marker) = previous_marker {
+            std::env::set_var("LGTM_FAKE_LSP_MARKER", previous_marker);
+        } else {
+            std::env::remove_var("LGTM_FAKE_LSP_MARKER");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            result.is_err(),
+            "shutdown should cancel the blocked request"
+        );
     }
 }
