@@ -191,6 +191,17 @@ impl ReviewCheckoutManager {
         Ok(lock)
     }
 
+    fn metadata_lock_cancellable(&self, cancel: &AtomicBool) -> Result<File> {
+        fs::create_dir_all(self.state_root())?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.state_lock_path())?;
+        lock_file_cancellable(&lock, LOCK_EX, cancel)?;
+        Ok(lock)
+    }
+
     fn lease_path(&self, spec: &CheckoutSpec) -> PathBuf {
         self.state_root()
             .join("leases")
@@ -220,6 +231,27 @@ impl ReviewCheckoutManager {
         Ok(())
     }
 
+    fn ensure_startup_cancellable(&self, cancel: &AtomicBool) -> Result<()> {
+        check_acquire_cancelled(cancel)?;
+        let _startup = loop {
+            match self.inner.startup_lock.try_lock() {
+                Ok(startup) => break startup,
+                Err(TryLockError::Poisoned(startup)) => break startup.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    check_acquire_cancelled(cancel)?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        if self.inner.startup_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        check_acquire_cancelled(cancel)?;
+        self.run_startup_cancellable(cancel)?;
+        self.inner.startup_complete.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub(crate) fn startup(&self) -> Result<()> {
         self.ensure_startup()
     }
@@ -230,15 +262,29 @@ impl ReviewCheckoutManager {
         head_oid: &str,
     ) -> Result<ReviewCheckoutLease> {
         self.ensure_startup()?;
-        self.acquire_after_startup(loc, head_oid)
+        self.acquire_after_startup(loc, head_oid, None)
+    }
+
+    pub(crate) fn acquire_cancellable(
+        &self,
+        loc: &gh::PrLocator,
+        head_oid: &str,
+        cancel: &AtomicBool,
+    ) -> Result<ReviewCheckoutLease> {
+        self.ensure_startup_cancellable(cancel)?;
+        self.acquire_after_startup(loc, head_oid, Some(cancel))
     }
 
     fn acquire_after_startup(
         &self,
         loc: &gh::PrLocator,
         head_oid: &str,
+        cancel: Option<&AtomicBool>,
     ) -> Result<ReviewCheckoutLease> {
         let spec = CheckoutSpec::new(loc, head_oid)?;
+        if let Some(cancel) = cancel {
+            check_acquire_cancelled(cancel)?;
+        }
         let path = self.lease_path(&spec);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -248,7 +294,11 @@ impl ReviewCheckoutManager {
             .read(true)
             .write(true)
             .open(&path)?;
-        lock_file(&file, LOCK_SH)?;
+        if let Some(cancel) = cancel {
+            lock_file_cancellable(&file, LOCK_SH, cancel)?;
+        } else {
+            lock_file(&file, LOCK_SH)?;
+        }
         let now = now_secs();
         let update = |record: &mut Option<CheckoutRecord>| {
             let record = record.get_or_insert_with(|| CheckoutRecord {
@@ -284,7 +334,11 @@ impl ReviewCheckoutManager {
             Self::update_record_in_metadata(metadata, &spec, update);
             Ok(())
         };
-        self.with_metadata(update_metadata)?;
+        if let Some(cancel) = cancel {
+            self.with_metadata_cancellable(cancel, update_metadata)?;
+        } else {
+            self.with_metadata(update_metadata)?;
+        }
         Ok(ReviewCheckoutLease {
             inner: Arc::new(LeaseInner {
                 manager: self.clone(),
@@ -384,6 +438,100 @@ impl ReviewCheckoutManager {
             return false;
         };
         try_lock_file(&file, LOCK_EX).is_ok()
+    }
+
+    pub(crate) fn materialize(&self, lease: &ReviewCheckoutLease) -> Result<PathBuf> {
+        let operation = lease.operation("materialize")?;
+        let cancel = operation.cancel_token();
+        let spec = &lease.inner.spec;
+        let repo_lock = self.repo_lock_cancellable(spec, &cancel)?;
+        let _metadata_lock = self.metadata_lock_cancellable(&cancel)?;
+        let base = self.ensure_base(spec, &cancel)?;
+        self.fetch_and_verify(&base, spec, &cancel)?;
+        self.validate_base_layout(&base)?;
+        let mut metadata = self.read_records_locked()?;
+        let mut existing = None;
+        for record in &metadata.records {
+            if record.key != spec.key() || record.kind != RecordKind::Linked {
+                continue;
+            }
+            if self.validate_record_path(record).is_err() {
+                continue;
+            }
+            if !Path::new(&record.path).is_dir() {
+                continue;
+            }
+            if registered_worktree_cancellable(
+                &base,
+                Path::new(&record.path),
+                &spec.head_oid,
+                &cancel,
+            )? {
+                existing = Some(record.clone());
+                break;
+            }
+        }
+        let path = if let Some(record) = existing {
+            PathBuf::from(record.path)
+        } else {
+            let path = self.worktrees_root().join(spec.key());
+            if path.exists() {
+                bail!(
+                    "registered review checkout path is not reusable: {}",
+                    path.display()
+                );
+            }
+            fs::create_dir_all(self.worktrees_root())?;
+            run_git_cancellable(
+                &base,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    path.to_str().context("checkout path is not UTF-8")?,
+                    &spec.head_oid,
+                ],
+                &cancel,
+            )?;
+            path
+        };
+        if !registered_worktree_cancellable(&base, &path, &spec.head_oid, &cancel)? {
+            bail!("git did not register review checkout {}", path.display());
+        }
+        let admin = git_output_cancellable(&path, &["rev-parse", "--absolute-git-dir"], &cancel)?;
+        let admin = PathBuf::from(admin.trim());
+        let now = now_secs();
+        self.update_record_locked(&mut metadata, &spec, |record| {
+            let record = record.get_or_insert_with(|| CheckoutRecord {
+                key: spec.key(),
+                owner: spec.owner.clone(),
+                repo: spec.repo.clone(),
+                number: spec.number,
+                head_oid: spec.head_oid.clone(),
+                path: path.display().to_string(),
+                git_admin_dir: None,
+                created_secs: now,
+                last_used_secs: now,
+                pending_cleanup: false,
+                storage_teardown_complete: false,
+                storage_initialized_without_id: false,
+                materialized: true,
+                kind: RecordKind::Linked,
+            });
+            record.path = path.display().to_string();
+            record.git_admin_dir = Some(admin.display().to_string());
+            record.materialized = true;
+            record.last_used_secs = now;
+            record.pending_cleanup = false;
+            record.storage_teardown_complete = false;
+            record.storage_initialized_without_id = false;
+            record.kind = RecordKind::Linked;
+        });
+        self.write_records_locked(&metadata)?;
+        *lease.inner.path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+        drop(_metadata_lock);
+        drop(repo_lock);
+        Ok(path)
     }
 
     pub(crate) fn teardown(&self, lease: &ReviewCheckoutLease) -> Result<bool> {
@@ -862,6 +1010,11 @@ impl ReviewCheckoutManager {
         self.run_startup_locked()
     }
 
+    fn run_startup_cancellable(&self, cancel: &AtomicBool) -> Result<()> {
+        let _metadata_lock = self.metadata_lock_cancellable(cancel)?;
+        self.run_startup_locked()
+    }
+
     fn run_startup_locked(&self) -> Result<()> {
         fs::create_dir_all(self.state_root().join("leases"))?;
         fs::create_dir_all(self.state_root().join("repos"))?;
@@ -1306,6 +1459,66 @@ impl ReviewCheckoutManager {
         Ok(())
     }
 
+    fn ensure_base(&self, spec: &CheckoutSpec, cancel: &AtomicBool) -> Result<PathBuf> {
+        check_cancelled(cancel)?;
+        self.validate_managed_roots()?;
+        let base = self.repos_root().join(spec.repo_key());
+        match fs::symlink_metadata(&base) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("cached base clone is a symlink: {}", base.display())
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        if base.exists() {
+            self.validate_base_layout(&base)?;
+            let remote =
+                git_output_cancellable(&base, &["config", "--get", "remote.origin.url"], cancel)?;
+            if !self.remote_matches(spec, remote.trim()) {
+                bail!("cached base clone has the wrong origin: {}", base.display());
+            }
+            return Ok(base);
+        }
+        let tmp = self
+            .repos_root()
+            .join(format!("{}.tmp-{}", spec.repo_key(), std::process::id()));
+        if tmp.exists() {
+            bail!("partial base clone already exists: {}", tmp.display());
+        }
+        let url = self
+            .inner
+            .remote_override
+            .clone()
+            .unwrap_or_else(|| format!("https://github.com/{}/{}.git", spec.owner, spec.repo));
+        let clone_result = run_command_cancellable(
+            &mut Command::new("git")
+                .args(["clone", "--no-checkout", "--filter=blob:none", &url])
+                .arg(&tmp),
+            cancel,
+        );
+        if let Err(err) = clone_result {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(err);
+        }
+        if let Err(err) = check_cancelled(cancel) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(err);
+        }
+        if let Err(err) = self.validate_base_layout(&tmp) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(err);
+        }
+        if let Err(err) = fs::rename(&tmp, &base) {
+            if base.is_dir() {
+                return Ok(base);
+            }
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(err.into());
+        }
+        Ok(base)
+    }
+
     fn validate_base_layout(&self, base: &Path) -> Result<()> {
         let base_metadata = fs::symlink_metadata(base)
             .with_context(|| format!("resolving cached base clone {}", base.display()))?;
@@ -1389,6 +1602,56 @@ impl ReviewCheckoutManager {
         Ok(())
     }
 
+    fn remote_matches(&self, spec: &CheckoutSpec, actual: &str) -> bool {
+        if let Some(expected) = self.inner.remote_override.as_deref() {
+            return same_remote(expected, actual);
+        }
+        crate::cached_prs::parse_github_owner_repo(actual).is_some_and(|(owner, repo)| {
+            owner.eq_ignore_ascii_case(&spec.owner) && repo.eq_ignore_ascii_case(&spec.repo)
+        })
+    }
+
+    fn fetch_and_verify(
+        &self,
+        base: &Path,
+        spec: &CheckoutSpec,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        let pull_ref = format!("refs/pull/{}/head", spec.number);
+        let local_ref = format!("refs/lgtm/pull/{}", spec.number);
+        run_git_cancellable(
+            base,
+            &[
+                "fetch",
+                "--filter=blob:none",
+                "origin",
+                &format!("+{pull_ref}:{local_ref}"),
+            ],
+            cancel,
+        )?;
+        let fetched = git_output_cancellable(
+            base,
+            &["rev-parse", &format!("{local_ref}^{{commit}}")],
+            cancel,
+        )?;
+        if fetched.trim() != spec.head_oid {
+            bail!(
+                "fetched PR head {} instead of requested {}",
+                fetched.trim(),
+                spec.head_oid
+            );
+        }
+        let full = git_output_cancellable(
+            base,
+            &["cat-file", "-e", &format!("{}^{{commit}}", spec.head_oid)],
+            cancel,
+        );
+        if full.is_err() {
+            bail!("requested PR head is not a complete commit in base clone");
+        }
+        Ok(())
+    }
+
     fn repo_lock(&self, spec: &CheckoutSpec) -> Result<File> {
         let path = self.repo_lock_path(spec);
         if let Some(parent) = path.parent() {
@@ -1400,6 +1663,20 @@ impl ReviewCheckoutManager {
             .write(true)
             .open(path)?;
         lock_file(&file, LOCK_EX)?;
+        Ok(file)
+    }
+
+    fn repo_lock_cancellable(&self, spec: &CheckoutSpec, cancel: &AtomicBool) -> Result<File> {
+        let path = self.repo_lock_path(spec);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        lock_file_cancellable(&file, LOCK_EX, cancel)?;
         Ok(file)
     }
 
@@ -1462,6 +1739,18 @@ impl ReviewCheckoutManager {
 
     fn with_metadata<R>(&self, f: impl FnOnce(&mut Metadata) -> Result<R>) -> Result<R> {
         let _lock = self.metadata_lock()?;
+        let mut metadata = self.read_records_locked()?;
+        let result = f(&mut metadata)?;
+        self.write_records_locked(&metadata)?;
+        Ok(result)
+    }
+
+    fn with_metadata_cancellable<R>(
+        &self,
+        cancel: &AtomicBool,
+        f: impl FnOnce(&mut Metadata) -> Result<R>,
+    ) -> Result<R> {
+        let _lock = self.metadata_lock_cancellable(cancel)?;
         let mut metadata = self.read_records_locked()?;
         let result = f(&mut metadata)?;
         self.write_records_locked(&metadata)?;
@@ -1669,6 +1958,81 @@ fn run_command(command: &mut Command) -> Result<()> {
     }
 }
 
+fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        bail!("review checkout materialization cancelled");
+    }
+    Ok(())
+}
+
+fn check_acquire_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        bail!("review checkout acquisition cancelled");
+    }
+    Ok(())
+}
+
+fn lock_file_cancellable(file: &File, mode: i32, cancel: &AtomicBool) -> Result<()> {
+    loop {
+        check_acquire_cancelled(cancel)?;
+        let result = unsafe { flock(file.as_raw_fd(), mode | LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) -> Result<()> {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    child.wait()?;
+    Ok(())
+}
+
+fn run_command_cancellable(command: &mut Command, cancel: &AtomicBool) -> Result<()> {
+    check_cancelled(cancel)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_process_group(command_with_env(command));
+    let mut child = command.spawn()?;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            terminate_process_group(&mut child)?;
+            bail!("review checkout materialization cancelled");
+        }
+        if let Some(status) = child.try_wait()? {
+            let output = child.wait_with_output()?;
+            if status.success() {
+                return Ok(());
+            }
+            bail!(
+                "command failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn git_command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(args);
@@ -1678,6 +2042,11 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
 fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     let mut command = git_command(dir, args);
     run_command(&mut command)
+}
+
+fn run_git_cancellable(dir: &Path, args: &[&str], cancel: &AtomicBool) -> Result<()> {
+    let mut command = git_command(dir, args);
+    run_command_cancellable(&mut command, cancel)
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
@@ -1691,6 +2060,51 @@ fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
+
+fn git_output_cancellable(dir: &Path, args: &[&str], cancel: &AtomicBool) -> Result<String> {
+    check_cancelled(cancel)?;
+    let mut command = git_command(dir, args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_process_group(command_with_env(&mut command));
+    let mut child = command.spawn()?;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            terminate_process_group(&mut child)?;
+            bail!("review checkout materialization cancelled");
+        }
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            if output.status.success() {
+                return Ok(String::from_utf8(output.stdout)?);
+            }
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn registered_worktree_cancellable(
+    base: &Path,
+    path: &Path,
+    head_oid: &str,
+    cancel: &AtomicBool,
+) -> Result<bool> {
+    let top = git_output_cancellable(path, &["rev-parse", "--show-toplevel"], cancel)?;
+    let head = git_output_cancellable(path, &["rev-parse", "HEAD"], cancel)?;
+    let Ok(dot_git) = fs::symlink_metadata(path.join(".git")) else {
+        return Ok(false);
+    };
+    Ok(dot_git.file_type().is_file()
+        && PathBuf::from(top.trim()).canonicalize().ok() == path.canonicalize().ok()
+        && head.trim() == head_oid
+        && registered_paths_cancellable(base, cancel)?
+            .iter()
+            .any(|registered| registered.canonicalize().ok() == path.canonicalize().ok()))
 }
 
 fn registered_path(base: &Path, path: &Path) -> Result<bool> {
@@ -1810,8 +2224,37 @@ fn canonicalize_with_missing(path: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
+fn same_remote(expected: &str, actual: &str) -> bool {
+    if expected == actual {
+        return true;
+    }
+    if let (Some(expected), Some(actual)) = (
+        crate::cached_prs::parse_github_owner_repo(expected),
+        crate::cached_prs::parse_github_owner_repo(actual),
+    ) {
+        return expected.0.eq_ignore_ascii_case(&actual.0)
+            && expected.1.eq_ignore_ascii_case(&actual.1);
+    }
+    let expected_path = Path::new(expected.strip_prefix("file://").unwrap_or(expected));
+    let actual_path = Path::new(actual.strip_prefix("file://").unwrap_or(actual));
+    expected_path
+        .canonicalize()
+        .ok()
+        .zip(actual_path.canonicalize().ok())
+        .is_some_and(|(expected, actual)| expected == actual)
+}
+
 fn registered_paths(base: &Path) -> Result<Vec<PathBuf>> {
     let output = git_output(base, &["worktree", "list", "--porcelain"])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
+fn registered_paths_cancellable(base: &Path, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
+    let output = git_output_cancellable(base, &["worktree", "list", "--porcelain"], cancel)?;
     Ok(output
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
@@ -1911,6 +2354,14 @@ fn legacy_identity(path: &Path) -> Result<Option<(String, String, u64, String)>>
 }
 
 #[cfg(test)]
+#[path = "review_checkouts_recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
+#[path = "review_checkouts_safety_tests.rs"]
+mod safety_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
@@ -1928,6 +2379,18 @@ mod tests {
         path
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        command
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com");
+        assert!(command.status().unwrap().success(), "git {:?}", args);
+    }
+
     #[test]
     fn names_are_case_insensitive_and_oids_must_be_full() {
         let loc = gh::PrLocator {
@@ -1938,6 +2401,121 @@ mod tests {
         let spec = CheckoutSpec::new(&loc, &"A".repeat(40)).unwrap();
         assert_eq!(spec.key(), "acme__thing__pr3__aaaaaaaaaaaa");
         assert!(CheckoutSpec::new(&loc, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn materializes_one_base_and_two_registered_heads() {
+        let remote = temp_path("remote");
+        git(&remote, &["init", "--bare"]);
+        let seed = temp_path("seed");
+        git(&seed, &["init"]);
+        fs::write(seed.join("file"), "one\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-m", "one"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "origin", "HEAD:main"]);
+        fs::write(seed.join("file"), "two\n").unwrap();
+        git(&seed, &["commit", "-am", "two"]);
+        let second = git_output(&seed, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git(&seed, &["push", "origin", "HEAD:refs/pull/7/head"]);
+        fs::write(seed.join("file"), "three\n").unwrap();
+        git(&seed, &["commit", "-am", "three"]);
+        let third = git_output(&seed, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        git(&seed, &["push", "origin", "HEAD:refs/pull/8/head"]);
+        let root = temp_path("root");
+        let manager =
+            ReviewCheckoutManager::at_root(root.join("cache"), Some(remote.display().to_string()));
+        let loc = gh::PrLocator {
+            owner: "Acme".into(),
+            repo: "Thing".into(),
+            number: 7,
+        };
+        let first_lease = manager.acquire(&loc, &second).unwrap();
+        let first_path = manager.materialize(&first_lease).unwrap();
+        assert!(first_path.join(".git").is_file());
+        assert_eq!(
+            git_output(&first_path, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            second
+        );
+        let second_lease = manager.acquire(&loc, &second).unwrap();
+        assert_eq!(manager.materialize(&second_lease).unwrap(), first_path);
+        let second_head_loc = gh::PrLocator {
+            owner: "acme".into(),
+            repo: "thing".into(),
+            number: 8,
+        };
+        let second_head_lease = manager.acquire(&second_head_loc, &third).unwrap();
+        let second_head_path = manager.materialize(&second_head_lease).unwrap();
+        assert_ne!(second_head_path, first_path);
+        drop(second_head_lease);
+        manager
+            .with_metadata(|metadata| {
+                metadata
+                    .records
+                    .iter_mut()
+                    .find(|record| record.number == 8)
+                    .unwrap()
+                    .last_used_secs = 0;
+                Ok(())
+            })
+            .unwrap();
+        ReviewCheckoutManager::at_root(root.join("cache"), Some(remote.display().to_string()))
+            .startup()
+            .unwrap();
+        assert!(!second_head_path.exists());
+        assert!(manager.teardown(&first_lease).unwrap() == false);
+        drop(second_lease);
+        assert!(manager.teardown(&first_lease).unwrap());
+        assert!(!first_path.exists());
+        assert!(root.join("cache/repos/acme__thing").is_dir());
+        for (number, suffix) in [(9, ""), (10, ".tmp-clear-999-1")] {
+            let legacy = manager
+                .worktrees_root()
+                .join(format!("acme__thing__pr{number}__{}{suffix}", &third[..12]));
+            let mut clone = Command::new("git");
+            clone.args(["clone", remote.to_str().unwrap(), legacy.to_str().unwrap()]);
+            assert!(clone.status().unwrap().success());
+            git(&legacy, &["fetch", "origin", "refs/pull/8/head"]);
+            git(
+                &legacy,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/acme/thing.git",
+                ],
+            );
+            git(&legacy, &["checkout", "--detach", &third]);
+        }
+        manager
+            .with_metadata(|metadata| {
+                metadata.migration_complete = false;
+                Ok(())
+            })
+            .unwrap();
+        ReviewCheckoutManager::at_root(root.join("cache"), Some(remote.display().to_string()))
+            .startup()
+            .unwrap();
+        assert!(manager
+            .worktrees_root()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
+        let _ = fs::remove_dir_all(remote);
+        let _ = fs::remove_dir_all(seed);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1954,5 +2532,54 @@ mod tests {
         lease.mark_closing();
         assert!(lease.operation("late").is_err());
         drop(operation);
+    }
+
+    #[test]
+    fn startup_keeps_missing_materialized_identity_without_teardown_proof() {
+        let root = temp_path("missing");
+        let manager = ReviewCheckoutManager::at_root(root.join("cache"), None);
+        let spec = CheckoutSpec {
+            owner: "acme".into(),
+            repo: "thing".into(),
+            number: 1,
+            head_oid: "a".repeat(40),
+        };
+        let path = manager.worktrees_root().join(spec.key());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        manager
+            .with_metadata(|metadata| {
+                metadata.records.push(CheckoutRecord {
+                    key: spec.key(),
+                    owner: spec.owner.clone(),
+                    repo: spec.repo.clone(),
+                    number: spec.number,
+                    head_oid: spec.head_oid.clone(),
+                    path: path.display().to_string(),
+                    git_admin_dir: Some("/managed/admin-identity".into()),
+                    created_secs: 0,
+                    last_used_secs: 0,
+                    pending_cleanup: false,
+                    storage_teardown_complete: false,
+                    storage_initialized_without_id: false,
+                    materialized: true,
+                    kind: RecordKind::Linked,
+                });
+                Ok(())
+            })
+            .unwrap();
+        manager.startup().unwrap();
+        let record = manager
+            .read_records()
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| record.key == spec.key())
+            .unwrap();
+        assert!(record.pending_cleanup);
+        assert_eq!(
+            record.git_admin_dir.as_deref(),
+            Some("/managed/admin-identity")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
