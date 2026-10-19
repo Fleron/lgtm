@@ -85,6 +85,50 @@ fn create_legacy_checkout(
 }
 
 #[test]
+fn materialization_cancellation_kills_hanging_git() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("cancel-child");
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let started = root.join("git-started");
+        let fake_git = fake_bin.join("git");
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\nprintf started > \"$FAKE_GIT_STARTED\"\nsleep 4\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let elapsed = Instant::now();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "review_checkouts::safety_tests::materialization_cancellation_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "PATH",
+                format!("{}:{}", fake_bin.display(), old_path.to_string_lossy()),
+            )
+            .env("FAKE_GIT_STARTED", &started)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(started.exists());
+        assert!(
+            elapsed.elapsed() < Duration::from_secs(3),
+            "Git cancellation took {:?}",
+            elapsed.elapsed()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
 fn cancellable_acquire_aborts_while_startup_metadata_lock_is_held() {
     let root = temp_root("acquire-cancel-lock");
     let manager = ReviewCheckoutManager::at_root(root.join("cache"), None);
@@ -232,6 +276,31 @@ fn acquire_preserves_storage_checkpoint_before_materialization() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn canceled_acquired_checkout_is_recoverable_before_materialization() {
+    let root = temp_root("canceled-after-acquire");
+    let manager = ReviewCheckoutManager::at_root(root.join("cache"), None);
+    let loc = gh::PrLocator {
+        owner: "acme".into(),
+        repo: "thing".into(),
+        number: 3,
+    };
+    let head = "c".repeat(40);
+    let tasks = Arc::new(crate::app::PendingCheckoutTasks::default());
+    let pending = tasks.begin(3, 1).unwrap();
+    let lease = manager.acquire(&loc, &head).unwrap();
+    pending.cancel_token().store(true, Ordering::Release);
+    pending.register_lease(&lease);
+    assert!(pending.is_cancelled());
+    assert!(manager.teardown(&lease).unwrap());
+    assert!(manager
+        .read_records()
+        .unwrap()
+        .records
+        .into_iter()
+        .all(|record| record.head_oid != head));
+    let _ = fs::remove_dir_all(root);
+}
 
 #[cfg(unix)]
 #[ignore]

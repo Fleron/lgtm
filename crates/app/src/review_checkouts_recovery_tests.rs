@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
 static NEXT_RECOVERY_DIR: AtomicU64 = AtomicU64::new(0);
+
 fn temp_root(label: &str) -> PathBuf {
     let nonce = NEXT_RECOVERY_DIR.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
@@ -17,18 +19,22 @@ fn temp_root(label: &str) -> PathBuf {
     fs::create_dir_all(&path).unwrap();
     path
 }
+
 fn init_repo(path: &Path) {
     fs::create_dir_all(path).unwrap();
     git(path, &["init", "--quiet"]);
     git(path, &["config", "user.name", "recovery-test"]);
     git(path, &["config", "user.email", "recovery-test@example.com"]);
 }
+
 fn git(path: &Path, args: &[&str]) {
     run_git(path, args).unwrap_or_else(|err| panic!("git {args:?}: {err:#}"));
 }
+
 fn git_text(path: &Path, args: &[&str]) -> String {
     git_output(path, args).unwrap_or_else(|err| panic!("git {args:?}: {err:#}"))
 }
+
 fn commit(path: &Path, file: &str, contents: &str, message: &str) -> String {
     let file = path.join(file);
     if let Some(parent) = file.parent() {
@@ -39,6 +45,7 @@ fn commit(path: &Path, file: &str, contents: &str, message: &str) -> String {
     git(path, &["commit", "--quiet", "-m", message]);
     git_text(path, &["rev-parse", "HEAD"]).trim().to_owned()
 }
+
 fn bare_remote(root: &Path, leap_package: Option<&str>) -> (PathBuf, PathBuf, String) {
     let remote = root.join("remote.git");
     let seed = root.join("seed");
@@ -57,10 +64,12 @@ fn bare_remote(root: &Path, leap_package: Option<&str>) -> (PathBuf, PathBuf, St
     git(&seed, &["push", "--quiet", "origin", "HEAD:main"]);
     (remote, seed, head)
 }
+
 fn set_pull_head(remote: &Path, number: u64, head: &str) {
     let reference = format!("refs/pull/{number}/head");
     git(remote, &["update-ref", &reference, head]);
 }
+
 fn locator(number: u64) -> gh::PrLocator {
     gh::PrLocator {
         owner: "Acme".into(),
@@ -153,6 +162,78 @@ fn shared_base_fetches_new_head_and_teardown_waits_for_active_operation() {
 
     assert!(second_head_lease.teardown().unwrap());
     assert!(!second_path.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn teardown_releases_shared_lock_across_inherited_descriptor() {
+    let root = temp_root("inherited-lock");
+    let (remote, _seed, head) = bare_remote(&root, None);
+    set_pull_head(&remote, 8, &head);
+    let manager =
+        ReviewCheckoutManager::at_root(root.join("cache"), Some(remote.display().to_string()));
+    let lease = manager.acquire(&locator(8), &head).unwrap();
+    let path = manager.materialize(&lease).unwrap();
+    let inherited = lease
+        .inner
+        .shared_lock
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .try_clone()
+        .unwrap();
+
+    assert!(lease.teardown().unwrap());
+    assert!(!path.exists());
+
+    drop(inherited);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_legacy_cleanup_does_not_block_later_migration() {
+    let root = temp_root("migration-continues");
+    let (remote, _seed, head) = bare_remote(&root, None);
+    let manager = ReviewCheckoutManager::at_root(root.join("cache"), None);
+    manager.startup().unwrap();
+
+    let bad_path = manager
+        .worktrees_root()
+        .join(format!("acme__thing__pr1__{head}"));
+    clone_legacy(&remote, &bad_path, "https://github.com/acme/thing.git");
+    git(&bad_path, &["checkout", "--detach", &head]);
+    let good_path = manager
+        .worktrees_root()
+        .join(format!("acme__other__pr2__{head}"));
+    clone_legacy(&remote, &good_path, "https://github.com/acme/other.git");
+    git(&good_path, &["checkout", "--detach", &head]);
+    manager
+        .with_metadata(|metadata| {
+            metadata.migration_complete = false;
+            Ok(())
+        })
+        .unwrap();
+
+    let bad_spec = CheckoutSpec {
+        owner: "acme".into(),
+        repo: "thing".into(),
+        number: 1,
+        head_oid: head.clone(),
+    };
+    let held = manager.repo_lock(&bad_spec).unwrap();
+    manager.migrate_legacy_locked().unwrap();
+
+    assert!(bad_path.exists());
+    assert!(!good_path.exists());
+    let metadata = manager.read_records().unwrap();
+    assert!(!metadata.migration_complete);
+    assert!(metadata
+        .records
+        .iter()
+        .any(|record| record.path == bad_path.display().to_string() && record.pending_cleanup));
+
+    drop(held);
     let _ = fs::remove_dir_all(root);
 }
 

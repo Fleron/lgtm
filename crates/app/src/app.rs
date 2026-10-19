@@ -3,37 +3,37 @@ use crate::chat::chat_scratch_root;
 use crate::comments::comment_anchor;
 use crate::composer::{Composer, ReviewDialog};
 use crate::diff::{
-    row_height, text_size, DEFAULT_TEXT_SIZE, FONT_PX, MAX_TEXT_SIZE, MIN_TEXT_SIZE,
-    SPLIT_DIVIDER, SPLIT_GUTTER, UNIFIED_GUTTER, ViewMode,
+    row_height, text_size, ViewMode, DEFAULT_TEXT_SIZE, FONT_PX, MAX_TEXT_SIZE, MIN_TEXT_SIZE,
+    SPLIT_DIVIDER, SPLIT_GUTTER, UNIFIED_GUTTER,
 };
 use crate::items::{dir_name, ItemData, ItemState, ReviewItem, Source};
 use crate::lsp_client::trace as lsp_trace;
 use crate::palette::PaletteStep;
+use crate::review_checkouts::{ReviewCheckoutLease, ReviewCheckoutManager};
 use crate::selection::{selection_text, RowCol, SelSide};
 use crate::subscriptions::{load_subscribed_repos, SubscribedRepo};
 use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom, GoToDefinition,
     GoToTop, LineDown, LineUp, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
-    OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
-    ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar,
-    ToggleTerminal, ToggleView,
-    TrackerBack,
-    TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
-    TrackerRefresh,
-    TrackerNewIssue, TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow,
-    TrackerPanelEditTitle, TrackerPanelSpace, TrackerSetFlight, TrackerSetHidden,
-    TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
+    OpenPalette, PrevFile, PrevHunk, PrevItem, Quit, Refresh, ShowReview, ShowTracker,
+    SubmitReview, ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar,
+    ToggleTerminal, ToggleView, TrackerBack, TrackerClosePanel, TrackerCycleAssignee,
+    TrackerDispatch, TrackerDown, TrackerFocusFilter, TrackerNewIssue, TrackerNextColumn,
+    TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow, TrackerPanelEditTitle, TrackerPanelSpace,
+    TrackerRefresh, TrackerSetFlight, TrackerSetHidden, TrackerSetReview, TrackerUp, ZoomIn,
+    ZoomOut, ZoomReset, MONO,
 };
 use gpui::{
-    div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
-    Keystroke, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render,
+    div, font, point, prelude::*, px, AnyWindowHandle, ClipboardItem, Context, FocusHandle,
+    IntoElement, Keystroke, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render,
     ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
 };
 use gpui_component::{
     input::{Escape as InputEscape, InputEvent, InputState},
     kbd::Kbd,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TopView {
@@ -74,6 +74,242 @@ pub(crate) fn app_title(detail: Option<String>) -> gpui::AnyElement {
         );
     }
     title.into_any_element()
+}
+
+struct PendingCheckoutState {
+    active: usize,
+    closing: bool,
+    next_id: u64,
+    tasks: Vec<PendingCheckoutEntry>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingCheckoutKind {
+    Lsp {
+        generation: u64,
+    },
+    Terminal {
+        lsp_generation: u64,
+        terminal_generation: u64,
+    },
+    Cleanup,
+}
+
+struct PendingCheckoutEntry {
+    id: u64,
+    item_id: u64,
+    kind: PendingCheckoutKind,
+    cancel: Arc<AtomicBool>,
+    lease: Option<ReviewCheckoutLease>,
+}
+
+pub(crate) struct PendingCheckoutTasks {
+    state: Mutex<PendingCheckoutState>,
+    idle: Condvar,
+}
+
+pub(crate) struct PendingCheckoutTask {
+    owner: Arc<PendingCheckoutTasks>,
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+struct CloseCleanup {
+    lsp: Option<crate::lsp::LspHandle>,
+    terminal: Option<crate::terminal::TerminalSession>,
+    lease: Option<ReviewCheckoutLease>,
+    task: PendingCheckoutTask,
+}
+
+impl Default for PendingCheckoutTasks {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(PendingCheckoutState {
+                active: 0,
+                closing: false,
+                next_id: 0,
+                tasks: Vec::new(),
+            }),
+            idle: Condvar::new(),
+        }
+    }
+}
+
+impl PendingCheckoutTasks {
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        item_id: u64,
+        generation: u64,
+    ) -> Option<PendingCheckoutTask> {
+        self.begin_kind(item_id, PendingCheckoutKind::Lsp { generation })
+    }
+
+    pub(crate) fn begin_terminal(
+        self: &Arc<Self>,
+        item_id: u64,
+        lsp_generation: u64,
+        terminal_generation: u64,
+    ) -> Option<PendingCheckoutTask> {
+        self.begin_kind(
+            item_id,
+            PendingCheckoutKind::Terminal {
+                lsp_generation,
+                terminal_generation,
+            },
+        )
+    }
+
+    pub(crate) fn begin_cleanup(self: &Arc<Self>, item_id: u64) -> PendingCheckoutTask {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(state.closing));
+        state.active += 1;
+        state.tasks.push(PendingCheckoutEntry {
+            id,
+            item_id,
+            kind: PendingCheckoutKind::Cleanup,
+            cancel: Arc::clone(&cancel),
+            lease: None,
+        });
+        PendingCheckoutTask {
+            owner: Arc::clone(self),
+            id,
+            cancel,
+        }
+    }
+
+    fn begin_kind(
+        self: &Arc<Self>,
+        item_id: u64,
+        kind: PendingCheckoutKind,
+    ) -> Option<PendingCheckoutTask> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closing {
+            return None;
+        }
+        state.active += 1;
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.tasks.push(PendingCheckoutEntry {
+            id,
+            item_id,
+            kind,
+            cancel: Arc::clone(&cancel),
+            lease: None,
+        });
+        Some(PendingCheckoutTask {
+            owner: Arc::clone(self),
+            id,
+            cancel,
+        })
+    }
+
+    pub(crate) fn cancel_item(&self, item_id: u64) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for task in &state.tasks {
+            if task.item_id == item_id {
+                task.cancel.store(true, Ordering::Release);
+                if let Some(lease) = &task.lease {
+                    lease.mark_closing();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cancel_superseded(&self, item_id: u64, generation: u64) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for task in &state.tasks {
+            let superseded = match task.kind {
+                PendingCheckoutKind::Lsp {
+                    generation: task_generation,
+                } => task_generation < generation,
+                PendingCheckoutKind::Terminal { lsp_generation, .. } => lsp_generation < generation,
+                PendingCheckoutKind::Cleanup => false,
+            };
+            if task.item_id == item_id && superseded {
+                task.cancel.store(true, Ordering::Release);
+                if let Some(lease) = &task.lease {
+                    lease.mark_closing();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cancel_terminal_superseded(&self, item_id: u64, generation: u64) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for task in &state.tasks {
+            if task.item_id == item_id
+                && matches!(
+                    task.kind,
+                    PendingCheckoutKind::Terminal {
+                        terminal_generation,
+                        ..
+                    } if terminal_generation < generation
+                )
+            {
+                task.cancel.store(true, Ordering::Release);
+                if let Some(lease) = &task.lease {
+                    lease.mark_closing();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn begin_close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closing = true;
+        for task in &state.tasks {
+            task.cancel.store(true, Ordering::Release);
+            if let Some(lease) = &task.lease {
+                lease.mark_closing();
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.active != 0 {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl PendingCheckoutTask {
+    pub(crate) fn cancel_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn register_lease(&self, lease: &ReviewCheckoutLease) {
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let closing = state.closing;
+        let Some(task) = state.tasks.iter_mut().find(|task| task.id == self.id) else {
+            lease.mark_closing();
+            return;
+        };
+        if closing || task.cancel.load(Ordering::Acquire) {
+            task.cancel.store(true, Ordering::Release);
+            lease.mark_closing();
+        } else {
+            task.lease = Some(lease.clone());
+        }
+    }
+}
+
+impl Drop for PendingCheckoutTask {
+    fn drop(&mut self) {
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.tasks.retain(|task| task.id != self.id);
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            self.owner.idle.notify_all();
+        }
+    }
 }
 
 pub(crate) struct ReviewApp {
