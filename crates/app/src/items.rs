@@ -5,6 +5,7 @@ use crate::diff::{
 };
 use crate::lsp_client::{LspBackend, LspProgress};
 use crate::minimap::{minimap_rows, minimap_runs, MinimapLayout, MinimapRow};
+use crate::review_checkout::{CloseGuard, ReviewCheckout, SetupState};
 use crate::selection::Selection;
 use crate::terminal::TerminalState;
 use crate::theme;
@@ -106,6 +107,7 @@ pub(crate) struct ItemData {
     /// user scrolls the tree themselves.
     pub(crate) tree_last_file: Option<usize>,
     pub(crate) lsp: Option<LspHandle>,
+    pub(crate) checkout: Option<ReviewCheckout>,
     pub(crate) lsp_progress: Option<Arc<Mutex<LspProgress>>>,
     pub(crate) lsp_loading: bool,
     pub(crate) lsp_error: Option<SharedString>,
@@ -213,9 +215,66 @@ pub(crate) struct ReviewItem {
     pub(crate) upgrade_gen: u64,
     /// Bumped whenever LSP root/session startup is restarted.
     pub(crate) lsp_gen: u64,
+    pub(crate) setup: Arc<SetupState>,
+    pub(crate) checkouts: Vec<ReviewCheckout>,
+}
+
+pub(crate) struct ItemCleanup {
+    setup: Arc<SetupState>,
+    lsp: Option<LspHandle>,
+    terminal: Option<crate::terminal::TerminalProcess>,
+    checkouts: Vec<ReviewCheckout>,
+}
+
+impl ItemCleanup {
+    pub(crate) fn run(self) {
+        self.setup.cancel();
+        self.setup.wait_zero();
+        if let Some(lsp) = self.lsp {
+            lsp.session.stop();
+            drop(lsp);
+        }
+        if let Some(process) = self.terminal {
+            process.reap();
+        }
+        for checkout in self.checkouts {
+            if let Err(err) = checkout.cleanup() {
+                eprintln!("lgtm: item checkout cleanup pending: {err:#}");
+            }
+        }
+    }
+}
+
+pub(crate) fn remember_checkout(checkouts: &mut Vec<ReviewCheckout>, checkout: &ReviewCheckout) {
+    if !checkouts.iter().any(|known| known.same_as(checkout)) {
+        checkouts.push(checkout.clone());
+    }
 }
 
 impl ReviewItem {
+    pub(crate) fn take_cleanup(&mut self) -> ItemCleanup {
+        let mut checkouts = std::mem::take(&mut self.checkouts);
+        let (lsp, terminal) = match &mut self.state {
+            ItemState::Ready(data) => {
+                let lsp = data.lsp.take();
+                if let Some(checkout) = data.checkout.as_ref() {
+                    remember_checkout(&mut checkouts, checkout);
+                }
+                if let Some(checkout) = lsp.as_ref().and_then(|handle| handle.checkout.as_ref()) {
+                    remember_checkout(&mut checkouts, checkout);
+                }
+                (lsp, data.terminal.take_cleanup())
+            }
+            _ => (None, None),
+        };
+        ItemCleanup {
+            setup: Arc::clone(&self.setup),
+            lsp,
+            terminal,
+            checkouts,
+        }
+    }
+
     pub(crate) fn primary(&self) -> SharedString {
         match &self.source {
             Source::Pr(loc) => format!("#{} {}", loc.number, loc.repo_slug()).into(),
@@ -362,6 +421,7 @@ impl ReviewItem {
                     tree_scroll: UniformListScrollHandle::new(),
                     tree_last_file: None,
                     lsp: None,
+                    checkout: None,
                     lsp_progress: None,
                     lsp_loading: false,
                     lsp_error: None,
@@ -473,6 +533,9 @@ pub(crate) fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Load
 
 impl ReviewApp {
     pub(crate) fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
+        let Some(open_guard) = self.close_gate.begin() else {
+            return;
+        };
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(ReviewItem {
@@ -483,14 +546,23 @@ impl ReviewApp {
             refresh_error: None,
             upgrade_gen: 0,
             lsp_gen: 0,
+            setup: SetupState::new(),
+            checkouts: Vec::new(),
         });
         self.active = self.items.len() - 1;
-        Self::spawn_fetch(id, source, ViewMode::Split, cx);
+        Self::spawn_fetch(id, source, ViewMode::Split, open_guard, cx);
         cx.notify();
     }
 
-    pub(crate) fn spawn_fetch(id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
+    pub(crate) fn spawn_fetch(
+        id: u64,
+        source: Source,
+        mode: ViewMode,
+        close_guard: CloseGuard,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
+            let _close_guard = close_guard;
             let fetched = cx
                 .background_spawn(async move { fetch_item(&source, mode) })
                 .await;
@@ -666,24 +738,30 @@ impl ReviewApp {
         if ix >= self.items.len() {
             return;
         }
+        let Some(close_guard) = self.close_gate.begin() else {
+            return;
+        };
         // Stop any in-flight chat run and drop its scratch dir (best-effort;
         // the path is ours and never the local repo root).
-        let item = &self.items[ix];
+        let item = &mut self.items[ix];
         if let ItemState::Ready(data) = &item.state {
             data.chat.cancel.store(true, Ordering::Relaxed);
         }
         let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
         let was_pr = matches!(item.source, Source::Pr(_));
-        self.items.remove(ix);
+        let mut item = self.items.remove(ix);
+        let cleanup = item.take_cleanup();
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
         }
-        // A PR reviewed this session may have just materialized its worktree;
-        // rescan so it (re)appears in the sidebar's cached list now that it's
-        // closed, rather than only after a restart.
-        if was_pr {
-            self.refresh_cached_prs(cx);
-        }
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move { cleanup.run() }).await;
+            if was_pr {
+                this.update(cx, |app, cx| app.refresh_cached_prs(cx)).ok();
+            }
+            drop(close_guard);
+        })
+        .detach();
         cx.notify();
     }
 
@@ -696,6 +774,9 @@ impl ReviewApp {
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(close_guard) = self.close_gate.begin() else {
+            return;
+        };
         let Some(item) = self.items.get_mut(self.active) else {
             return;
         };
@@ -712,7 +793,7 @@ impl ReviewApp {
         }
         item.refresh_error = None;
         let (id, source) = (item.id, item.source.clone());
-        Self::spawn_fetch(id, source, mode, cx);
+        Self::spawn_fetch(id, source, mode, close_guard, cx);
         cx.notify();
     }
 

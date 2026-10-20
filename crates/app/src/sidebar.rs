@@ -1,4 +1,4 @@
-use crate::cached_prs::{scan_cached_prs, stage_worktree_dir, CachedPr};
+use crate::cached_prs::{scan_cached_prs, CachedPr};
 use crate::diff::row_height;
 use crate::items::{ItemData, ItemState, Source};
 use crate::subscriptions::{pr_key, save_subscribed_repos, SubscribedRepo};
@@ -7,6 +7,7 @@ use crate::tree::{
     fuzzy_file_matches, status_style, visible_entries, TreeEntryKind, TreeListRow, TREE_ROW_HEIGHT,
 };
 use crate::{theme, ReviewApp, SIDEBAR_MAX_LIST_HEIGHT};
+use crate::review_checkout::cleanup_cached_dir;
 use diff_core::FileDiff;
 use gpui::{
     div, prelude::*, px, uniform_list, Context, Hsla, PromptButton, PromptLevel, ScrollStrategy,
@@ -163,14 +164,6 @@ impl ReviewApp {
             let scan = cx.background_spawn(async move { scan_cached_prs() }).await;
             this.update(cx, |app, cx| {
                 app.cached_prs = scan.cached_prs;
-                if !scan.staged_clear_dirs.is_empty() {
-                    cx.background_spawn(async move {
-                        for dir in scan.staged_clear_dirs {
-                            let _ = std::fs::remove_dir_all(dir);
-                        }
-                    })
-                    .detach();
-                }
                 cx.notify();
             })
             .ok();
@@ -314,10 +307,24 @@ impl ReviewApp {
         if ix >= self.cached_prs.len() {
             return;
         }
-        for dir in &self.cached_prs[ix].dirs {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        let Some(close_guard) = self.close_gate.begin() else {
+            return;
+        };
+        let dirs = self.cached_prs[ix].dirs.clone();
         self.cached_prs.remove(ix);
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                for dir in dirs {
+                    if let Err(err) = cleanup_cached_dir(&dir) {
+                        eprintln!("lgtm: cached checkout cleanup pending: {err:#}");
+                    }
+                }
+                drop(close_guard);
+            })
+            .await;
+            this.update(cx, |app, cx| app.refresh_cached_prs(cx)).ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -351,7 +358,7 @@ impl ReviewApp {
 
         cx.spawn(async move |this, cx| {
             if matches!(receiver.await, Ok(0)) {
-                this.update(cx, |this, cx| {
+                let pending = this.update(cx, |this, _cx| {
                     let open_pr_keys: HashSet<PrKey> = this
                         .items
                         .iter()
@@ -375,30 +382,27 @@ impl ReviewApp {
                         &open_pr_keys,
                         &subscribed_pr_keys,
                     );
-                    let mut staged_dirs = Vec::new();
-                    for ix in indexes.into_iter().rev() {
-                        let dirs = std::mem::take(&mut this.cached_prs[ix].dirs);
-                        for dir in dirs {
-                            match stage_worktree_dir(&dir) {
-                                Ok(staged) => staged_dirs.push(staged),
-                                Err(_) => this.cached_prs[ix].dirs.push(dir),
-                            }
-                        }
-                        if this.cached_prs[ix].dirs.is_empty() {
-                            this.cached_prs.remove(ix);
-                        }
+                    let mut dirs = Vec::new();
+                    for ix in indexes {
+                        dirs.extend(this.cached_prs[ix].dirs.clone());
                     }
-                    if !staged_dirs.is_empty() {
-                        cx.notify();
-                        cx.background_spawn(async move {
-                            for dir in staged_dirs {
-                                let _ = std::fs::remove_dir_all(dir);
+                    (!dirs.is_empty())
+                        .then(|| this.close_gate.begin().map(|guard| (dirs, guard)))
+                        .flatten()
+                });
+                if let Ok(Some((dirs, close_guard))) = pending {
+                    let _ = cx
+                        .background_spawn(async move {
+                            for dir in dirs {
+                                if let Err(err) = cleanup_cached_dir(&dir) {
+                                    eprintln!("lgtm: cached checkout cleanup pending: {err:#}");
+                                }
                             }
+                            drop(close_guard);
                         })
-                        .detach();
-                    }
-                })
-                .ok();
+                        .await;
+                    this.update(cx, |app, cx| app.refresh_cached_prs(cx)).ok();
+                }
             }
         })
         .detach();

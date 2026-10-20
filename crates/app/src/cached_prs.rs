@@ -1,9 +1,12 @@
 use anyhow::{anyhow, bail};
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
 static NEXT_STAGED_WORKTREE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Environment that makes every `git` we (or anything below us) run use the
@@ -56,9 +59,11 @@ pub(crate) struct CachedPr {
 #[derive(Default)]
 pub(crate) struct CachedPrScan {
     pub(crate) cached_prs: Vec<CachedPr>,
+    #[cfg(test)]
     pub(crate) staged_clear_dirs: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 pub(crate) fn stage_worktree_dir(path: &Path) -> std::io::Result<PathBuf> {
     let staged_path = loop {
         let id = NEXT_STAGED_WORKTREE_ID.fetch_add(1, Ordering::Relaxed);
@@ -90,6 +95,7 @@ fn scan_cached_prs_at(root: &Path) -> CachedPrScan {
     };
     // (locator, dirs, latest mtime) — one entry per distinct PR.
     let mut grouped: Vec<(gh::PrLocator, Vec<PathBuf>, std::time::SystemTime)> = Vec::new();
+    #[cfg(test)]
     let mut staged_clear_dirs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -99,7 +105,11 @@ fn scan_cached_prs_at(root: &Path) -> CachedPrScan {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if is_staged_clear_dir(&name) {
+            #[cfg(test)]
             staged_clear_dirs.push(path);
+            continue;
+        }
+        if !is_linked_worktree_name(&name) {
             continue;
         }
         // Skip half-written clones from an in-progress materialize.
@@ -144,11 +154,12 @@ fn scan_cached_prs_at(root: &Path) -> CachedPrScan {
         .collect();
     CachedPrScan {
         cached_prs,
+        #[cfg(test)]
         staged_clear_dirs,
     }
 }
 
-fn is_staged_clear_dir(name: &str) -> bool {
+pub(crate) fn is_staged_clear_dir(name: &str) -> bool {
     let Some((original_name, suffix)) = name.rsplit_once(".tmp-clear-") else {
         return false;
     };
@@ -170,6 +181,26 @@ pub(crate) fn cached_pr_number(dir_name: &str) -> Option<u64> {
     let after = dir_name.rsplit_once("__pr")?.1;
     let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+pub(crate) fn is_linked_worktree_name(name: &str) -> bool {
+    let Some((before_pid, pid_sequence)) = name.rsplit_once("__") else {
+        return false;
+    };
+    let Some((process_id, sequence)) = pid_sequence.split_once('-') else {
+        return false;
+    };
+    let Some((before_head, head)) = before_pid.rsplit_once("__") else {
+        return false;
+    };
+    let Some((_, number)) = before_head.rsplit_once("__pr") else {
+        return false;
+    };
+    number.parse::<u64>().is_ok()
+        && head.len() == 12
+        && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && process_id.parse::<u32>().is_ok()
+        && sequence.parse::<u64>().is_ok()
 }
 
 /// Owner/repo from a cached clone's `origin` remote URL.
@@ -202,7 +233,7 @@ pub(crate) fn sanitize_path_part(input: &str) -> String {
     input
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
                 c
             } else {
                 '_'
@@ -329,5 +360,4 @@ mod tests {
             Some(&"!gh auth git-credential")
         );
     }
-
 }

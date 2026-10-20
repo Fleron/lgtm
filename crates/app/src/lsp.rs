@@ -1,15 +1,17 @@
-use crate::cached_prs::{git_ok, sanitize_path_part};
 use crate::comments::comment_anchor;
-use crate::items::{ItemData, ItemState, Source};
-use crate::lsp_client::{trace as lsp_trace, DefinitionTarget, HoverResult, LspPosition, LspProgress, LspSession};
+use crate::items::{remember_checkout, ItemData, ItemState, Source};
+use crate::lsp_client::{
+    trace as lsp_trace, DefinitionTarget, HoverResult, LspPosition, LspProgress, LspSession,
+};
+use crate::review_checkout::ReviewCheckout;
 use crate::selection::{RowCol, SelSide};
 use crate::terminal::TerminalStatus;
 use crate::theme;
 use crate::{
-    line_content, row_height, text_size, NavBack, NavForward, Row, ReviewApp,
+    line_content, row_height, text_size, NavBack, NavForward, ReviewApp, Row,
     MAX_SOURCE_HIGHLIGHT_BYTES, MAX_SYNTAX_LINE_BYTES, MONO,
 };
-use anyhow::{bail, Context as _};
+use anyhow::Context as _;
 use gpui::{
     anchored, deferred, div, font, point, prelude::*, px, uniform_list, Context, Hsla,
     ListHorizontalSizingBehavior, Pixels, Point, ScrollStrategy, SharedString, TextRun,
@@ -26,75 +28,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub(crate) fn lsp_root_for_source(source: &Source, pr_meta: Option<&gh::PrMeta>) -> anyhow::Result<PathBuf> {
-    match source {
-        Source::Local(src) => Ok(src.repo_root.clone()),
-        Source::Pr(loc) => {
-            let meta = pr_meta.context("PR metadata missing; cannot materialize LSP worktree")?;
-            if meta.head_ref_oid.is_empty() {
-                bail!("PR head oid missing; cannot materialize LSP worktree");
-            }
-            materialize_pr_worktree(loc, &meta.head_ref_oid)
-        }
-    }
-}
-
-pub(crate) fn materialize_pr_worktree(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
-    let root = lsp_worktree_root(loc, head_oid)?;
-    let pull_ref = format!("refs/pull/{}/head", loc.number);
-    if root.join(".git").exists() {
-        git_ok(&root, &["fetch", "--depth", "1", "origin", &pull_ref]).ok();
-        git_ok(&root, &["checkout", "--detach", head_oid])?;
-        return Ok(root);
-    }
-    let parent = root
-        .parent()
-        .context("worktree root unexpectedly has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = root.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    git_ok(
-        parent,
-        &[
-            "clone",
-            "--no-checkout",
-            "--filter=blob:none",
-            &format!("https://github.com/{}.git", loc.repo_slug()),
-            tmp.file_name()
-                .and_then(|name| name.to_str())
-                .context("temporary worktree path is not UTF-8")?,
-        ],
-    )?;
-    git_ok(&tmp, &["fetch", "--depth", "1", "origin", &pull_ref])?;
-    git_ok(&tmp, &["checkout", "--detach", head_oid])?;
-    std::fs::rename(&tmp, &root).or_else(|_| {
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::rename(&tmp, &root)
-    })?;
-    Ok(root)
-}
-
-pub(crate) fn lsp_worktree_root(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let key = format!(
-        "{}__{}__pr{}__{}",
-        sanitize_path_part(&loc.owner),
-        sanitize_path_part(&loc.repo),
-        loc.number,
-        &head_oid[..head_oid.len().min(12)]
-    );
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("lgtm")
-        .join("worktrees")
-        .join(key))
-}
-
 #[derive(Clone)]
 pub(crate) struct LspHandle {
     pub(crate) root: PathBuf,
     pub(crate) session: LspSession,
     pub(crate) progress: Arc<Mutex<LspProgress>>,
+    pub(crate) checkout: Option<ReviewCheckout>,
+}
+
+enum LspStartup {
+    Ready {
+        handle: LspHandle,
+        created_checkout: bool,
+    },
+    Failed {
+        error: anyhow::Error,
+        checkout: Option<ReviewCheckout>,
+        created_checkout: bool,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -232,7 +183,11 @@ impl ReviewApp {
     }
 
     pub(crate) fn restart_lsp_for_item(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(close_guard) = self.close_gate.begin() else {
+            return;
+        };
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            drop(close_guard);
             return;
         };
         let ItemState::Ready(data) = &mut item.state else {
@@ -241,7 +196,8 @@ impl ReviewApp {
         item.lsp_gen += 1;
         let gen = item.lsp_gen;
         let backend = data.lsp_backend;
-        data.lsp = None;
+        let old_lsp = data.lsp.take();
+        let prior_checkout = data.checkout.clone();
         data.lsp_error = None;
         data.lsp_loading = true;
         let progress = Arc::new(Mutex::new(LspProgress {
@@ -260,51 +216,172 @@ impl ReviewApp {
         let pr_meta = data.pr_meta.clone();
         let warmup = lsp_warmup_position(data);
         let progress_for_start = Arc::clone(&progress);
+        let setup = Arc::clone(&item.setup);
+        let Some(setup_guard) = setup.begin() else {
+            data.lsp_loading = false;
+            drop(close_guard);
+            return;
+        };
         cx.spawn(async move |this, cx| {
+            let _close_guard = close_guard;
             let result = cx
                 .background_spawn(async move {
-                    let root = lsp_root_for_source(&source, pr_meta.as_ref())?;
-                    let session = LspSession::start(
+                    if let Some(old_lsp) = old_lsp {
+                        old_lsp.session.stop();
+                    }
+                    if setup.is_canceled() {
+                        anyhow::bail!("LSP startup canceled");
+                    }
+                    let (root, checkout, created_checkout) = match (&source, pr_meta.as_ref()) {
+                        (Source::Local(src), _) => (src.repo_root.clone(), None, false),
+                        (Source::Pr(loc), Some(meta)) => {
+                            let head = &meta.head_ref_oid;
+                            let (checkout, created_checkout) = match prior_checkout
+                                .filter(|checkout| checkout.matches(loc, head))
+                            {
+                                Some(checkout) => (checkout, false),
+                                None => (ReviewCheckout::create(loc, head)?, true),
+                            };
+                            (
+                                checkout.root().to_path_buf(),
+                                Some(checkout),
+                                created_checkout,
+                            )
+                        }
+                        (Source::Pr(_), None) => {
+                            anyhow::bail!("PR metadata missing; cannot start LSP")
+                        }
+                    };
+                    let lease = checkout.as_ref().map(ReviewCheckout::lease);
+                    let session = match LspSession::start(
                         root.clone(),
                         backend,
                         Arc::clone(&progress_for_start),
                         warmup,
-                    )?;
-                    Ok::<LspHandle, anyhow::Error>(LspHandle {
-                        root,
-                        session,
-                        progress: progress_for_start,
+                        lease,
+                    ) {
+                        Ok(session) => session,
+                        Err(err) => {
+                            return Ok(LspStartup::Failed {
+                                error: err,
+                                checkout,
+                                created_checkout,
+                            });
+                        }
+                    };
+                    Ok::<LspStartup, anyhow::Error>(LspStartup::Ready {
+                        handle: LspHandle {
+                            root,
+                            session,
+                            progress: progress_for_start,
+                            checkout,
+                        },
+                        created_checkout,
                     })
                 })
                 .await;
-            this.update(cx, |app, cx| {
-                let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
-                    return;
-                };
-                if item.lsp_gen != gen {
-                    return;
-                }
-                let ItemState::Ready(data) = &mut item.state else {
-                    return;
-                };
-                data.lsp_loading = false;
-                match result {
-                    Ok(handle) => {
-                        data.lsp_progress = Some(Arc::clone(&handle.progress));
-                        data.lsp = Some(handle);
-                        data.lsp_error = None;
+            match result {
+                Ok(LspStartup::Ready {
+                    mut handle,
+                    created_checkout,
+                }) => {
+                    let accepted = this
+                        .update(cx, |app, cx| {
+                            let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                                return false;
+                            };
+                            if item.lsp_gen != gen {
+                                return false;
+                            }
+                            let ItemState::Ready(data) = &mut item.state else {
+                                return false;
+                            };
+                            data.lsp_loading = false;
+                            data.lsp_progress = Some(Arc::clone(&handle.progress));
+                            if let Some(checkout) = handle.checkout.as_ref() {
+                                remember_checkout(&mut item.checkouts, checkout);
+                            }
+                            data.checkout = handle.checkout.clone();
+                            data.lsp = Some(handle.clone());
+                            data.lsp_error = None;
+                            if data.terminal.status == TerminalStatus::WaitingForCheckout {
+                                app.launch_terminal(id, cx);
+                            }
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !accepted && created_checkout {
+                        let checkout = handle.checkout.take();
+                        handle.session.stop();
+                        drop(handle);
+                        if let Some(checkout) = checkout {
+                            if let Err(err) = checkout.cleanup() {
+                                eprintln!("lgtm: stale LSP checkout cleanup pending: {err:#}");
+                            }
+                        }
                     }
-                    Err(err) => {
+                }
+                Ok(LspStartup::Failed {
+                    error,
+                    mut checkout,
+                    created_checkout,
+                }) => {
+                    let accepted = this
+                        .update(cx, |app, cx| {
+                            let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                                return false;
+                            };
+                            if item.lsp_gen != gen {
+                                return false;
+                            }
+                            let ItemState::Ready(data) = &mut item.state else {
+                                return false;
+                            };
+                            data.lsp_loading = false;
+                            data.lsp = None;
+                            if let Some(new_checkout) = checkout.as_ref() {
+                                remember_checkout(&mut item.checkouts, new_checkout);
+                            }
+                            data.checkout = checkout.take();
+                            data.lsp_error = Some(format!("{error:#}").into());
+                            if data.terminal.status == TerminalStatus::WaitingForCheckout {
+                                app.launch_terminal(id, cx);
+                            }
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !accepted && created_checkout {
+                        if let Some(checkout) = checkout {
+                            if let Err(err) = checkout.cleanup() {
+                                eprintln!("lgtm: stale LSP checkout cleanup pending: {err:#}");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |app, cx| {
+                        let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                            return;
+                        };
+                        if item.lsp_gen != gen {
+                            return;
+                        }
+                        let ItemState::Ready(data) = &mut item.state else {
+                            return;
+                        };
+                        data.lsp_loading = false;
                         data.lsp = None;
                         data.lsp_error = Some(format!("{err:#}").into());
-                    }
+                        if data.terminal.status == TerminalStatus::WaitingForCheckout {
+                            app.launch_terminal(id, cx);
+                        }
+                        cx.notify();
+                    });
                 }
-                if data.terminal.status == TerminalStatus::WaitingForCheckout {
-                    app.launch_terminal(id, cx);
-                }
-                cx.notify();
-            })
-            .ok();
+            }
+            drop(setup_guard);
         })
         .detach();
         cx.spawn(async move |this, cx| loop {
@@ -455,6 +532,9 @@ impl ReviewApp {
         mouse: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        let Some(setup) = self.active_item().map(|item| Arc::clone(&item.setup)) else {
+            return;
+        };
         let Some(data) = self.active_data_mut() else {
             return;
         };
@@ -473,6 +553,9 @@ impl ReviewApp {
         let canceled = Arc::new(AtomicBool::new(false));
         data.hover_cancel = Some(Arc::clone(&canceled));
         data.last_symbol_target = Some(target.clone());
+        let Some(setup_guard) = setup.begin() else {
+            return;
+        };
         let Some(handle) = data.lsp.clone() else {
             if data.lsp_loading {
                 let waiting_target = target.clone();
@@ -483,6 +566,7 @@ impl ReviewApp {
                 });
                 cx.notify();
                 cx.spawn(async move |this, cx| loop {
+                    let _setup_guard = &setup_guard;
                     cx.background_executor()
                         .timer(Duration::from_millis(150))
                         .await;
@@ -508,11 +592,14 @@ impl ReviewApp {
                     }
                 })
                 .detach();
+            } else {
+                drop(setup_guard);
             }
             return;
         };
         data.hover = None;
         cx.spawn(async move |this, cx| {
+            let _setup_guard = setup_guard;
             cx.background_executor()
                 .timer(Duration::from_millis(250))
                 .await;
@@ -578,13 +665,20 @@ impl ReviewApp {
     }
 
     pub(crate) fn request_definition(&mut self, origin: SymbolTarget, cx: &mut Context<Self>) {
+        let Some(setup) = self.active_item().map(|item| Arc::clone(&item.setup)) else {
+            return;
+        };
         let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
             return;
         };
         if let Some(data) = self.active_data_mut() {
             data.cursor = origin.row.min(data.rows.len().saturating_sub(1));
         }
+        let Some(setup_guard) = setup.begin() else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
+            let _setup_guard = setup_guard;
             let position = origin.position.clone();
             let result = cx
                 .background_spawn(async move { handle.session.definition(position) })

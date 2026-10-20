@@ -1,6 +1,6 @@
 use crate::chat::{backend_chip, local_chat_header, pr_chat_header, ChatBackend, CHAT_WIDTH};
-use crate::items::{ItemState, Source};
-use crate::lsp::lsp_root_for_source;
+use crate::items::{remember_checkout, ItemState, Source};
+use crate::review_checkout::{CheckoutLease, ReviewCheckout};
 use crate::theme;
 use crate::{centered_message, ReviewApp, TerminalCopy, TerminalPaste, TopView};
 use gpui::{
@@ -77,27 +77,61 @@ pub(crate) struct TerminalSession {
     view: Entity<TerminalView>,
     writer: SharedWriter,
     child: Option<Box<dyn Child + Send + Sync>>,
+    _lease: Option<Arc<CheckoutLease>>,
+}
+
+pub(crate) struct TerminalProcess {
+    child: Option<Box<dyn Child + Send + Sync>>,
+    _lease: Option<Arc<CheckoutLease>>,
+}
+
+impl TerminalProcess {
+    pub(crate) fn reap(mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            if let Some(pid) = child.process_id() {
+                if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
+                    eprintln!(
+                        "lgtm: failed to kill terminal process group {pid}: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+        if let Err(err) = child.wait() {
+            eprintln!("lgtm: failed to reap terminal process: {err}");
+        }
+    }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        let Some(process) = self.take_process() else {
             return;
         };
-        if let Ok(Some(_)) = child.try_wait() {
-            return;
-        }
-        // portable-pty's `kill` sends SIGHUP, which the agent may handle and
-        // outlive; SIGKILL can't be caught. portable-pty spawns the child
-        // with setsid, so its pid is also the group id and the negative pid
-        // takes the agent's own subprocesses with it. The blocking reap runs
-        // off the UI thread so closing an item never stalls a frame.
-        if let Some(pid) = child.process_id() {
-            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        }
         std::thread::spawn(move || {
-            let _ = child.wait();
+            let _ = process.reap();
         });
+    }
+}
+
+impl TerminalSession {
+    pub(crate) fn take_process(&mut self) -> Option<TerminalProcess> {
+        self.child.take().map(|child| TerminalProcess {
+            child: Some(child),
+            _lease: self._lease.take(),
+        })
+    }
+}
+
+impl TerminalState {
+    pub(crate) fn take_cleanup(&mut self) -> Option<TerminalProcess> {
+        let Some(mut session) = self.session.take() else {
+            return None;
+        };
+        session.take_process()
     }
 }
 
@@ -182,6 +216,7 @@ fn open_session(
     cwd: &Path,
     app: WeakEntity<ReviewApp>,
     item_id: u64,
+    lease: Option<Arc<CheckoutLease>>,
     cx: &mut Context<ReviewApp>,
 ) -> anyhow::Result<TerminalSession> {
     // Iosevka's advance is 0.5em; the first paint measures the real cell and
@@ -198,13 +233,13 @@ fn open_session(
     cmd.args(&argv[1..]);
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
+    let reader = master.try_clone_reader()?;
+    let writer: SharedWriter = Arc::new(Mutex::new(master.take_writer()?));
+    let key_writer = Arc::clone(&writer);
     let child = slave.spawn_command(cmd)?;
     // The master reads EOF only once every slave fd is closed; keeping ours
     // open would stop the exit callback from ever firing.
     drop(slave);
-    let reader = master.try_clone_reader()?;
-    let writer: SharedWriter = Arc::new(Mutex::new(master.take_writer()?));
-    let key_writer = Arc::clone(&writer);
     let master = Mutex::new(master);
     let config = TerminalConfig {
         cols: size.cols.into(),
@@ -255,6 +290,7 @@ fn open_session(
         view,
         writer,
         child: Some(child),
+        _lease: lease,
     })
 }
 
@@ -303,63 +339,140 @@ impl ReviewApp {
     }
 
     /// (Re)start the item's session: kill any current one, resolve the cwd,
-    /// then spawn. PR items reuse the LSP's checkout rather than
-    /// materializing it concurrently, since two `materialize_pr_worktree`
-    /// runs for one PR share a tmp dir and break each other.
+    /// then spawn.
     pub(crate) fn launch_terminal(&mut self, item_id: u64, cx: &mut Context<Self>) {
+        let Some(mut close_guard) = self.close_gate.begin() else {
+            return;
+        };
         let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
             return;
         };
         let ItemState::Ready(data) = &mut item.state else {
             return;
         };
-        data.terminal.session = None;
-        let cwd = match (&item.source, &data.pr_meta, &data.lsp) {
-            (Source::Local(src), _, _) => src.repo_root.clone(),
+        let process = data.terminal.take_cleanup();
+        if let Some(process) = process {
+            let Some(setup_guard) = item.setup.begin() else {
+                let _ = process.reap();
+                drop(close_guard);
+                return;
+            };
+            let retire_guard = close_guard;
+            std::thread::spawn(move || {
+                let _ = process.reap();
+                drop(setup_guard);
+                drop(retire_guard);
+            });
+            let Some(next_guard) = self.close_gate.begin() else {
+                return;
+            };
+            close_guard = next_guard;
+        }
+        let source = item.source.clone();
+        let cwd = match (&source, &data.pr_meta, &data.lsp) {
+            (Source::Local(src), _, _) => Some((src.repo_root.clone(), None)),
             (Source::Pr(_), None, _) => {
                 data.terminal.status = TerminalStatus::Idle;
                 cx.notify();
                 return;
             }
-            (Source::Pr(_), Some(_), Some(handle)) => handle.root.clone(),
+            (Source::Pr(_), Some(_), Some(handle)) => {
+                Some((handle.root.clone(), handle.checkout.clone()))
+            }
             (Source::Pr(_), Some(_), None) if data.lsp_loading => {
                 data.terminal.status = TerminalStatus::WaitingForCheckout;
                 cx.notify();
                 return;
             }
             (Source::Pr(_), Some(meta), None) => {
-                let (source, meta) = (item.source.clone(), meta.clone());
-                data.terminal.status = TerminalStatus::Preparing;
-                cx.spawn(async move |this, cx| {
-                    let root = cx
-                        .background_spawn(async move { lsp_root_for_source(&source, Some(&meta)) })
-                        .await;
-                    this.update(cx, |app, cx| {
-                        let Some(terminal) = app.terminal_mut(item_id) else {
-                            return;
-                        };
-                        if terminal.status != TerminalStatus::Preparing {
-                            return;
-                        }
-                        match root {
-                            Ok(root) => app.spawn_terminal(item_id, &root, cx),
-                            Err(err) => {
-                                terminal.status = TerminalStatus::Failed(format!("{err:#}"));
-                                cx.notify();
+                let Some(checkout) = data.checkout.as_ref().filter(|checkout| {
+                    checkout.matches(
+                        match &source {
+                            Source::Pr(loc) => loc,
+                            Source::Local(_) => unreachable!(),
+                        },
+                        &meta.head_ref_oid,
+                    )
+                }) else {
+                    let meta = meta.clone();
+                    let upgrade_gen = item.upgrade_gen;
+                    let setup = Arc::clone(&item.setup);
+                    let Some(setup_guard) = setup.begin() else {
+                        data.terminal.status = TerminalStatus::Idle;
+                        return;
+                    };
+                    data.terminal.status = TerminalStatus::Preparing;
+                    cx.spawn(async move |this, cx| {
+                        let _close_guard = close_guard;
+                        let result = cx
+                            .background_spawn(async move {
+                                let Source::Pr(loc) = &source else {
+                                    anyhow::bail!("local terminal has no checkout");
+                                };
+                                ReviewCheckout::create(loc, &meta.head_ref_oid)
+                            })
+                            .await;
+                        let mut checkout = result.ok();
+                        let accepted = this
+                            .update(cx, |app, cx| {
+                                let Some(item) =
+                                    app.items.iter_mut().find(|item| item.id == item_id)
+                                else {
+                                    return false;
+                                };
+                                let ItemState::Ready(data) = &mut item.state else {
+                                    return false;
+                                };
+                                if data.terminal.status != TerminalStatus::Preparing {
+                                    return false;
+                                }
+                                if item.upgrade_gen != upgrade_gen {
+                                    data.terminal.status = TerminalStatus::Idle;
+                                    cx.notify();
+                                    return false;
+                                }
+                                let Some(new_checkout) = checkout.take() else {
+                                    data.terminal.status = TerminalStatus::Failed(
+                                        "could not prepare PR checkout".to_string(),
+                                    );
+                                    cx.notify();
+                                    return true;
+                                };
+                                let root = new_checkout.root().to_path_buf();
+                                data.checkout = Some(new_checkout.clone());
+                                remember_checkout(&mut item.checkouts, &new_checkout);
+                                app.spawn_terminal(item_id, &root, Some(new_checkout), cx);
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !accepted {
+                            if let Some(checkout) = checkout {
+                                let _ = checkout.cleanup();
                             }
                         }
+                        drop(setup_guard);
                     })
-                    .ok();
-                })
-                .detach();
-                cx.notify();
-                return;
+                    .detach();
+                    cx.notify();
+                    return;
+                };
+                Some((checkout.root().to_path_buf(), Some(checkout.clone())))
             }
         };
-        self.spawn_terminal(item_id, &cwd, cx);
+        let Some((cwd, checkout)) = cwd else {
+            return;
+        };
+        self.spawn_terminal(item_id, &cwd, checkout, cx);
+        drop(close_guard);
     }
 
-    fn spawn_terminal(&mut self, item_id: u64, cwd: &Path, cx: &mut Context<Self>) {
+    fn spawn_terminal(
+        &mut self,
+        item_id: u64,
+        cwd: &Path,
+        checkout: Option<ReviewCheckout>,
+        cx: &mut Context<Self>,
+    ) {
         let app = cx.weak_entity();
         let shown =
             self.terminal_visible && self.active_item().is_some_and(|item| item.id == item_id);
@@ -375,7 +488,11 @@ impl ReviewApp {
             (Source::Pr(_), None) => return,
         };
         let argv = terminal_argv(data.terminal.backend, &context);
-        match open_session(&argv, cwd, app, item_id, cx) {
+        if let Some(checkout) = checkout.as_ref() {
+            remember_checkout(&mut item.checkouts, checkout);
+        }
+        let lease = checkout.as_ref().map(ReviewCheckout::lease);
+        match open_session(&argv, cwd, app, item_id, lease, cx) {
             Ok(session) => {
                 data.terminal.focus_pending = shown
                     && matches!(

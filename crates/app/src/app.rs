@@ -7,6 +7,7 @@ use crate::diff::{
     SPLIT_DIVIDER, SPLIT_GUTTER, UNIFIED_GUTTER, ViewMode,
 };
 use crate::items::{dir_name, ItemData, ItemState, ReviewItem, Source};
+use crate::review_checkout::CloseGate;
 use crate::lsp_client::trace as lsp_trace;
 use crate::palette::PaletteStep;
 use crate::selection::{selection_text, RowCol, SelSide};
@@ -34,6 +35,7 @@ use gpui_component::{
     kbd::Kbd,
 };
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TopView {
@@ -132,6 +134,8 @@ pub(crate) struct ReviewApp {
     pub(crate) subscribed_scroll: ScrollHandle,
     pub(crate) tracker: crate::tracker::TrackerState,
     pub(crate) _subscriptions: Vec<Subscription>,
+    pub(crate) close_gate: Arc<CloseGate>,
+    pub(crate) closing: bool,
 }
 
 impl ReviewApp {
@@ -150,11 +154,27 @@ impl ReviewApp {
         let mut _subscriptions = vec![
             // Best-effort cleanup of every item's chat scratch dir on quit
             // (close_item handles the per-item case).
-            cx.on_app_quit(|this: &mut Self, _cx| {
+            cx.on_app_quit(|this: &mut Self, cx| {
+                this.close_gate.close();
                 for item in &this.items {
                     let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
                 }
-                async {}
+                let cleanups = this
+                    .items
+                    .iter_mut()
+                    .map(ReviewItem::take_cleanup)
+                    .collect::<Vec<_>>();
+                this.items.clear();
+                let gate = Arc::clone(&this.close_gate);
+                let cleanup_task = cx.background_spawn(async move {
+                    for cleanup in cleanups {
+                        cleanup.run();
+                    }
+                    gate.wait_zero();
+                });
+                async move {
+                    cleanup_task.await;
+                }
             }),
             cx.subscribe_in(
                 &open_input,
@@ -226,6 +246,8 @@ impl ReviewApp {
             subscribed_scroll: ScrollHandle::new(),
             tracker,
             _subscriptions,
+            close_gate: Arc::new(CloseGate::default()),
+            closing: false,
         };
         this.refresh_cached_prs(cx);
         this.start_subscribed_pr_poll(cx);
@@ -234,6 +256,38 @@ impl ReviewApp {
         }
         this.active = 0;
         this
+    }
+
+    pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        self.close_gate.close();
+        for item in &self.items {
+            let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
+        }
+        let cleanups = self
+            .items
+            .iter_mut()
+            .map(ReviewItem::take_cleanup)
+            .collect::<Vec<_>>();
+        self.items.clear();
+        let gate = Arc::clone(&self.close_gate);
+        let window = cx.windows().into_iter().next();
+        cx.spawn(async move |_, cx| {
+            cx.background_spawn(async move {
+                for cleanup in cleanups {
+                    cleanup.run();
+                }
+                gate.wait_zero();
+            })
+            .await;
+            if let Some(window) = window {
+                let _ = cx.update_window(window, |_, window, _| window.remove_window());
+            }
+        })
+        .detach();
     }
 
     /// Step the diff font size (cmd-+ / cmd-- / cmd-0). Row height follows the
@@ -578,6 +632,9 @@ impl Render for ReviewApp {
             .flex_col()
             .bg(theme::base())
             .text_color(theme::text())
+            .on_action(cx.listener(|this, _: &crate::Quit, _, cx| {
+                this.request_quit(cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 if this.palette.is_some() {
                     this.close_palette(window, cx);
