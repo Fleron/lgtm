@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 const TERMINAL_FONT: &str = "Iosevka Term";
-const TERMINAL_FONT_PX: f32 = 11.0;
+const TERMINAL_FONT_PX: f32 = 12.0;
 
 // --- Interactive claude/codex terminal ---------------------------------------
 

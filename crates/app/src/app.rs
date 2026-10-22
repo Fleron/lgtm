@@ -16,8 +16,8 @@ use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom, GoToDefinition,
     GoToTop, LineDown, LineUp, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
-    ToggleChat, ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar,
-    ToggleTerminal, ToggleView,
+    SidebarResizeEnd, SidebarResizeHome, SidebarResizeLeft, SidebarResizeRight, ToggleChat,
+    ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar, ToggleTerminal, ToggleView,
     TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
     TrackerRefresh,
@@ -27,7 +27,7 @@ use crate::{
 };
 use gpui::{
     div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
-    Keystroke, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render,
+    Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render,
     ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
 };
 use gpui_component::{
@@ -83,6 +83,9 @@ pub(crate) struct ReviewApp {
     pub(crate) items: Vec<ReviewItem>,
     pub(crate) active: usize,
     pub(crate) sidebar_visible: bool,
+    pub(crate) manual_sidebar_width: Option<f32>,
+    pub(crate) sidebar_resize_drag: Option<(f32, f32)>,
+    pub(crate) sidebar_resize_focus: FocusHandle,
     pub(crate) open_input: gpui::Entity<InputState>,
     pub(crate) open_error: Option<SharedString>,
     /// Fuzzy filter over the active item's file tree (`/` focuses it).
@@ -219,6 +222,9 @@ impl ReviewApp {
             sidebar_visible: !errors.is_empty()
                 || sources.len() != 1
                 || !subscribed_repos.is_empty(),
+            manual_sidebar_width: None,
+            sidebar_resize_drag: None,
+            sidebar_resize_focus: cx.focus_handle(),
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
             tree_filter_input,
@@ -753,6 +759,14 @@ impl Render for ReviewApp {
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.sidebar_resize_drag.is_some() {
+                    if event.dragging() {
+                        this.update_sidebar_resize(f32::from(event.position.x), window, cx);
+                    } else {
+                        this.end_sidebar_resize();
+                    }
+                    return;
+                }
                 if event.dragging() {
                     return;
                 }
@@ -783,6 +797,18 @@ impl Render for ReviewApp {
                     (None, None) => {}
                 }
             }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.end_sidebar_resize();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.end_sidebar_resize();
+                }),
+            )
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             // Bound in the "ReviewApp" context: these only fire while the
             // diff pane has focus. With the palette open, focus sits in the
@@ -829,6 +855,22 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SidebarResizeLeft, window, cx| {
+                cx.stop_propagation();
+                this.resize_sidebar_left(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SidebarResizeRight, window, cx| {
+                cx.stop_propagation();
+                this.resize_sidebar_right(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SidebarResizeHome, window, cx| {
+                cx.stop_propagation();
+                this.resize_sidebar_home(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SidebarResizeEnd, window, cx| {
+                cx.stop_propagation();
+                this.resize_sidebar_end(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., false, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., false, cx)))
