@@ -11,6 +11,7 @@ mod lsp_client;
 mod minimap;
 mod palette;
 mod pr_conversation;
+mod review_checkout;
 mod selection;
 mod subscriptions;
 mod terminal;
@@ -136,6 +137,7 @@ fn main() {
             return;
         }
     }
+    review_checkout::cleanup_all();
     let mut sources = Vec::new();
     let mut errors = Vec::new();
     if args.is_empty() {
@@ -248,7 +250,6 @@ fn main() {
                 KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
                 KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
             ]);
-            cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
@@ -269,6 +270,13 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(|cx| ReviewApp::new(sources, errors, window, cx));
+                    let weak_view = view.downgrade();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        weak_view
+                            .update(cx, |app, cx| app.request_quit(cx))
+                            .ok();
+                        false
+                    });
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },

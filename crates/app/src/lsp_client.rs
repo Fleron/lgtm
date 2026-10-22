@@ -91,7 +91,14 @@ pub struct LspClient {
 
 #[derive(Clone)]
 pub struct LspSession {
+    worker: Arc<LspWorker>,
+}
+
+struct LspWorker {
     commands: mpsc::Sender<LspCommand>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    stopped: AtomicBool,
+    _lease: Option<Arc<crate::review_checkout::CheckoutLease>>,
 }
 
 enum LspCommand {
@@ -103,6 +110,9 @@ enum LspCommand {
     Definition {
         position: LspPosition,
         reply: mpsc::Sender<Result<Vec<DefinitionTarget>>>,
+    },
+    Shutdown {
+        reply: mpsc::Sender<()>,
     },
 }
 
@@ -657,10 +667,11 @@ impl LspSession {
         backend: LspBackend,
         progress: Arc<Mutex<LspProgress>>,
         warmup: Option<LspPosition>,
+        lease: Option<Arc<crate::review_checkout::CheckoutLease>>,
     ) -> Result<Self> {
         let mut client = LspClient::start(root, backend, progress, warmup)?;
         let (commands, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("bifrost-lsp".to_string())
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
@@ -705,11 +716,23 @@ impl LspSession {
                             ));
                             let _ = reply.send(client.definition(&position));
                         }
+                        LspCommand::Shutdown { reply } => {
+                            client.shutdown();
+                            let _ = reply.send(());
+                            break;
+                        }
                     }
                 }
             })
             .context("starting Bifrost LSP worker")?;
-        Ok(Self { commands })
+        Ok(Self {
+            worker: Arc::new(LspWorker {
+                commands,
+                join: Mutex::new(Some(join)),
+                stopped: AtomicBool::new(false),
+                _lease: lease,
+            }),
+        })
     }
 
     pub fn hover(
@@ -724,7 +747,8 @@ impl LspSession {
             position.line + 1,
             position.character + 1
         ));
-        self.commands
+        self.worker
+            .commands
             .send(LspCommand::Hover {
                 position,
                 canceled,
@@ -742,17 +766,58 @@ impl LspSession {
             position.line + 1,
             position.character + 1
         ));
-        self.commands
+        self.worker
+            .commands
             .send(LspCommand::Definition { position, reply })
             .context("Bifrost LSP worker stopped")?;
         response.recv().context("Bifrost LSP worker stopped")?
     }
 }
 
+impl LspSession {
+    pub fn stop(&self) {
+        self.worker.stop();
+    }
+}
+
+impl LspWorker {
+    fn stop(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            let (reply, ack) = mpsc::channel();
+            let _ = self.worker_command(LspCommand::Shutdown { reply });
+            let _ = ack.recv_timeout(Duration::from_secs(5));
+        }
+        if let Some(join) = self.join.lock().unwrap().take() {
+            let _ = join.join();
+        }
+    }
+
+    fn worker_command(&self, command: LspCommand) -> Result<()> {
+        self.commands
+            .send(command)
+            .map_err(|_| anyhow!("Bifrost LSP worker stopped"))
+    }
+}
+
+impl Drop for LspWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl Drop for LspClient {
     fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl LspClient {
+    fn shutdown(&mut self) {
         let _ = self.notify("exit", json!({}));
-        let _ = self.child.kill();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
     }
 }
 
@@ -1105,7 +1170,7 @@ mod tests {
         let declaration = position_in_line(&root, rel, "fn mono_family(cfg:", "mono_family", 0);
         let cfg_reference = position_in_line(&root, rel, "if cfg.font.mono_family", "cfg.font", 0);
         let progress = Arc::new(Mutex::new(LspProgress::default()));
-        let session = LspSession::start(root, LspBackend::Bifrost, progress, Some(call.clone()))
+        let session = LspSession::start(root, LspBackend::Bifrost, progress, Some(call.clone()), None)
             .expect("start Bifrost LSP session");
 
         let definitions = session
@@ -1183,6 +1248,7 @@ mod tests {
             LspBackend::RustAnalyzer,
             progress,
             Some(method_pos.clone()),
+            None,
         )
         .expect("start rust-analyzer session");
 

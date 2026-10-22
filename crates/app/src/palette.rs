@@ -530,6 +530,9 @@ impl ReviewApp {
             return;
         };
         let (item_id, repo_root, base_ref) = (*item_id, repo_root.clone(), all[ix].clone());
+        let Some(close_guard) = self.close_gate.begin() else {
+            return;
+        };
         self.close_palette(window, cx);
         let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
             return;
@@ -549,6 +552,7 @@ impl ReviewApp {
             base_label: base_ref,
             base_oid: None,
         });
+        item.upgrade_gen += 1;
         item.source = source.clone();
         item.refresh_error = None;
         match item.state {
@@ -556,7 +560,7 @@ impl ReviewApp {
             ItemState::Loading => {}
             ItemState::Ready(_) => item.reloading = true,
         }
-        Self::spawn_fetch(item_id, source, mode, cx);
+        Self::spawn_fetch(item_id, source, mode, close_guard, cx);
         cx.notify();
     }
 
