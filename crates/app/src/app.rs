@@ -224,7 +224,7 @@ impl ReviewApp {
                 || !subscribed_repos.is_empty(),
             manual_sidebar_width: None,
             sidebar_resize_drag: None,
-            sidebar_resize_focus: cx.focus_handle(),
+            sidebar_resize_focus: cx.focus_handle().tab_stop(true),
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
             tree_filter_input,

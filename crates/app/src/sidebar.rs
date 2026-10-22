@@ -1029,7 +1029,6 @@ impl ReviewApp {
                     .cursor_col_resize()
                     .key_context("SidebarResize")
                     .track_focus(&self.sidebar_resize_focus)
-                    .tab_stop(true)
                     .border_l_1()
                     .border_color(theme::surface0())
                     .focus(|style| style.border_color(theme::overlay0()))
