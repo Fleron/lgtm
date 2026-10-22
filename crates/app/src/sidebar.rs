@@ -990,7 +990,9 @@ impl ReviewApp {
                             .gap_1()
                             .child(Input::new(&self.open_input).small())
                             .when_some(self.open_error.clone(), |area, err| {
-                                area.child(div().text_size(px(11.)).text_color(theme::red()).child(err))
+                                area.child(
+                                    div().text_size(px(11.)).text_color(theme::red()).child(err),
+                                )
                             }),
                     )
                     .child(list)
@@ -1027,6 +1029,7 @@ impl ReviewApp {
                     .cursor_col_resize()
                     .key_context("SidebarResize")
                     .track_focus(&self.sidebar_resize_focus)
+                    .tab_stop(true)
                     .border_l_1()
                     .border_color(theme::surface0())
                     .focus(|style| style.border_color(theme::overlay0()))
@@ -1034,10 +1037,8 @@ impl ReviewApp {
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            this.sidebar_resize_drag = Some((
-                                f32::from(event.position.x),
-                                this.sidebar_width(window),
-                            ));
+                            this.sidebar_resize_drag =
+                                Some((f32::from(event.position.x), this.sidebar_width(window)));
                             this.drag_anchor = None;
                             this.minimap_scrub = false;
                             window.focus(&this.sidebar_resize_focus);

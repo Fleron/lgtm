@@ -15,8 +15,8 @@ use crate::subscriptions::{load_subscribed_repos, SubscribedRepo};
 use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom, GoToDefinition,
     GoToTop, LineDown, LineUp, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
-    OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SubmitReview,
-    SidebarResizeEnd, SidebarResizeHome, SidebarResizeLeft, SidebarResizeRight, ToggleChat,
+    OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SidebarResizeEnd,
+    SidebarResizeHome, SidebarResizeLeft, SidebarResizeRight, SubmitReview, ToggleChat,
     ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar, ToggleTerminal, ToggleView,
     TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
@@ -26,8 +26,8 @@ use crate::{
     TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
 };
 use gpui::{
-    div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement,
-    Keystroke, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render,
+    div, font, point, prelude::*, px, ClipboardItem, Context, FocusHandle, IntoElement, Keystroke,
+    MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render,
     ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
 };
 use gpui_component::{
