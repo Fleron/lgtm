@@ -111,7 +111,11 @@ actions!(
         TrackerPanelEditTitle,
         TrackerPanelAddRow,
         TrackerDispatch,
-        TrackerRefresh
+        TrackerRefresh,
+        SidebarResizeLeft,
+        SidebarResizeRight,
+        SidebarResizeHome,
+        SidebarResizeEnd
     ]
 );
 
@@ -199,6 +203,10 @@ fn main() {
                 KeyBinding::new("cmd-right", NavForward, Some("ReviewApp")),
                 KeyBinding::new("alt-left", NavBack, Some("ReviewApp")),
                 KeyBinding::new("alt-right", NavForward, Some("ReviewApp")),
+                KeyBinding::new("left", SidebarResizeLeft, Some("SidebarResize")),
+                KeyBinding::new("right", SidebarResizeRight, Some("SidebarResize")),
+                KeyBinding::new("home", SidebarResizeHome, Some("SidebarResize")),
+                KeyBinding::new("end", SidebarResizeEnd, Some("SidebarResize")),
                 // Zoom. Bind both "cmd-=" and "cmd-+" so it fires with or
                 // without shift, the way browsers and editors behave.
                 KeyBinding::new("cmd-=", ZoomIn, None),

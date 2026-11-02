@@ -10,8 +10,8 @@ use crate::{theme, ReviewApp, SIDEBAR_MAX_LIST_HEIGHT};
 use crate::review_checkout::cleanup_cached_dir;
 use diff_core::FileDiff;
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Hsla, PromptButton, PromptLevel, ScrollStrategy,
-    SharedString, Window,
+    div, prelude::*, px, uniform_list, Context, Hsla, MouseButton, MouseDownEvent, PromptButton,
+    PromptLevel, ScrollStrategy, SharedString, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -23,6 +23,11 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 type PrKey = (String, String, u64);
+
+const SIDEBAR_MIN_WIDTH: f32 = 260.;
+const SIDEBAR_MAX_WIDTH: f32 = 600.;
+const SIDEBAR_DIVIDER_WIDTH: f32 = 24.;
+const SIDEBAR_RESIZE_STEP: f32 = 16.;
 
 fn cached_pr_is_visible(
     cached: &CachedPr,
@@ -456,7 +461,67 @@ impl ReviewApp {
         }
     }
 
-    pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_max_width(window: &Window) -> f32 {
+        (f32::from(window.bounds().size.width) * 0.5).max(SIDEBAR_MIN_WIDTH)
+    }
+
+    fn sidebar_width(&self, window: &Window) -> f32 {
+        let automatic = (f32::from(window.bounds().size.width) * 0.25)
+            .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        self.manual_sidebar_width
+            .map(|width| width.clamp(SIDEBAR_MIN_WIDTH, Self::sidebar_max_width(window)))
+            .unwrap_or(automatic)
+    }
+
+    fn set_sidebar_width(&mut self, width: f32, window: &Window, cx: &mut Context<Self>) {
+        let width = width.clamp(SIDEBAR_MIN_WIDTH, Self::sidebar_max_width(window));
+        if self.manual_sidebar_width != Some(width) {
+            self.manual_sidebar_width = Some(width);
+            cx.notify();
+        }
+    }
+
+    fn resize_sidebar_by(&mut self, delta: f32, window: &Window, cx: &mut Context<Self>) {
+        self.set_sidebar_width(self.sidebar_width(window) + delta, window, cx);
+    }
+
+    pub(crate) fn resize_sidebar_left(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.resize_sidebar_by(-SIDEBAR_RESIZE_STEP, window, cx);
+    }
+
+    pub(crate) fn resize_sidebar_right(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.resize_sidebar_by(SIDEBAR_RESIZE_STEP, window, cx);
+    }
+
+    pub(crate) fn resize_sidebar_home(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.set_sidebar_width(SIDEBAR_MIN_WIDTH, window, cx);
+    }
+
+    pub(crate) fn resize_sidebar_end(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.set_sidebar_width(Self::sidebar_max_width(window), window, cx);
+    }
+
+    pub(crate) fn update_sidebar_resize(
+        &mut self,
+        pointer_x: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_x, start_width)) = self.sidebar_resize_drag else {
+            return;
+        };
+        self.set_sidebar_width(start_width + pointer_x - start_x, window, cx);
+    }
+
+    pub(crate) fn end_sidebar_resize(&mut self) {
+        self.sidebar_resize_drag = None;
+    }
+
+    pub(crate) fn render_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Five normal two-line entries fit before this area scrolls, leaving
         // the rest of the sidebar for the active item's file tree.
         let mut list = div()
@@ -804,18 +869,21 @@ impl ReviewApp {
             + usize::from(cached_count > 0);
         let sidebar_row_count =
             self.items.len() + subscribed_feed_count + cached_count + section_count;
-        let list = div()
-            .relative()
-            .w_full()
-            .max_h(px(SIDEBAR_MAX_LIST_HEIGHT))
-            .flex_shrink_0()
-            .child(list)
-            .when(sidebar_row_count > 5, |area| {
-                area.child(
+        let list = if sidebar_row_count > 5 {
+            div()
+                .relative()
+                .w_full()
+                .h(px(SIDEBAR_MAX_LIST_HEIGHT))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(list.h_full())
+                .child(
                     Scrollbar::vertical(&self.subscribed_scroll)
                         .scrollbar_show(ScrollbarShow::Always),
                 )
-            });
+        } else {
+            div().relative().w_full().flex_shrink_0().child(list)
+        };
 
         // --- file tree for the active item ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
@@ -899,49 +967,82 @@ impl ReviewApp {
         };
 
         div()
-            .w(px(260.))
+            .w(px(self.sidebar_width(window)))
             .flex_shrink_0()
             .h_full()
             .flex()
-            .flex_col()
             .bg(theme::mantle())
             .border_r_1()
             .border_color(theme::surface0())
             .text_size(px(12.))
             .child(
                 div()
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(Input::new(&self.open_input).small())
-                    .when_some(self.open_error.clone(), |area, err| {
-                        area.child(div().text_size(px(11.)).text_color(theme::red()).child(err))
-                    }),
-            )
-            .child(list)
-            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
-            .child(
-                div()
                     .flex_1()
-                    .min_h_0()
+                    .min_w_0()
+                    .h_full()
                     .flex()
                     .flex_col()
-                    // The filter input propagates Escape when it has nothing
-                    // of its own to dismiss; catch it here (before the root's
-                    // handler) to clear the query and return to the diff.
-                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                        this.tree_filter_input
-                            .update(cx, |state, cx| state.set_value("", window, cx));
-                        window.focus(&this.focus_handle);
-                        cx.notify();
-                    }))
                     .child(
                         div()
                             .p_2()
-                            .child(Input::new(&self.tree_filter_input).small()),
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(Input::new(&self.open_input).small())
+                            .when_some(self.open_error.clone(), |area, err| {
+                                area.child(
+                                    div().text_size(px(11.)).text_color(theme::red()).child(err),
+                                )
+                            }),
                     )
-                    .child(div().flex_1().min_h_0().child(tree_list)),
+                    .child(list)
+                    .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            // The filter input propagates Escape when it has nothing
+                            // of its own to dismiss; catch it here (before the root's
+                            // handler) to clear the query and return to the diff.
+                            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                                this.tree_filter_input
+                                    .update(cx, |state, cx| state.set_value("", window, cx));
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .p_2()
+                                    .child(Input::new(&self.tree_filter_input).small()),
+                            )
+                            .child(div().flex_1().min_h_0().child(tree_list)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("sidebar-resize")
+                    .w(px(SIDEBAR_DIVIDER_WIDTH))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor_col_resize()
+                    .key_context("SidebarResize")
+                    .track_focus(&self.sidebar_resize_focus)
+                    .border_l_1()
+                    .border_color(theme::surface0())
+                    .focus(|style| style.border_color(theme::overlay0()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_resize_drag =
+                                Some((f32::from(event.position.x), this.sidebar_width(window)));
+                            this.drag_anchor = None;
+                            this.minimap_scrub = false;
+                            window.focus(&this.sidebar_resize_focus);
+                        }),
+                    ),
             )
     }
 }
