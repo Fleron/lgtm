@@ -386,11 +386,34 @@ impl ReviewCheckout {
         let paths = inner.paths.clone();
         let _lease = Arc::clone(&inner.lease);
         drop(inner);
-        validate_owned_paths(&paths, &path, &base_repo, &marker, &lease_path)?;
+        let path_missing = validate_owned_paths(
+            &paths,
+            &path,
+            &base_repo,
+            &marker,
+            &lease_path,
+            stage == Some(CleanupStage::StorageDestroyed),
+        )?;
         let _lock = RepoLock::acquire(&paths.repos.join(format!(
             ".{}.lock",
             base_repo.file_name().unwrap().to_string_lossy()
         )))?;
+        if path_missing {
+            if is_registered_worktree(&base_repo, &path)? {
+                git_ok(
+                    &base_repo,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        path.to_str().context("worktree path is not UTF-8")?,
+                    ],
+                )?;
+            }
+            remove_state_file(&marker);
+            remove_state_file(&lease_path);
+            return Ok(());
+        }
         if linked_admin(&base_repo, &path)?.is_none() {
             eprintln!(
                 "lgtm: refusing to remove unregistered checkout {}",
@@ -486,12 +509,7 @@ fn remove_worktree(base_repo: &Path, path: &Path) -> Result<()> {
 
 fn linked_admin(base_repo: &Path, path: &Path) -> Result<Option<PathBuf>> {
     let expected = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let listing = git_output(base_repo, &["worktree", "list", "--porcelain"])?;
-    if !listing.lines().any(|line| {
-        line.strip_prefix("worktree ")
-            .and_then(|value| PathBuf::from(value).canonicalize().ok())
-            .is_some_and(|candidate| candidate == expected)
-    }) {
+    if !is_registered_worktree(base_repo, &expected)? {
         return Ok(None);
     }
     let admin = fs::canonicalize(git_admin_dir(path)?)?;
@@ -504,18 +522,55 @@ fn linked_admin(base_repo: &Path, path: &Path) -> Result<Option<PathBuf>> {
     Ok((backlink == expected).then_some(admin))
 }
 
+fn is_registered_worktree(base_repo: &Path, path: &Path) -> Result<bool> {
+    let expected = canonical_worktree_path(path).context("worktree path is unavailable")?;
+    let listing = git_output(base_repo, &["worktree", "list", "--porcelain", "-z"])?;
+    Ok(listing
+        .split('\0')
+        .filter_map(|record| record.strip_prefix("worktree "))
+        .filter_map(|candidate| canonical_worktree_path(Path::new(candidate)))
+        .any(|candidate| candidate == expected))
+}
+
+fn canonical_worktree_path(path: &Path) -> Option<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => path.canonicalize().ok(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Some(
+            fs::canonicalize(path.parent()?)
+                .ok()?
+                .join(path.file_name()?),
+        ),
+        Err(_) => None,
+    }
+}
+
 fn validate_owned_paths(
     paths: &CachePaths,
     path: &Path,
     base_repo: &Path,
     marker: &Path,
     lease: &Path,
-) -> Result<()> {
+    allow_missing: bool,
+) -> Result<bool> {
     let root = fs::canonicalize(paths.repos.parent().context("repos has no parent")?)?;
     let worktrees = fs::canonicalize(&paths.worktrees)?;
     let repos = fs::canonicalize(&paths.repos)?;
     let state = fs::canonicalize(&paths.state)?;
-    let path = fs::canonicalize(path)?;
+    let path_missing = match fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(err) if allow_missing && err.kind() == io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err.into()),
+    };
+    let path = if path_missing {
+        let parent = fs::canonicalize(path.parent().context("worktree path has no parent")?)?;
+        let name = path.file_name().context("worktree path has no name")?;
+        if parent != worktrees || Some(name) != marker.file_name() {
+            bail!("missing checkout path does not match its managed state");
+        }
+        parent.join(name)
+    } else {
+        fs::canonicalize(path)?
+    };
     let base_repo = fs::canonicalize(base_repo)?;
     let base_git = fs::canonicalize(base_repo.join(".git"))?;
     let marker_parent = fs::canonicalize(marker.parent().context("marker has no parent")?)?;
@@ -531,7 +586,7 @@ fn validate_owned_paths(
     {
         bail!("checkout paths are outside the owned cache");
     }
-    Ok(())
+    Ok(path_missing)
 }
 
 fn destroy_linked_storage(path: &Path, base_repo: &Path) -> Result<()> {
@@ -900,7 +955,7 @@ fn destroy_legacy_storage(paths: &CachePaths, path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::{mpsc, Mutex};
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
@@ -1119,5 +1174,117 @@ mod tests {
         fake_vp(&root.0, 0);
         cleanup_all_at(&root.0);
         assert!(!legacy_path.exists());
+
+        let second_name = second_path.file_name().unwrap().to_str().unwrap();
+        let second_path_str = second_path.to_str().unwrap();
+        let second_lease = root
+            .0
+            .join("checkout-state")
+            .join(format!("{second_name}.lease"));
+        git(
+            Some(&base),
+            &["worktree", "remove", "--force", second_path_str],
+        );
+        write_stage(&second_marker, CleanupStage::StorageDestroyed).unwrap();
+        assert!(!is_registered_worktree(&base, &second_path).unwrap());
+        cleanup_cached_dir_at(&root.0, &second_path).unwrap();
+        assert!(!second_marker.exists());
+        assert!(!second_lease.exists());
+
+        git(
+            Some(&base),
+            &["worktree", "add", "--detach", second_path_str, &head],
+        );
+        write_stage(&second_marker, CleanupStage::StorageDestroyed).unwrap();
+        fs::remove_dir_all(&second_path).unwrap();
+        assert!(is_registered_worktree(&base, &second_path).unwrap());
+        cleanup_cached_dir_at(&root.0, &second_path).unwrap();
+        assert!(!is_registered_worktree(&base, &second_path).unwrap());
+        assert!(!second_marker.exists());
+        assert!(!second_lease.exists());
+        cleanup_cached_dir_at(&root.0, &second_path).unwrap();
+
+        git(
+            Some(&base),
+            &["worktree", "add", "--detach", second_path_str, &head],
+        );
+        write_stage(&second_marker, CleanupStage::Pending).unwrap();
+        fs::remove_dir_all(&second_path).unwrap();
+        assert!(cleanup_cached_dir_at(&root.0, &second_path).is_err());
+        assert_eq!(
+            read_stage(&second_marker).unwrap(),
+            Some(CleanupStage::Pending)
+        );
+        assert!(is_registered_worktree(&base, &second_path).unwrap());
+
+        write_stage(&second_marker, CleanupStage::StorageDestroyed).unwrap();
+        symlink(root.0.join("missing-target"), &second_path).unwrap();
+        let listing_before = git_output(&base, &["worktree", "list", "--porcelain", "-z"]).unwrap();
+        assert!(cleanup_cached_dir_at(&root.0, &second_path).is_err());
+        let listing_after = git_output(&base, &["worktree", "list", "--porcelain", "-z"]).unwrap();
+        assert_eq!(listing_after, listing_before);
+
+        let paths = CachePaths::new(&root.0);
+        let outside_parent = root.0.join("outside");
+        fs::create_dir_all(&outside_parent).unwrap();
+        let outside_path = outside_parent.join(second_name);
+        assert!(validate_owned_paths(
+            &paths,
+            &outside_path,
+            &base,
+            &second_marker,
+            &second_lease,
+            true,
+        )
+        .is_err());
+
+        let mismatch_path = paths.worktrees.join("mismatch");
+        assert!(validate_owned_paths(
+            &paths,
+            &mismatch_path,
+            &base,
+            &second_marker,
+            &second_lease,
+            true,
+        )
+        .is_err());
+
+        let newline_paths = CachePaths {
+            worktrees: root.0.join("worktrees\n"),
+            ..paths
+        };
+        fs::create_dir_all(&newline_paths.worktrees).unwrap();
+        let newline_name = format!("owner__repo.with.dot__pr18__{head}");
+        let newline_path = newline_paths.worktrees.join(&newline_name);
+        git(
+            Some(&base),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                newline_path.to_str().unwrap(),
+                &head,
+            ],
+        );
+        let newline_marker = newline_paths.state.join(&newline_name);
+        let newline_lease = newline_paths.state.join(format!("{newline_name}.lease"));
+        write_stage(&newline_marker, CleanupStage::StorageDestroyed).unwrap();
+        fs::remove_dir_all(&newline_path).unwrap();
+        detached_checkout(
+            &newline_paths,
+            &newline_path,
+            &base,
+            &newline_marker,
+            &newline_lease,
+            gh::PrLocator {
+                owner: loc.owner.clone(),
+                repo: loc.repo.clone(),
+                number: 18,
+            },
+        )
+        .unwrap()
+        .cleanup()
+        .unwrap();
+        assert!(!is_registered_worktree(&base, &newline_path).unwrap());
     }
 }
