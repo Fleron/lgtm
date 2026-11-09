@@ -2,7 +2,7 @@ use crate::cached_prs::{scan_cached_prs, CachedPr};
 use crate::diff::row_height;
 use crate::items::{ItemData, ItemState, Source};
 use crate::subscriptions::{pr_key, save_subscribed_repos, SubscribedRepo};
-use crate::titlebar::review_ci_indicator;
+use crate::titlebar::merge_readiness_indicator;
 use crate::tree::{
     fuzzy_file_matches, status_style, visible_entries, TreeEntryKind, TreeListRow, TREE_ROW_HEIGHT,
 };
@@ -536,8 +536,22 @@ impl ReviewApp {
             let dot: Hsla = item.dot_color().into();
             let status: gpui::AnyElement = match &item.state {
                 ItemState::Ready(data) => {
-                    let review_ci = data.pr_meta.as_ref().map(|meta| {
-                        review_ci_indicator(&meta.review_decision, &meta.status_check_rollup)
+                    let readiness_ci = data.pr_meta.as_ref().map(|meta| {
+                        let id = match &item.source {
+                            Source::Pr(loc) => {
+                                format!("item-merge-readiness-{}#{}", loc.repo_slug(), loc.number)
+                            }
+                            Source::Local(_) => format!("item-merge-readiness-{}", item.id),
+                        };
+                        merge_readiness_indicator(
+                            SharedString::from(id),
+                            gh::merge_readiness(
+                                &meta.state,
+                                meta.is_draft,
+                                meta.merge_state_status.as_deref(),
+                            ),
+                            &meta.status_check_rollup,
+                        )
                     });
                     div()
                         .flex()
@@ -555,7 +569,7 @@ impl ReviewApp {
                                 .text_color(theme::red())
                                 .child(SharedString::from(format!("−{}", data.deletions))),
                         )
-                        .children(review_ci)
+                        .children(readiness_ci)
                         .into_any_element()
                 }
                 ItemState::Loading => div()
@@ -750,8 +764,17 @@ impl ReviewApp {
                                     .text_color(theme::subtext())
                                     .child(SharedString::from(pr.author.login.clone())),
                             )
-                            .child(review_ci_indicator(
-                                &pr.review_decision,
+                            .child(merge_readiness_indicator(
+                                SharedString::from(format!(
+                                    "subscribed-pr-merge-readiness-{}#{}",
+                                    loc.repo_slug(),
+                                    pr.number
+                                )),
+                                gh::merge_readiness(
+                                    &pr.state,
+                                    pr.is_draft,
+                                    pr.merge_state_status.as_deref(),
+                                ),
                                 &pr.status_check_rollup,
                             )),
                     )

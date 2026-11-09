@@ -113,7 +113,45 @@ pub struct PrMeta {
     #[serde(default)]
     pub review_decision: String,
     #[serde(default)]
+    pub merge_state_status: Option<String>,
+    #[serde(default)]
     pub status_check_rollup: Vec<CheckRun>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeReadiness {
+    Ready,
+    NotReady(&'static str),
+    Unknown,
+}
+
+pub fn merge_readiness(
+    state: &str,
+    is_draft: bool,
+    merge_state_status: Option<&str>,
+) -> MergeReadiness {
+    if is_draft {
+        return MergeReadiness::NotReady("draft");
+    }
+
+    match state {
+        "CLOSED" => return MergeReadiness::NotReady("closed"),
+        "MERGED" => return MergeReadiness::NotReady("merged"),
+        "OPEN" => {}
+        _ if merge_state_status == Some("DRAFT") => {
+            return MergeReadiness::NotReady("draft");
+        }
+        _ => return MergeReadiness::Unknown,
+    }
+
+    match merge_state_status {
+        Some("CLEAN" | "HAS_HOOKS" | "UNSTABLE") => MergeReadiness::Ready,
+        Some("BLOCKED") => MergeReadiness::NotReady("blocked by branch protection or checks"),
+        Some("BEHIND") => MergeReadiness::NotReady("branch is behind its base"),
+        Some("DIRTY") => MergeReadiness::NotReady("merge conflicts"),
+        Some("DRAFT") => MergeReadiness::NotReady("draft"),
+        _ => MergeReadiness::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -183,7 +221,7 @@ pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
         &loc.repo_slug(),
         "--json",
         "number,title,author,state,isDraft,url,body,baseRefName,headRefName,baseRefOid,\
-         headRefOid,additions,deletions,changedFiles,reviewDecision,statusCheckRollup",
+         headRefOid,additions,deletions,changedFiles,reviewDecision,mergeStateStatus,statusCheckRollup",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr view JSON")
 }
@@ -200,7 +238,7 @@ pub struct PrSummary {
     pub head_ref_name: String,
     pub updated_at: String,
     #[serde(default)]
-    pub review_decision: String,
+    pub merge_state_status: Option<String>,
     #[serde(default)]
     pub status_check_rollup: Vec<CheckRun>,
 }
@@ -217,8 +255,7 @@ pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
         "--limit",
         "200",
         "--json",
-        "number,title,author,state,isDraft,headRefName,updatedAt,reviewDecision,\
-         statusCheckRollup",
+        "number,title,author,state,isDraft,headRefName,updatedAt,mergeStateStatus,statusCheckRollup",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr list JSON")
 }
@@ -1304,6 +1341,170 @@ mod tests {
         assert_eq!(meta.review_decision, "");
     }
 
+    fn merge_readiness_from_meta_json(
+        state: &str,
+        is_draft: bool,
+        merge_state_status: Option<serde_json::Value>,
+        review_decision: &str,
+        status_check_rollup: serde_json::Value,
+    ) -> MergeReadiness {
+        let mut json = serde_json::json!({
+            "number": 1,
+            "title": "t",
+            "author": {"login": "a"},
+            "state": state,
+            "isDraft": is_draft,
+            "url": "https://github.com/o/r/pull/1",
+            "baseRefName": "main",
+            "headRefName": "feat",
+            "additions": 1,
+            "deletions": 2,
+            "changedFiles": 3,
+            "reviewDecision": review_decision,
+            "statusCheckRollup": status_check_rollup,
+        });
+        if let Some(status) = merge_state_status {
+            json["mergeStateStatus"] = status;
+        }
+        let meta: PrMeta = serde_json::from_str(&json.to_string()).unwrap();
+        merge_readiness(
+            &meta.state,
+            meta.is_draft,
+            meta.merge_state_status.as_deref(),
+        )
+    }
+
+    #[test]
+    fn merge_readiness_classifies_parsed_github_state_conservatively() {
+        let failing_check = serde_json::json!([{"state": "FAILURE", "conclusion": ""}]);
+        assert_eq!(
+            merge_readiness_from_meta_json(
+                "OPEN",
+                false,
+                Some(serde_json::json!("BLOCKED")),
+                "",
+                failing_check.clone(),
+            ),
+            MergeReadiness::NotReady("blocked by branch protection or checks")
+        );
+        assert_eq!(
+            merge_readiness_from_meta_json(
+                "OPEN",
+                false,
+                Some(serde_json::json!("BLOCKED")),
+                "APPROVED",
+                failing_check,
+            ),
+            MergeReadiness::NotReady("blocked by branch protection or checks")
+        );
+
+        for (state, is_draft, merge_state_status, expected) in [
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("CLEAN")),
+                MergeReadiness::Ready,
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("HAS_HOOKS")),
+                MergeReadiness::Ready,
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("UNSTABLE")),
+                MergeReadiness::Ready,
+            ),
+            (
+                "OPEN",
+                true,
+                Some(serde_json::json!("CLEAN")),
+                MergeReadiness::NotReady("draft"),
+            ),
+            (
+                "CLOSED",
+                false,
+                Some(serde_json::json!("CLEAN")),
+                MergeReadiness::NotReady("closed"),
+            ),
+            (
+                "MERGED",
+                false,
+                Some(serde_json::json!("CLEAN")),
+                MergeReadiness::NotReady("merged"),
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("BLOCKED")),
+                MergeReadiness::NotReady("blocked by branch protection or checks"),
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("BEHIND")),
+                MergeReadiness::NotReady("branch is behind its base"),
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("DIRTY")),
+                MergeReadiness::NotReady("merge conflicts"),
+            ),
+            (
+                "UNKNOWN",
+                false,
+                Some(serde_json::json!("DRAFT")),
+                MergeReadiness::NotReady("draft"),
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("DRAFT")),
+                MergeReadiness::NotReady("draft"),
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::Value::Null),
+                MergeReadiness::Unknown,
+            ),
+            ("OPEN", false, None, MergeReadiness::Unknown),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("UNKNOWN")),
+                MergeReadiness::Unknown,
+            ),
+            (
+                "OPEN",
+                false,
+                Some(serde_json::json!("FUTURE_STATUS")),
+                MergeReadiness::Unknown,
+            ),
+            (
+                "UNKNOWN",
+                false,
+                Some(serde_json::json!("CLEAN")),
+                MergeReadiness::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                merge_readiness_from_meta_json(
+                    state,
+                    is_draft,
+                    merge_state_status.clone(),
+                    "",
+                    serde_json::json!([]),
+                ),
+                expected,
+                "state={state}, draft={is_draft}, mergeStateStatus={merge_state_status:?}"
+            );
+        }
+    }
+
     #[test]
     fn deserializes_review_comments() {
         // Shaped like `gh api --paginate --slurp`: one array per page. The
@@ -1376,7 +1577,9 @@ mod tests {
                 "state": "OPEN",
                 "isDraft": false,
                 "headRefName": "field-name-terminator",
-                "updatedAt": "2026-07-01T12:34:56Z"
+                "updatedAt": "2026-07-01T12:34:56Z",
+                "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [{"state": "FAILURE", "conclusion": ""}]
             },
             {
                 "number": 3470,
@@ -1384,6 +1587,7 @@ mod tests {
                 "author": {"login": "bob"},
                 "state": "OPEN",
                 "isDraft": true,
+                "mergeStateStatus": "CLEAN",
                 "headRefName": "bob/wip",
                 "updatedAt": "2026-06-30T08:00:00Z"
             }
@@ -1396,7 +1600,24 @@ mod tests {
         assert!(!prs[0].is_draft);
         assert_eq!(prs[0].head_ref_name, "field-name-terminator");
         assert_eq!(prs[0].updated_at, "2026-07-01T12:34:56Z");
+        assert_eq!(prs[0].merge_state_status.as_deref(), Some("CLEAN"));
+        assert_eq!(
+            merge_readiness(
+                &prs[0].state,
+                prs[0].is_draft,
+                prs[0].merge_state_status.as_deref(),
+            ),
+            MergeReadiness::Ready
+        );
         assert!(prs[1].is_draft);
+        assert_eq!(
+            merge_readiness(
+                &prs[1].state,
+                prs[1].is_draft,
+                prs[1].merge_state_status.as_deref(),
+            ),
+            MergeReadiness::NotReady("draft")
+        );
     }
 
     #[test]
