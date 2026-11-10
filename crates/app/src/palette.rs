@@ -873,7 +873,7 @@ mod tests {
             is_draft: false,
             head_ref_name: branch.to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),
-            review_decision: String::new(),
+            merge_state_status: None,
             status_check_rollup: Vec::new(),
         }
     }

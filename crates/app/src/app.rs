@@ -16,13 +16,12 @@ use crate::{
     theme, ClearSelection, CloseItem, CopySelection, FocusTreeFilter, GoToBottom, GoToDefinition,
     GoToTop, LineDown, LineUp, NavBack, NavForward, NextFile, NextHunk, NextItem, OpenInput,
     OpenPalette, PrevFile, PrevHunk, PrevItem, Refresh, ShowReview, ShowTracker, SidebarResizeEnd,
-    SidebarResizeHome, SidebarResizeLeft, SidebarResizeRight, SubmitReview, ToggleChat,
-    ToggleComments, ToggleMinimap, TogglePrConversation, ToggleSidebar, ToggleTerminal, ToggleView,
-    TrackerBack,
+    SidebarResizeHome, SidebarResizeLeft, SidebarResizeRight, SubmitReview, TerminalResizeEnd,
+    TerminalResizeHome, TerminalResizeLeft, TerminalResizeRight, ToggleChat, ToggleComments,
+    ToggleMinimap, TogglePrConversation, ToggleSidebar, ToggleTerminal, ToggleView, TrackerBack,
     TrackerClosePanel, TrackerCycleAssignee, TrackerDispatch, TrackerDown, TrackerFocusFilter,
-    TrackerRefresh,
     TrackerNewIssue, TrackerNextColumn, TrackerOpen, TrackerOpenGithub, TrackerPanelAddRow,
-    TrackerPanelEditTitle, TrackerPanelSpace, TrackerSetFlight, TrackerSetHidden,
+    TrackerPanelEditTitle, TrackerPanelSpace, TrackerRefresh, TrackerSetFlight, TrackerSetHidden,
     TrackerSetReview, TrackerUp, ZoomIn, ZoomOut, ZoomReset, MONO,
 };
 use gpui::{
@@ -86,6 +85,9 @@ pub(crate) struct ReviewApp {
     pub(crate) manual_sidebar_width: Option<f32>,
     pub(crate) sidebar_resize_drag: Option<(f32, f32)>,
     pub(crate) sidebar_resize_focus: FocusHandle,
+    pub(crate) manual_terminal_width: Option<f32>,
+    pub(crate) terminal_resize_drag: Option<(f32, f32)>,
+    pub(crate) terminal_resize_focus: FocusHandle,
     pub(crate) open_input: gpui::Entity<InputState>,
     pub(crate) open_error: Option<SharedString>,
     /// Fuzzy filter over the active item's file tree (`/` focuses it).
@@ -225,6 +227,9 @@ impl ReviewApp {
             manual_sidebar_width: None,
             sidebar_resize_drag: None,
             sidebar_resize_focus: cx.focus_handle().tab_stop(true),
+            manual_terminal_width: None,
+            terminal_resize_drag: None,
+            terminal_resize_focus: cx.focus_handle().tab_stop(true),
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
             tree_filter_input,
@@ -333,6 +338,9 @@ impl ReviewApp {
     pub(crate) fn show_view(&mut self, view: TopView, cx: &mut Context<Self>) {
         if self.top_view == view {
             return;
+        }
+        if view != TopView::Review {
+            self.end_terminal_resize();
         }
         self.top_view = view;
         self.tracker.dispatch = None;
@@ -759,6 +767,15 @@ impl Render for ReviewApp {
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.terminal_resize_drag.is_some() {
+                    if event.dragging() && this.terminal_visible && this.top_view == TopView::Review
+                    {
+                        this.update_terminal_resize(f32::from(event.position.x), window, cx);
+                    } else {
+                        this.end_terminal_resize();
+                    }
+                    return;
+                }
                 if this.sidebar_resize_drag.is_some() {
                     if event.dragging() {
                         this.update_sidebar_resize(f32::from(event.position.x), window, cx);
@@ -801,12 +818,14 @@ impl Render for ReviewApp {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| {
                     this.end_sidebar_resize();
+                    this.end_terminal_resize();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| {
                     this.end_sidebar_resize();
+                    this.end_terminal_resize();
                 }),
             )
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
@@ -871,6 +890,22 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &SidebarResizeEnd, window, cx| {
                 cx.stop_propagation();
                 this.resize_sidebar_end(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalResizeLeft, window, cx| {
+                cx.stop_propagation();
+                this.resize_terminal_left(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalResizeRight, window, cx| {
+                cx.stop_propagation();
+                this.resize_terminal_right(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalResizeHome, window, cx| {
+                cx.stop_propagation();
+                this.resize_terminal_home(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalResizeEnd, window, cx| {
+                cx.stop_propagation();
+                this.resize_terminal_end(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., false, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., false, cx)))

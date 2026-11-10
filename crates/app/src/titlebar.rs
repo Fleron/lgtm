@@ -5,19 +5,33 @@ use gpui::{div, prelude::*, px, Context, Hsla, SharedString};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     tag::Tag,
+    tooltip::Tooltip,
     Icon, IconName, Sizable as _, TitleBar,
 };
 
-/// Icon-only review + CI summary for a sidebar PR row: a warning triangle
-/// while a review is still required (a green check once it isn't), plus a
-/// passed/total CI count when the PR has any checks at all. Used in both the
-/// subscribed-PRs feed (before a PR is opened) and the open-items list
-/// (after), so it takes plain fields rather than `PrSummary`/`PrMeta`.
-pub(crate) fn review_ci_indicator(review_decision: &str, checks: &[gh::CheckRun]) -> gpui::AnyElement {
-    let (icon, icon_color) = if review_decision == "REVIEW_REQUIRED" {
-        (IconName::TriangleAlert, theme::peach())
-    } else {
-        (IconName::CircleCheck, theme::green())
+/// Merge readiness and CI summary for a sidebar PR row, shared by the
+/// subscribed-PR feed and open-items list.
+pub(crate) fn merge_readiness_indicator(
+    id: SharedString,
+    readiness: gh::MergeReadiness,
+    checks: &[gh::CheckRun],
+) -> gpui::AnyElement {
+    let (icon, icon_color, tooltip) = match readiness {
+        gh::MergeReadiness::Ready => (
+            IconName::CircleCheck,
+            theme::green(),
+            "Ready to merge".to_string(),
+        ),
+        gh::MergeReadiness::NotReady(reason) => (
+            IconName::TriangleAlert,
+            theme::peach(),
+            format!("Not ready to merge: {reason}"),
+        ),
+        gh::MergeReadiness::Unknown => (
+            IconName::Info,
+            theme::overlay0(),
+            "Merge readiness unknown".to_string(),
+        ),
     };
     let checks_text = (!checks.is_empty()).then(|| {
         let total = checks.len();
@@ -30,11 +44,13 @@ pub(crate) fn review_ci_indicator(review_decision: &str, checks: &[gh::CheckRun]
         (color, format!("{passed}/{total}"))
     });
     div()
+        .id(id)
         .flex()
         .items_center()
         .gap_1()
         .flex_shrink_0()
         .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .when_some(checks_text, |row, (color, label)| {
             row.child(
                 div()

@@ -1012,6 +1012,7 @@ mod tests {
             deletions: 2,
             changed_files: 3,
             review_decision: String::new(),
+            merge_state_status: None,
             status_check_rollup: Vec::new(),
         };
         let header = pr_chat_header(&meta);

@@ -2,7 +2,7 @@ use crate::cached_prs::{scan_cached_prs, CachedPr};
 use crate::diff::row_height;
 use crate::items::{ItemData, ItemState, Source};
 use crate::subscriptions::{pr_key, save_subscribed_repos, SubscribedRepo};
-use crate::titlebar::review_ci_indicator;
+use crate::titlebar::merge_readiness_indicator;
 use crate::tree::{
     fuzzy_file_matches, status_style, visible_entries, TreeEntryKind, TreeListRow, TREE_ROW_HEIGHT,
 };
@@ -26,8 +26,8 @@ type PrKey = (String, String, u64);
 
 const SIDEBAR_MIN_WIDTH: f32 = 260.;
 const SIDEBAR_MAX_WIDTH: f32 = 600.;
-const SIDEBAR_DIVIDER_WIDTH: f32 = 24.;
-const SIDEBAR_RESIZE_STEP: f32 = 16.;
+pub(crate) const PANEL_RESIZE_DIVIDER_WIDTH: f32 = 24.;
+pub(crate) const PANEL_RESIZE_STEP: f32 = 16.;
 
 fn cached_pr_is_visible(
     cached: &CachedPr,
@@ -465,7 +465,7 @@ impl ReviewApp {
         (f32::from(window.bounds().size.width) * 0.5).max(SIDEBAR_MIN_WIDTH)
     }
 
-    fn sidebar_width(&self, window: &Window) -> f32 {
+    pub(crate) fn sidebar_width(&self, window: &Window) -> f32 {
         let automatic = (f32::from(window.bounds().size.width) * 0.25)
             .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         self.manual_sidebar_width
@@ -486,11 +486,11 @@ impl ReviewApp {
     }
 
     pub(crate) fn resize_sidebar_left(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.resize_sidebar_by(-SIDEBAR_RESIZE_STEP, window, cx);
+        self.resize_sidebar_by(-PANEL_RESIZE_STEP, window, cx);
     }
 
     pub(crate) fn resize_sidebar_right(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.resize_sidebar_by(SIDEBAR_RESIZE_STEP, window, cx);
+        self.resize_sidebar_by(PANEL_RESIZE_STEP, window, cx);
     }
 
     pub(crate) fn resize_sidebar_home(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -536,8 +536,22 @@ impl ReviewApp {
             let dot: Hsla = item.dot_color().into();
             let status: gpui::AnyElement = match &item.state {
                 ItemState::Ready(data) => {
-                    let review_ci = data.pr_meta.as_ref().map(|meta| {
-                        review_ci_indicator(&meta.review_decision, &meta.status_check_rollup)
+                    let readiness_ci = data.pr_meta.as_ref().map(|meta| {
+                        let id = match &item.source {
+                            Source::Pr(loc) => {
+                                format!("item-merge-readiness-{}#{}", loc.repo_slug(), loc.number)
+                            }
+                            Source::Local(_) => format!("item-merge-readiness-{}", item.id),
+                        };
+                        merge_readiness_indicator(
+                            SharedString::from(id),
+                            gh::merge_readiness(
+                                &meta.state,
+                                meta.is_draft,
+                                meta.merge_state_status.as_deref(),
+                            ),
+                            &meta.status_check_rollup,
+                        )
                     });
                     div()
                         .flex()
@@ -555,7 +569,7 @@ impl ReviewApp {
                                 .text_color(theme::red())
                                 .child(SharedString::from(format!("−{}", data.deletions))),
                         )
-                        .children(review_ci)
+                        .children(readiness_ci)
                         .into_any_element()
                 }
                 ItemState::Loading => div()
@@ -750,8 +764,17 @@ impl ReviewApp {
                                     .text_color(theme::subtext())
                                     .child(SharedString::from(pr.author.login.clone())),
                             )
-                            .child(review_ci_indicator(
-                                &pr.review_decision,
+                            .child(merge_readiness_indicator(
+                                SharedString::from(format!(
+                                    "subscribed-pr-merge-readiness-{}#{}",
+                                    loc.repo_slug(),
+                                    pr.number
+                                )),
+                                gh::merge_readiness(
+                                    &pr.state,
+                                    pr.is_draft,
+                                    pr.merge_state_status.as_deref(),
+                                ),
                                 &pr.status_check_rollup,
                             )),
                     )
@@ -1023,7 +1046,7 @@ impl ReviewApp {
             .child(
                 div()
                     .id("sidebar-resize")
-                    .w(px(SIDEBAR_DIVIDER_WIDTH))
+                    .w(px(PANEL_RESIZE_DIVIDER_WIDTH))
                     .h_full()
                     .flex_shrink_0()
                     .cursor_col_resize()
@@ -1036,6 +1059,7 @@ impl ReviewApp {
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
+                            this.end_terminal_resize();
                             this.sidebar_resize_drag =
                                 Some((f32::from(event.position.x), this.sidebar_width(window)));
                             this.drag_anchor = None;
