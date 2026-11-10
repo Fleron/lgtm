@@ -55,6 +55,36 @@ fn write_pty(writer: &SharedWriter, bytes: &[u8]) {
     let _ = writer.flush();
 }
 
+fn handle_terminal_host_key(
+    backend: ChatBackend,
+    keystroke: &gpui::Keystroke,
+    writer: &SharedWriter,
+) -> bool {
+    let modifiers = keystroke.modifiers;
+    if modifiers.platform {
+        return true;
+    }
+    if backend == ChatBackend::Codex
+        && keystroke.key == "enter"
+        && modifiers.shift
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && !modifiers.function
+    {
+        // Codex's Shift+Enter binding expects CSI-u Enter with the Shift flag.
+        write_pty(writer, b"\x1b[13;2u");
+        return true;
+    }
+    match &keystroke.key_char {
+        Some(typed) if modifiers.alt && !modifiers.control => {
+            write_pty(writer, typed.as_bytes());
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The PTY writer handed to `TerminalView`, sharing the session's handle so
 /// paste and option-key input write to the same stream.
 struct PtyWriter(SharedWriter);
@@ -218,6 +248,7 @@ fn open_session(
     cwd: &Path,
     app: WeakEntity<ReviewApp>,
     item_id: u64,
+    backend: ChatBackend,
     lease: Option<Arc<CheckoutLease>>,
     cx: &mut Context<ReviewApp>,
 ) -> anyhow::Result<TerminalSession> {
@@ -268,17 +299,7 @@ fn open_session(
             // which loses the characters Nordic and German macOS layouts type
             // with option (@ $ [ ] { } | \ ~); those go out as typed.
             .with_key_handler(move |event| {
-                let modifiers = event.keystroke.modifiers;
-                if modifiers.platform {
-                    return true;
-                }
-                match &event.keystroke.key_char {
-                    Some(typed) if modifiers.alt && !modifiers.control => {
-                        write_pty(&key_writer, typed.as_bytes());
-                        true
-                    }
-                    _ => false,
-                }
+                handle_terminal_host_key(backend, &event.keystroke, &key_writer)
             })
             .with_exit_callback(move |_, cx| {
                 let app = app.clone();
@@ -556,12 +577,13 @@ impl ReviewApp {
             (Source::Pr(_), Some(meta)) => pr_chat_header(meta),
             (Source::Pr(_), None) => return,
         };
-        let argv = terminal_argv(data.terminal.backend, &context);
+        let backend = data.terminal.backend;
+        let argv = terminal_argv(backend, &context);
         if let Some(checkout) = checkout.as_ref() {
             remember_checkout(&mut item.checkouts, checkout);
         }
         let lease = checkout.as_ref().map(ReviewCheckout::lease);
-        match open_session(&argv, cwd, app, item_id, lease, cx) {
+        match open_session(&argv, cwd, app, item_id, backend, lease, cx) {
             Ok(session) => {
                 data.terminal.focus_pending = shown
                     && matches!(
@@ -821,7 +843,62 @@ impl ReviewApp {
 mod tests {
     use super::*;
 
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_writer() -> (SharedWriter, Arc<Mutex<Vec<u8>>>) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer: Box<dyn std::io::Write + Send> = Box::new(CapturedWriter(Arc::clone(&bytes)));
+        (Arc::new(Mutex::new(writer)), bytes)
+    }
+
     const NASTY: &str = "PR \"x\" costs $5 `id`\n[section]\nkey = \"v\"";
+
+    #[test]
+    fn codex_shift_enter_uses_kitty_enter_and_only_for_that_chord() {
+        for (backend, key, consumed, expected) in [
+            (ChatBackend::Codex, "shift-enter", true, &b"\x1b[13;2u"[..]),
+            (ChatBackend::Codex, "enter", false, &b""[..]),
+            (ChatBackend::Claude, "shift-enter", false, &b""[..]),
+            (ChatBackend::Codex, "ctrl-shift-enter", false, &b""[..]),
+            (ChatBackend::Codex, "alt-shift-enter", false, &b""[..]),
+            (ChatBackend::Codex, "cmd-shift-enter", true, &b""[..]),
+            (ChatBackend::Codex, "fn-shift-enter", false, &b""[..]),
+        ] {
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            let (writer, bytes) = captured_writer();
+            assert_eq!(
+                handle_terminal_host_key(backend, &keystroke, &writer),
+                consumed,
+                "backend={backend:?}, key={key}"
+            );
+            assert_eq!(bytes.lock().unwrap().as_slice(), expected, "key={key}");
+        }
+    }
+
+    #[test]
+    fn terminal_host_key_preserves_option_typed_characters() {
+        let mut keystroke = gpui::Keystroke::parse("alt-o").unwrap();
+        keystroke.key_char = Some("ø".into());
+        let (writer, bytes) = captured_writer();
+
+        assert!(handle_terminal_host_key(
+            ChatBackend::Codex,
+            &keystroke,
+            &writer
+        ));
+        assert_eq!(bytes.lock().unwrap().as_slice(), "ø".as_bytes());
+    }
 
     #[test]
     fn claude_argv_passes_context_verbatim_as_dollar_zero() {
