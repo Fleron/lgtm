@@ -115,7 +115,11 @@ actions!(
         SidebarResizeLeft,
         SidebarResizeRight,
         SidebarResizeHome,
-        SidebarResizeEnd
+        SidebarResizeEnd,
+        TerminalResizeLeft,
+        TerminalResizeRight,
+        TerminalResizeHome,
+        TerminalResizeEnd
     ]
 );
 
@@ -207,6 +211,10 @@ fn main() {
                 KeyBinding::new("right", SidebarResizeRight, Some("SidebarResize")),
                 KeyBinding::new("home", SidebarResizeHome, Some("SidebarResize")),
                 KeyBinding::new("end", SidebarResizeEnd, Some("SidebarResize")),
+                KeyBinding::new("left", TerminalResizeLeft, Some("TerminalResize")),
+                KeyBinding::new("right", TerminalResizeRight, Some("TerminalResize")),
+                KeyBinding::new("home", TerminalResizeHome, Some("TerminalResize")),
+                KeyBinding::new("end", TerminalResizeEnd, Some("TerminalResize")),
                 // Zoom. Bind both "cmd-=" and "cmd-+" so it fires with or
                 // without shift, the way browsers and editors behave.
                 KeyBinding::new("cmd-=", ZoomIn, None),

@@ -1,10 +1,12 @@
 use crate::chat::{backend_chip, local_chat_header, pr_chat_header, ChatBackend, CHAT_WIDTH};
 use crate::items::{remember_checkout, ItemState, Source};
 use crate::review_checkout::{CheckoutLease, ReviewCheckout};
+use crate::sidebar::{PANEL_RESIZE_DIVIDER_WIDTH, PANEL_RESIZE_STEP};
 use crate::theme;
 use crate::{centered_message, ReviewApp, TerminalCopy, TerminalPaste, TopView};
 use gpui::{
-    div, prelude::*, px, ClipboardItem, Context, Entity, Rgba, SharedString, WeakEntity, Window,
+    div, prelude::*, px, ClipboardItem, Context, Entity, MouseButton, Rgba, SharedString,
+    WeakEntity, Window,
 };
 use gpui_component::{button::Button, Sizable as _};
 use gpui_terminal::{ColorPalette, ColorPaletteBuilder, TerminalConfig, TerminalView};
@@ -302,6 +304,70 @@ impl ReviewApp {
         }
     }
 
+    fn terminal_max_width(&self, window: &Window) -> f32 {
+        let window_width = f32::from(window.bounds().size.width);
+        let sidebar_width = if self.top_view == TopView::Review && self.sidebar_visible {
+            self.sidebar_width(window)
+        } else {
+            0.
+        };
+        ((window_width - sidebar_width) * 0.5).max(CHAT_WIDTH)
+    }
+
+    fn terminal_width(&self, window: &Window) -> f32 {
+        let automatic = (f32::from(window.bounds().size.width) * 0.25).clamp(CHAT_WIDTH, 600.);
+        self.manual_terminal_width
+            .map(|width| width.clamp(CHAT_WIDTH, self.terminal_max_width(window)))
+            .unwrap_or(automatic)
+    }
+
+    fn set_terminal_width(&mut self, width: f32, window: &Window, cx: &mut Context<Self>) {
+        if !self.terminal_visible || self.top_view != TopView::Review {
+            return;
+        }
+        let width = width.clamp(CHAT_WIDTH, self.terminal_max_width(window));
+        if self.manual_terminal_width != Some(width) {
+            self.manual_terminal_width = Some(width);
+            cx.notify();
+        }
+    }
+
+    fn resize_terminal_by(&mut self, delta: f32, window: &Window, cx: &mut Context<Self>) {
+        self.set_terminal_width(self.terminal_width(window) + delta, window, cx);
+    }
+
+    pub(crate) fn resize_terminal_left(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.resize_terminal_by(PANEL_RESIZE_STEP, window, cx);
+    }
+
+    pub(crate) fn resize_terminal_right(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.resize_terminal_by(-PANEL_RESIZE_STEP, window, cx);
+    }
+
+    pub(crate) fn resize_terminal_home(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.set_terminal_width(CHAT_WIDTH, window, cx);
+    }
+
+    pub(crate) fn resize_terminal_end(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.set_terminal_width(self.terminal_max_width(window), window, cx);
+    }
+
+    pub(crate) fn update_terminal_resize(
+        &mut self,
+        pointer_x: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_x, start_width)) = self.terminal_resize_drag else {
+            return;
+        };
+        self.set_terminal_width(start_width + start_x - pointer_x, window, cx);
+    }
+
+    pub(crate) fn end_terminal_resize(&mut self) {
+        self.terminal_resize_drag = None;
+    }
+
     /// `cmd-e`: toggle the terminal panel. Opening starts the active item's
     /// session if it has never run; hiding leaves it running.
     pub(crate) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -309,6 +375,9 @@ impl ReviewApp {
             return;
         }
         self.terminal_visible = !self.terminal_visible;
+        if !self.terminal_visible {
+            self.end_terminal_resize();
+        }
         if self.terminal_visible {
             self.chat_visible = false;
             self.pr_conversation_visible = false;
@@ -608,25 +677,50 @@ impl ReviewApp {
                 window.focus(view.read(cx).focus_handle());
             });
         }
+        let resize_handle = div()
+            .id("terminal-resize")
+            .w(px(PANEL_RESIZE_DIVIDER_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .cursor_col_resize()
+            .key_context("TerminalResize")
+            .track_focus(&self.terminal_resize_focus)
+            .border_r_1()
+            .border_color(theme::surface0())
+            .focus(|style| style.border_color(theme::overlay0()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.end_sidebar_resize();
+                    this.drag_anchor = None;
+                    this.minimap_scrub = false;
+                    this.terminal_resize_drag =
+                        Some((f32::from(event.position.x), this.terminal_width(window)));
+                    window.focus(&this.terminal_resize_focus);
+                }),
+            );
+        let frame = div()
+            .w(px(self.terminal_width(window)))
+            .flex()
+            .h_full()
+            .flex_shrink_0()
+            .bg(theme::mantle())
+            .child(resize_handle);
         let panel = div()
             .id("terminal")
-            .w(px(
-                (f32::from(window.bounds().size.width) * 0.25).clamp(CHAT_WIDTH, 600.)
-            ))
-            .flex_shrink_0()
+            .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .bg(theme::mantle())
-            .border_l_1()
-            .border_color(theme::surface0())
             .text_size(px(13.));
         let Some(item) = self.active_item() else {
-            return panel
-                .child(centered_message(
+            return frame
+                .child(panel.child(centered_message(
                     "open an item to start a terminal".into(),
                     theme::overlay0(),
-                ))
+                )))
                 .into_any_element();
         };
         let data = match (&item.state, &item.source) {
@@ -637,8 +731,8 @@ impl ReviewApp {
                     (ItemState::Loading, Source::Local(_)) => "still loading",
                     _ => "item failed to load",
                 };
-                return panel
-                    .child(centered_message(text.into(), theme::overlay0()))
+                return frame
+                    .child(panel.child(centered_message(text.into(), theme::overlay0())))
                     .into_any_element();
             }
         };
@@ -701,21 +795,23 @@ impl ReviewApp {
             (TerminalStatus::Failed(err), _) => centered_message(err.clone().into(), theme::red()),
         };
 
-        panel
-            .child(header)
+        frame
             .child(
-                div()
-                    .key_context("Terminal")
-                    .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| {
-                        this.paste_into_terminal(cx);
-                    }))
-                    .on_action(cx.listener(|this, _: &TerminalCopy, _, cx| {
-                        this.copy_from_terminal(cx);
-                    }))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(body),
+                panel.child(header).child(
+                    div()
+                        .key_context("Terminal")
+                        .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| {
+                            this.paste_into_terminal(cx);
+                        }))
+                        .on_action(cx.listener(|this, _: &TerminalCopy, _, cx| {
+                            this.copy_from_terminal(cx);
+                        }))
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(body),
+                ),
             )
             .into_any_element()
     }
